@@ -213,7 +213,25 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
                 };
-                r.arbiter.as_mut().map(|a| a.on_tick(Instant::now())).unwrap_or_default()
+                let mut acts = Vec::new();
+                let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
+                if let Some(a) = r.arbiter.as_mut() {
+                    let (w, h) = platform::screen_size();
+                    if a.mode == Mode::Sink {
+                        // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
+                        acts.extend(a.on_sink_tick(platform::last_injected_pos(), w, h, Instant::now()));
+                    } else {
+                        acts.extend(a.on_tick(Instant::now()));
+                    }
+                    // 断线复位：连接断了还挂着跨屏/被控状态 → 复位并恢复光标/本机输入
+                    if !connected && (a.linked || a.mode == Mode::Sink) {
+                        log::warn!("网络断开，复位跨屏状态");
+                        a.on_peer_release();
+                        platform::show_cursor();
+                        platform::set_local_input_blocked(false);
+                    }
+                }
+                acts
             };
             for action in actions {
                 execute_action(&router, action);
@@ -237,10 +255,14 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
     match action {
         Action::TakeControl { x, y, src_w, src_h } => {
             log::info!("发起跨屏 → TakeControl({x}, {y})");
+            platform::hide_cursor();
+            platform::set_local_input_blocked(true);
             net.send(Message::ctrl(&name, Payload::TakeControl { x, y, src_w, src_h }));
         }
         Action::ReleaseControl => {
             log::info!("返回本机 → ReleaseControl");
+            platform::show_cursor();
+            platform::set_local_input_blocked(false);
             net.send(Message::ctrl(&name, Payload::ReleaseControl));
         }
         Action::Warp { x, y } => {
@@ -268,6 +290,8 @@ async fn run_incoming_router(
         match &msg.payload {
             Payload::Heartbeat { .. } => {} // 保活，无需处理
             Payload::TakeControl { x, y, src_w, src_h } => {
+                platform::hide_cursor();
+                platform::set_local_input_blocked(false);
                 let entry = {
                     let mut r = match router.lock() {
                         Ok(g) => g,
@@ -291,6 +315,8 @@ async fn run_incoming_router(
             }
             Payload::ReleaseControl => {
                 log::info!("对端归还控制");
+                platform::show_cursor();
+                platform::set_local_input_blocked(false);
                 let mut r = match router.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
@@ -336,7 +362,7 @@ async fn run_incoming_router(
 
 /// 按当前设置（重）配置网络与仲裁器。
 async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), String> {
-    let (peer_ip, layout, name) = {
+    let (peer_ip, layout, name, cross_enabled) = {
         let r = match router.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -345,6 +371,7 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
             r.settings.peer_ip.trim().to_string(),
             r.settings.layout.clone(),
             r.settings.name.trim().to_string(),
+            r.settings.cross_screen_enabled,
         )
     };
     // 停旧引擎
@@ -383,7 +410,7 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
         };
         r.engine = Some(start.engine);
         r.net = Some(handle);
-        r.arbiter = Some(Arbiter::new(layout));
+        r.arbiter = if cross_enabled { Some(Arbiter::new(layout)) } else { None };
     }
     tauri::async_runtime::spawn(run_incoming_router(start.incoming, router.clone(), injector));
     log::info!("网络已启动：对端 {peer_ip}");
@@ -405,6 +432,14 @@ struct Settings {
     clipboard_enabled: bool,
     /// 开机自启
     autostart: bool,
+    /// 跨屏共享开关（默认开启；关闭后不再触发跨屏，网络保持连接）
+    #[serde(default = "default_true")]
+    cross_screen_enabled: bool,
+}
+
+/// serde 反序列化默认值：跨屏共享默认开启
+fn default_true() -> bool {
+    true
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -579,6 +614,7 @@ struct NetStatusView {
     linked: bool,
     sent: u64,
     received: u64,
+    cross_screen: bool,
 }
 
 #[tauri::command]
@@ -599,13 +635,14 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
         None => ("source", false),
     };
     NetStatusView {
-        configured: r.arbiter.is_some(),
+        configured: r.net.is_some(),
         connected,
         capture_ok: r.capture_ok,
         mode,
         linked,
         sent,
         received,
+        cross_screen: r.arbiter.is_some(),
     }
 }
 

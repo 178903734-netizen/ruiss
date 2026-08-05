@@ -28,6 +28,7 @@
     $('layout').value = s.layout === 'left' ? 'left' : 'right';
     $('clipboardEnabled').checked = !!s.clipboardEnabled;
     $('autostart').checked = !!s.autostart;
+    $('crossScreenEnabled').checked = s.crossScreenEnabled !== false;
   }
 
   async function save() {
@@ -41,6 +42,7 @@
           layout: $('layout').value,
           clipboardEnabled: $('clipboardEnabled').checked,
           autostart: $('autostart').checked,
+          crossScreenEnabled: $('crossScreenEnabled').checked,
         },
       });
       status.textContent = '已保存 ✓';
@@ -90,6 +92,10 @@
     }
     if (!s.configured) {
       el.textContent = '网络：未配置（填对方 IP 并保存）';
+      return;
+    }
+    if (!s.crossScreen) {
+      el.textContent = '网络：已连接 ｜ 跨屏已关闭（设置里开启）';
       return;
     }
     const role = s.mode === 'sink' ? '被控' : '主控';

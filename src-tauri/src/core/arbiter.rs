@@ -54,6 +54,8 @@ pub enum Action {
 const EDGE_MARGIN: i32 = 2;
 /// 边缘停留防误触时长（规划 100~200ms）
 const DWELL: Duration = Duration::from_millis(150);
+/// 跨屏触发（Take/Release）防抖冷却时间
+const TRIGGER_COOLDOWN: Duration = Duration::from_millis(1000);
 
 /// 仲裁器：每次光标事件调用 on_cursor，空闲时上层每 100ms 调 on_tick。
 pub struct Arbiter {
@@ -66,6 +68,12 @@ pub struct Arbiter {
     dwell: Option<(Instant, i32, i32)>,
     /// 最近一次光标位置（on_tick 用）
     last: Option<(i32, i32, i32, i32)>,
+    /// Sink 侧：注入光标停在入口边的起始时间（返回判定）
+    sink_dwell: Option<Instant>,
+    /// Sink 侧：最近一次注入位置（位置变化即重置停留计时）
+    last_injected: Option<(i32, i32)>,
+    /// 最近一次跨屏触发时间（Take/Release 防抖）
+    last_trigger: Option<Instant>,
 }
 
 impl Arbiter {
@@ -74,7 +82,7 @@ impl Arbiter {
             Layout::PeerRight => Edge::Right,
             Layout::PeerLeft => Edge::Left,
         };
-        Self { layout, exit_edge, mode: Mode::Source, linked: false, dwell: None, last: None }
+        Self { layout, exit_edge, mode: Mode::Source, linked: false, dwell: None, last: None, sink_dwell: None, last_injected: None, last_trigger: None }
     }
 
     /// 本机光标事件。`now` 可注入（单测用），生产传 Instant::now()。
@@ -128,6 +136,49 @@ impl Arbiter {
         }
     }
 
+    /// Sink 侧空闲心跳（上层每 100ms 调用）：注入光标停在入口边足够久 → 返回本机。
+    pub fn on_sink_tick(
+        &mut self,
+        injected: Option<(i32, i32)>,
+        w: i32,
+        h: i32,
+        now: Instant,
+    ) -> Vec<Action> {
+        if self.mode != Mode::Sink {
+            return Vec::new();
+        }
+        let Some((x, y)) = injected else {
+            self.sink_dwell = None;
+            self.last_injected = None;
+            return Vec::new();
+        };
+        let at_entry = geometry::hit_edge(x, y, w, h, EDGE_MARGIN) == self.exit_edge;
+        // 注入位置变化 → 重置停留计时（只有真正停住才算停留）
+        if self.last_injected != Some((x, y)) {
+            self.last_injected = Some((x, y));
+            self.sink_dwell = if at_entry { Some(now) } else { None };
+            return Vec::new();
+        }
+        if at_entry {
+            if let Some(start) = self.sink_dwell {
+                if now.duration_since(start) >= DWELL {
+                    let cooled = self
+                        .last_trigger
+                        .map_or(true, |t| now.duration_since(t) > TRIGGER_COOLDOWN);
+                    if cooled {
+                        self.last_trigger = Some(now);
+                        self.sink_dwell = None;
+                        self.last_injected = None;
+                        self.mode = Mode::Source;
+                        self.linked = false;
+                        return vec![Action::ReleaseControl];
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// 对端发来 TakeControl：接受，进入 Sink，返回对端给的入口位置（需注入）。
     /// 已知限制：双方同时抢控时都接受可能双双变 Sink，任一方出口边停留即可夺回。
     pub fn on_peer_take(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
@@ -142,8 +193,14 @@ impl Arbiter {
         self.linked = false;
     }
 
-    /// 停留判定：dwell 到期 → 归还（已跨屏）或发起（未跨屏/夺回）。
+    /// 停留判定：dwell 到期 → 发起跨屏（原路返回改由被控端 on_sink_tick 负责）。
     fn check_dwell(&mut self, now: Instant, w: i32, h: i32) -> Vec<Action> {
+        // 防抖：刚触发过（如刚从对端返回、光标还停在边缘）则等冷却结束
+        if let Some(t) = self.last_trigger {
+            if now.duration_since(t) <= TRIGGER_COOLDOWN {
+                return Vec::new();
+            }
+        }
         let (start, x, y) = match self.dwell {
             Some(d) => d,
             None => return Vec::new(),
@@ -153,15 +210,10 @@ impl Arbiter {
         }
         self.dwell = None; // 防重复触发（触发后本机光标仍停在边缘，避免反复触发）
 
-        if self.linked {
-            // 跨屏中回到出口边 → 归还
-            self.linked = false;
-            return vec![Action::ReleaseControl];
-        }
-
         // 发起/夺回：成为 Source 并跨屏
         self.mode = Mode::Source;
         self.linked = true;
+        self.last_trigger = Some(now); // 触发时记录（防抖）
         let (peer_x, peer_y) = geometry::enter_position(self.exit_edge, y, x, w, h);
         let warp_x = match self.exit_edge {
             Edge::Right => 1,   // 回绕到左边缘内侧
@@ -234,13 +286,12 @@ mod tests {
         let mut a = Arbiter::new(Layout::PeerRight);
         a.on_cursor(EDGE_X, 100, W, H, t(0));
         a.on_cursor(EDGE_X, 100, W, H, t(160)); // 跨屏
-        // 回到出口边停留 → Release
+        // Source 侧回到出口边停留：不再直接返回 ReleaseControl（原路返回改由被控端 on_sink_tick 负责），
+        // 且跨屏触发后 1s 防抖冷却期内也不重复触发 TakeControl。
         assert!(a.on_cursor(EDGE_X, 300, W, H, t(200)).is_empty()); // 开始计时
         let acts = a.on_cursor(EDGE_X, 300, W, H, t(360));
-        assert_eq!(acts, vec![Action::ReleaseControl]);
-        assert!(!a.linked);
-        // 归还后普通移动不再转发
-        assert!(a.on_cursor(100, 200, W, H, t(400)).is_empty());
+        assert!(acts.is_empty());
+        assert!(a.linked); // 跨屏状态保持，等待对端 on_sink_tick 归还
     }
 
     #[test]
@@ -251,19 +302,32 @@ mod tests {
         assert_eq!(a.mode, Mode::Sink);
         // Sink 期间本机移动不转发
         assert!(a.on_cursor(500, 400, W, H, t(100)).is_empty());
-        // 本机在出口边停留 → 夺回（需要 PeerLeft 布局才与出口边一致？不——Sink 侧出口边不变）
-        // PeerRight 的出口边是右边缘；被对端接管后入口在左边缘。夺回边 = 出口边（右）。
-        a.on_cursor(EDGE_X, 300, W, H, t(200));
-        let acts = a.on_cursor(EDGE_X, 300, W, H, t(360));
-        assert_eq!(
-            acts,
-            vec![
-                Action::TakeControl { x: ENTRY_X, y: 300, src_w: W as u32, src_h: H as u32 },
-                Action::Warp { x: 1, y: 300 },
-            ]
-        );
+        // 注入光标在入口边（=自己的出口边，右边缘）停留 ≥150ms → 原路返回
+        a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(200));
+        let acts = a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(360));
+        assert_eq!(acts, vec![Action::ReleaseControl]);
         assert_eq!(a.mode, Mode::Source);
-        assert!(a.linked);
+        assert!(!a.linked);
+    }
+
+    #[test]
+    fn sink_tick_release_path() {
+        let mut a = Arbiter::new(Layout::PeerRight);
+        a.on_peer_take(ENTRY_X, 100);
+        assert_eq!(a.mode, Mode::Sink);
+        // 无注入位置：清空状态、无动作
+        assert!(a.on_sink_tick(None, W, H, t(0)).is_empty());
+        assert!(a.on_sink_tick(Some((500, 300)), W, H, t(100)).is_empty()); // 不在入口边
+        // 注入位置变化 → 重置停留计时，未到 DWELL
+        assert!(a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(200)).is_empty());
+        assert!(a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(300)).is_empty()); // 100ms < 150ms
+        // 停留 ≥150ms → ReleaseControl，且 1s 防抖冷却期内不再重复触发
+        let acts = a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(400));
+        assert_eq!(acts, vec![Action::ReleaseControl]);
+        assert_eq!(a.mode, Mode::Source);
+        assert!(!a.linked);
+        // Source 模式直接返回空
+        assert!(a.on_sink_tick(Some((EDGE_X, 300)), W, H, t(500)).is_empty());
     }
 
     #[test]

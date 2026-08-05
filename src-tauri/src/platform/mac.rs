@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -58,7 +58,23 @@ thread_local! {
 }
 
 /// 注入侧最后已知光标位置（点击/滚轮注入用）。
-static LAST_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+static LAST_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+/// 最近一次注入到本机的光标位置（None = 还没注入过移动）。
+pub fn last_injected_pos() -> Option<(i32, i32)> {
+    match LAST_POS.lock() {
+        Ok(g) => g.map(|(x, y)| (x as i32, y as i32)),
+        Err(_) => None,
+    }
+}
+
+/// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
+static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+
+/// 设置跨屏期间本机输入拦截开关。
+pub fn set_local_input_blocked(blocked: bool) {
+    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+}
 
 /// 捕获器：CGEventTap + 捕获线程 + 消费线程。
 pub struct InputCapturer {
@@ -134,7 +150,16 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 return Some(event.clone());
             }
             if let Some(p) = event_to_payload(event_type, event) {
-                let _ = tx.send(p);
+                let _ = tx.send(p.clone());
+                // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
+                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    && matches!(
+                        p,
+                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
+                    )
+                {
+                    return None; // 吞掉事件
+                }
             }
             // 监听模式：原样放行，绝不吞事件
             Some(event.clone())
@@ -240,7 +265,7 @@ impl InputInjector {
         // 记录最后光标位置（点击/滚轮注入落点）
         if let Payload::MouseMove { x, y, .. } = &event {
             if let Ok(mut p) = LAST_POS.lock() {
-                *p = (*x as f64, *y as f64);
+                *p = Some((*x as f64, *y as f64));
             }
         }
         let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
@@ -265,7 +290,7 @@ impl InputInjector {
                     _ => return 0,
                 };
                 let (x, y) = match LAST_POS.lock() {
-                    Ok(g) => *g,
+                    Ok(g) => g.unwrap_or((0.0, 0.0)),
                     Err(_) => (0.0, 0.0),
                 };
                 CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn)
@@ -314,6 +339,24 @@ pub fn warp_cursor(x: i32, y: i32) {
             CGMouseButton::Left,
         ) {
             ev.post(CGEventTapLocation::HID);
+        }
+    }
+}
+
+/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+pub fn hide_cursor() {
+    unsafe {
+        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+            let _: () = objc::msg_send![cls, hide];
+        }
+    }
+}
+
+/// 恢复显示本机光标。
+pub fn show_cursor() {
+    unsafe {
+        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+            let _: () = objc::msg_send![cls, unhide];
         }
     }
 }
