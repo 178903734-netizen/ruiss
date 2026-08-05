@@ -151,14 +151,16 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
-                // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
-                    && matches!(
-                        p,
-                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
-                    )
-                {
-                    return None; // 吞掉事件
+                // 跨屏期间（Source 侧）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）
+                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) {
+                    match &p {
+                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. } => {
+                            return None; // 吞掉事件
+                        }
+                        // 移动放行（转发对端）；但 macOS 会因移动自动恢复光标显示 → 立即补藏
+                        Payload::MouseMove { .. } => force_hide_cursor(),
+                        _ => {}
+                    }
                 }
             }
             // 监听模式：原样放行，绝不吞事件
@@ -346,16 +348,27 @@ pub fn warp_cursor(x: i32, y: i32) {
 /// 光标隐藏状态（NSCursor hide/unhide 是计数制，用标志位幂等化防计数失衡）
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
-/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
-pub fn hide_cursor() {
-    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
-        return; // 已隐藏，跳过（避免计数失衡）
-    }
+/// 真正调用 NSCursor hide（不查状态标志）。
+fn raw_hide_cursor() {
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, hide];
         }
     }
+}
+
+/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+pub fn hide_cursor() {
+    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+        return; // 已隐藏，跳过（避免计数失衡）
+    }
+    raw_hide_cursor();
+}
+
+/// 强制再隐藏一次（跨屏源端：macOS 会因鼠标移动自动恢复光标显示，需立即补藏）。
+fn force_hide_cursor() {
+    CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+    raw_hide_cursor();
 }
 
 /// 恢复显示本机光标。
