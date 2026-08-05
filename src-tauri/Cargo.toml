@@ -1,0 +1,44 @@
+[package]
+name = "ruiss"
+version = "0.1.0"
+description = "双机键鼠共享：鼠标跨屏、键盘共享、剪贴板同步"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "ruiss_lib"
+# 注意：去掉 cdylib —— GNU 工具链（w64devkit）链接 cdylib 时会自动导出全部符号，
+# 超过 PE/COFF 导出序号上限 65535，报 "export ordinal too large"。
+# 桌面端 main.rs 走 rlib 链接，不需要 cdylib；将来做移动端再按需加回。
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+arboard = "3"
+
+# ---- 平台依赖（M1 启用：Windows 低层钩子捕获 + SendInput 注入）----
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# highsierra feature：启用新版事件 tap API（闭包回调 + EventField），Mac 端编译已验证
+core-graphics = { version = "0.24", features = ["highsierra"] }
+core-foundation = "0.10"
+objc = "0.2"
+[profile.release]
+strip = true
+lto = true

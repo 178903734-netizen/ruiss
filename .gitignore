@@ -1,0 +1,22 @@
+# Rust / Cargo
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+gui/node_modules/
+
+# 构建产物
+dist/
+gui/dist/
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 工具备份
+.mini-code-backups/

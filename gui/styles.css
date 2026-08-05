@@ -1,0 +1,73 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: #f4f6fa;
+  color: #1f2430;
+  user-select: none;
+}
+
+.panel { padding: 20px 24px; }
+
+h1 { font-size: 17px; margin-bottom: 18px; color: #232a3b; }
+
+.form { display: flex; flex-direction: column; gap: 14px; }
+
+label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: #4a5268; }
+
+label.row { flex-direction: row; align-items: center; justify-content: space-between; }
+
+input[type="text"], select {
+  padding: 8px 10px;
+  border: 1px solid #d3d9e6;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+  color: #1f2430;
+  outline: none;
+}
+input[type="text"]:focus, select:focus { border-color: #4f8ff7; box-shadow: 0 0 0 2px rgba(79,143,247,.15); }
+
+input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
+
+.actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+
+.divider { height: 1px; background: #e2e7f0; margin: 4px 0; }
+
+.section-title { font-size: 13px; color: #232a3b; margin-top: 2px; }
+
+#saveBtn {
+  padding: 8px 22px;
+  border: none;
+  border-radius: 6px;
+  background: #4f8ff7;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+#saveBtn:hover { background: #3d7ce8; }
+
+.status { font-size: 12px; color: #2e9e5b; }
+
+.stats {
+  font-size: 12px;
+  color: #3a4256;
+  background: #eef2f8;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: Consolas, "Courier New", monospace;
+}
+.stats.net { border: 1px solid #d8e0ee; }
+
+.test-btn {
+  padding: 8px 12px;
+  border: 1px solid #c9d4e8;
+  border-radius: 6px;
+  background: #fff;
+  color: #1f2430;
+  font-size: 12px;
+  cursor: pointer;
+}
+.test-btn:hover { border-color: #4f8ff7; }
+
+.hint { margin-top: 16px; font-size: 11px; color: #8a93a8; line-height: 1.6; }

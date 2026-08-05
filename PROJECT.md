@@ -1,0 +1,126 @@
+# Ruiss — 双机键鼠共享
+
+一句话：两台电脑共用一套鼠标键盘，鼠标滑到屏幕边缘就"滑"到另一台；剪贴板（文本+图片）自动同步。
+Windows 托盘图标 + Mac 菜单栏图标，右键菜单：显示设置窗口 / 退出。
+
+## 技术栈
+
+- 核心：Rust（事件捕获/注入、网络、剪贴板读写）
+- 界面/托盘：Tauri 2（前端 HTML/JS，后续可切 Vue）
+- Windows 平台：SendInput / SetWindowsHookEx（windows crate）
+- Mac 平台：CGEventPost（core-graphics crate）
+- 剪贴板：arboard crate
+- 网络：tokio + 自定义二进制协议（TCP 走按键/剪贴板，UDP 走高频鼠标移动）
+
+## 目录结构
+
+```
+ruiss/
+├── src-tauri/               # Rust 侧全部代码（Tauri 2 标准布局）
+│   ├── Cargo.toml
+│   ├── tauri.conf.json      # 窗口、托盘、打包配置
+│   ├── build.rs
+│   ├── capabilities/default.json
+│   ├── icons/               # 图标资源（icon.png 等）
+│   └── src/
+│       ├── main.rs          # 入口：调 lib::run()
+│       ├── lib.rs           # Tauri 启动、托盘菜单、设置窗口、Tauri 命令
+│       ├── core/            # 共享逻辑：协议定义、坐标换算、键位映射
+│       │   ├── mod.rs
+│       │   ├── protocol.rs  # 跨机事件消息协议（枚举 + serde）
+│       │   ├── geometry.rs  # 屏幕坐标换算（逻辑像素，DPI 友好）
+│       │   └── keys.rs      # 键位映射表（Ctrl↔Command、Win↔Command）
+│       ├── platform/        # 平台相关：事件捕获与注入
+│       │   ├── mod.rs       # cfg 分发（win / mac）
+│       │   ├── win.rs       # Windows 实现（SendInput / SetWindowsHookEx）
+│       │   └── mac.rs       # macOS 实现（CGEventPost）
+│       ├── net/             # TCP + UDP 通道
+│       │   ├── mod.rs
+│       │   ├── tcp.rs       # 按键、剪贴板（可靠传输）
+│       │   └── udp.rs       # 鼠标移动（高频、可丢）
+│       └── clipboard/       # 剪贴板同步（监听变化 + 防回环）
+│           └── mod.rs
+├── gui/                     # 前端：设置窗口（index.html + js + css）
+├── scripts/
+│   └── gen-icon.mjs         # 生成托盘图标 PNG（node 脚本）
+├── PROJECT.md               # 本文件：项目地图 + 规划存档
+└── CHANGELOG.md
+```
+
+## 模块职责
+
+- core/protocol.rs — 定义对端事件消息：MouseMove/MouseButton/KeyDown/KeyUp/Clipboard(Text|Image) 等，serde 序列化。
+- core/geometry.rs — 坐标换算。统一按"逻辑像素"算（Windows 缩放 125%/150%、Mac Retina 都避开物理像素问题）。
+- core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则。
+- platform/ — 事件捕获与注入，每端约 200 行。Windows: SetWindowsHookEx 捕获 + SendInput 注入；Mac: CGEventTap 捕获 + CGEventPost 注入。
+- net/ — TCP（按键、剪贴板，可靠）+ UDP（鼠标高频移动）。二进制协议，粘包处理。
+- clipboard/ — 监听系统剪贴板变化（Win: AddClipboardFormatListener；Mac: NSPasteboard 通知），变化后经 TCP 发给对端；带标记位防回环（收到自己发的不再转发）。
+
+## 核心机制（想通这三点，代码就顺）
+
+1. 角色动态仲裁：不设固定主控/被控。谁的鼠标在动谁就是主控，另一台收事件注入。"心跳 + 令牌"避免两边同时发。
+2. 跨屏判定：本机鼠标 x 超出右边缘且停留 100~200ms（防误触，手感关键）→ 把鼠标从右边缘"滑过去"，通知对端注入从左边进入的事件；回不来同理。
+3. 剪贴板防回环：标记位，收到自己发的消息不再转发。
+
+## 开发路线（里程碑）
+
+- M1 单机自测：本机捕获→本机注入，验证钩子和注入链路通。（滑自己屏幕"隔空打字"）
+- M2 双机打通：网络层 + 跨屏判定 + 键位映射。两台电脑真能共用一套键鼠。
+- M3 剪贴板 + 托盘 UI：剪贴板同步、托盘、设置窗口、开机自启、打包分发。
+- M4 打磨：DPI 适配、鼠标平滑、延迟优化、断线重连、日志。
+
+当前进度：骨架搭建完成（M0）。托盘图标能弹出 = M0 验收标准。
+
+## 明确不做（第一版）
+
+文件拖拽、加密传输、跨公网、多显示器复杂布局、手机端。
+
+## 提前踩过的坑（写代码时注意）
+
+1. Mac 辅助功能权限：设置窗口里必须有"申请辅助功能权限"按钮引导用户授权，否则 Mac 端完全收不到键鼠事件。
+2. DPI：坐标统一按逻辑像素算，别用物理像素。
+3. 边缘停留 100~200ms 再切换，一碰就切会误触。
+4. 键位映射表：Ctrl↔Command 硬映射，Win→Command，Shift/Alt 不动，第一版就三条。
+
+## 常用命令
+
+> 完整的环境安装、编译、自测/双实例/双机测试步骤见 **[BUILD.md](BUILD.md)**（含 Windows/Mac 双平台、环境变量速查、常见问题）。
+
+```bash
+# 安装 Rust（本机还没有，必须装）
+winget install Rustlang.Rustup        # Windows 装 rustup
+# 或手动：https://rustup.rs
+
+# 生成/更新托盘图标
+node scripts/gen-icon.mjs
+
+# 开发运行（弹出托盘图标 + 设置窗口）
+cargo run --manifest-path src-tauri/Cargo.toml
+
+# 编译检查
+cargo check --manifest-path src-tauri/Cargo.toml
+
+# 打包（M3 里程碑再做）
+cargo tauri build --manifest-path src-tauri/Cargo.toml
+```
+
+## 当前进度
+
+- [x] M0 骨架：目录结构、Cargo.toml、Tauri 配置、托盘 + 设置窗口、模块占位、文档
+- [~] M1 单机自测（本机捕获→注入）：
+  - 已实现：Windows 低层钩子捕获 + SendInput 注入 + INJECTED 标记防回环；
+    延迟回声（按下先入表、松开时注入完整按下+松开对，避开按键状态合并）；
+    鼠标移动只计数不注入；修饰键按住时不出回声。
+  - 已自动化验证：注入生效（GetAsyncKeyState 校验）、跨进程事件被钩子捕获
+    （探针 + RUISS_NO_SUPPRESS）、正常模式防回环生效。
+  - 待人工确认：设置窗口 M1 自测 → 统计数字跳动 + 打字/点击回声（双字符/双击）。
+    验证方式：设置窗口 → M1 自测 → 开启；或 `RUISS_SELF_TEST=1 cargo run`。
+- [ ] M2 双机打通（网络层 + 跨屏判定 + 键位映射）
+- [ ] M3 剪贴板 + 托盘 UI + 打包
+- [ ] M4 打磨
+
+## 环境备注
+
+- 本机（2026-08-05）：Windows + Git Bash；node v24.15.0 / npm 11.12.1 / git 2.54.0；Rust 尚未安装。
+- 首次运行前：装 Rust（上面命令），然后 `cargo check --manifest-path src-tauri/Cargo.toml` 验证骨架可编译，再 `cargo run` 跑托盘。
+- Windows 依赖 WebView2 Runtime（Win10/11 一般自带，没有的话装一下）。

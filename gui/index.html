@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Ruiss 设置</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="panel">
+    <h1>Ruiss 设置</h1>
+
+    <section class="form">
+      <label>
+        <span>本机名字</span>
+        <input id="name" type="text" placeholder="例如：work-pc" />
+      </label>
+
+      <label>
+        <span>对方 IP</span>
+        <input id="peerIp" type="text" placeholder="例如：192.168.1.20" />
+      </label>
+
+      <label>
+        <span>屏幕布局（对方在我哪边）</span>
+        <select id="layout">
+          <option value="right">右边</option>
+          <option value="left">左边</option>
+        </select>
+      </label>
+
+      <label class="row">
+        <span>剪贴板共享</span>
+        <input id="clipboardEnabled" type="checkbox" checked />
+      </label>
+
+      <label class="row">
+        <span>开机自启</span>
+        <input id="autostart" type="checkbox" />
+      </label>
+
+      <div class="divider"></div>
+
+      <h2 class="section-title">M1 自测</h2>
+
+      <label class="row">
+        <span>自测模式（本机捕获→注入回环）</span>
+        <input id="selfTest" type="checkbox" />
+      </label>
+
+      <div id="stats" class="stats">自测关闭</div>
+
+      <div id="netStatus" class="stats net">网络：未配置</div>
+
+      <button id="testInjectBtn" class="test-btn">注入测试：先聚焦记事本，再点我</button>
+
+      <div class="actions">
+        <button id="saveBtn">保存</button>
+        <span id="status" class="status"></span>
+      </div>
+    </section>
+
+    <p class="hint">双机使用：两台都填好"本机名字 + 对方 IP + 布局"并保存，鼠标滑到屏幕边缘停留一会儿即滑到对端（键盘/点击/滚轮跟着走），回到边缘停留即返回。自测模式是开发验证工具，测完记得关。</p>
+  </main>
+  <script src="main.js"></script>
+</body>
+</html>
