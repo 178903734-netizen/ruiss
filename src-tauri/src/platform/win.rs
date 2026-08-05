@@ -11,12 +11,13 @@
 
 use std::cell::RefCell;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{FALSE, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -28,10 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT,
     LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW,
-    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 use crate::core::keys::Key;
@@ -411,5 +412,28 @@ pub fn screen_size() -> (i32, i32) {
 pub fn warp_cursor(x: i32, y: i32) {
     unsafe {
         let _ = SetCursorPos(x, y);
+    }
+}
+
+/// 光标隐藏状态（ShowCursor 是全局计数制，用标志位幂等化防计数失衡）
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+pub fn hide_cursor() {
+    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+        return; // 已隐藏，跳过（避免计数失衡）
+    }
+    unsafe {
+        let _ = ShowCursor(FALSE);
+    }
+}
+
+/// 恢复显示本机光标。
+pub fn show_cursor() {
+    if !CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
+        return; // 已显示，跳过（避免计数失衡）
+    }
+    unsafe {
+        let _ = ShowCursor(TRUE);
     }
 }
