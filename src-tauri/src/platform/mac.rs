@@ -343,8 +343,14 @@ pub fn warp_cursor(x: i32, y: i32) {
     }
 }
 
+/// 光标隐藏状态（NSCursor hide/unhide 是计数制，用标志位幂等化防计数失衡）
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 /// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
 pub fn hide_cursor() {
+    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+        return; // 已隐藏，跳过（避免计数失衡）
+    }
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, hide];
@@ -354,6 +360,9 @@ pub fn hide_cursor() {
 
 /// 恢复显示本机光标。
 pub fn show_cursor() {
+    if !CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
+        return; // 已显示，跳过（避免计数失衡）
+    }
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, unhide];
