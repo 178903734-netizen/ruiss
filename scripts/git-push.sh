@@ -68,7 +68,7 @@ git pull --rebase || {
 
 echo ""
 echo "=== 4/5 推送到 GitHub ==="
-git push || { echo "❌ push 失败，可能原因：网络不通 / 未配 SSH"; exit 1; }
+git push origin HEAD:master || { echo "❌ push 失败，可能原因：网络不通 / 未配 SSH"; exit 1; }
 
 echo ""
 echo "=== 5/5 完成 ==="
