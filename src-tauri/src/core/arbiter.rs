@@ -125,8 +125,21 @@ impl Arbiter {
             }
         }
 
-        // Sink（被对端控制）：本机事件不转发、不触发边缘
+        // Sink（被对端控制）：本机事件不转发；但本机鼠标推到出口边停留
+        // 可反向夺回控制权（自由双向切换）——复用 check_dwell 的"夺回"分支。
         if self.mode == Mode::Sink {
+            let at_exit = geometry::hit_edge(x, y, w, h, EDGE_MARGIN) == self.exit_edge;
+            match (at_exit, self.dwell) {
+                (true, None) => self.dwell = Some((now, x, y)),
+                (false, Some(_)) => self.dwell = None,
+                _ => {}
+            }
+            if at_exit {
+                let actions = self.check_dwell(now, w, h);
+                if !actions.is_empty() {
+                    return actions;
+                }
+            }
             return Vec::new();
         }
         if self.linked {

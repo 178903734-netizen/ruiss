@@ -96,12 +96,19 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 /// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
 /// 无条件执行 NSCursor hide 并计数——macOS 移动鼠标会自动重显光标，
 /// 重复 hide 是刻意的（计数配对，show 时按次数恢复）。
+/// 注意：NSCursor hide 必须在主线程调用，此处与 enforce_cursor_hidden
+/// 一致用 performSelectorOnMainThread 调度（本函数可能被仲裁器线程调用）。
 pub fn hide_cursor() {
     CURSOR_SUPPRESS.store(true, Ordering::SeqCst);
     CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-            let _: () = objc::msg_send![cls, hide];
+            let _: () = objc::msg_send![
+                cls,
+                performSelectorOnMainThread: sel!(hide)
+                withObject: std::ptr::null_mut::<objc::runtime::Object>()
+                waitUntilDone: false
+            ];
         }
     }
 }
@@ -130,7 +137,7 @@ pub fn enforce_cursor_hidden() {
                 let _: () = objc::msg_send![
                     cls,
                     performSelectorOnMainThread: sel!(hide)
-                    withObject: nil
+                    withObject: std::ptr::null_mut::<objc::runtime::Object>()
                     waitUntilDone: false
                 ];
             }
@@ -211,13 +218,9 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             if pid != 0 {
                 return Some(event.clone());
             }
-            // 被控端（Sink）：吞掉本机 MouseMoved——光标只跟对端注入走，
-            // 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
-            if SINK_ACTIVE.load(Ordering::Relaxed)
-                && matches!(event_type, CGEventType::MouseMoved)
-            {
-                return None;
-            }
+            // 被控端（Sink）：本机 MouseMoved 放行进入仲裁器——本机鼠标推到
+            // 出口边停留可反向夺回控制权（自由切换）；非出口边由仲裁器过滤不转发，
+            // 光标位置仍跟随本机鼠标（用户可见），对端注入已停时不会打架。
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
                 // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
