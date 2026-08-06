@@ -18,7 +18,10 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -28,14 +31,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW,
-    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LWA_ALPHA, LLKHF_EXTENDED, LLKHF_INJECTED,
+    LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetCursorPos,
+    SetLayeredWindowAttributes, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    CreateCursor, SetSystemCursor, SystemParametersInfoW,
+    CreateCursor, SetSystemCursor,
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
+    SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
+    HICON,
 };
 
 use crate::core::keys::Key;
@@ -56,8 +63,74 @@ fn suppress_injected() -> bool {
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
+/// 全屏透明"罩子"窗口句柄（存 isize：HWND 是裸指针不 Send，不能进 static Mutex）。
+/// 跨屏期间盖住整个桌面，鼠标移动消息打在罩子上（桌面收不到）→ 桌面文件零 hover；
+/// 低层钩子仍在罩子之前拿到事件，转发数据链完全不受影响。
+static SHIELD_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+    // 罩子窗口开合与跨屏状态联动：显示罩子（不抢焦点）或收起
+    if let Ok(g) = SHIELD_HWND.lock() {
+        if let Some(raw) = *g {
+            let hwnd = HWND(raw as *mut c_void);
+            unsafe {
+                let _ = ShowWindow(hwnd, if blocked { SW_SHOWNA } else { SW_HIDE });
+            }
+        }
+    }
+}
+
+/// 罩子窗口的窗口过程：什么都不做，默认处理即可（窗口只是"接住"鼠标消息）。
+unsafe extern "system" fn shield_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 创建全屏透明罩子窗口（WS_EX_LAYERED 全透明 + 置顶 + 不激活）。
+/// 创建后默认隐藏，跨屏开始由 set_local_input_blocked(true) 显示。
+fn create_shield_window() -> Option<HWND> {
+    unsafe {
+        let class = w!("RuissShieldWindow");
+        let hinst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
+        let wc = WNDCLASSW {
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(shield_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: HICON::default(),
+            hCursor: HCURSOR::default(),
+            hbrBackground: HBRUSH::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: class,
+        };
+        // 类可能已被本进程注册（重复 start），忽略 ERR_ALREADY_EXISTS 即可
+        let _ = RegisterClassW(&wc);
+        let (w, h) = screen_size();
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            class,
+            w!("RuissShield"),
+            WS_POPUP,
+            0,
+            0,
+            w,
+            h,
+            None,
+            None,
+            hinst,
+            None,
+        )
+        .ok()?;
+        // alpha=1：肉眼不可见但 hit-test 有效（alpha=0 可能被系统当点击穿透）
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
+        Some(hwnd)
+    }
 }
 
 /// 捕获器：两个低层钩子 + 钩子线程 + 消费线程。
@@ -124,6 +197,17 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<u32>>) {
         };
 
     log::info!("低层钩子已安装（鼠标 + 键盘）");
+    // 创建全屏透明罩子窗口（默认隐藏）：跨屏期间盖住桌面 → 桌面文件零 hover。
+    // 窗口在钩子线程创建，消息循环泵它的消息；ShowWindow 由 set_local_input_blocked 从外部控制。
+    match create_shield_window() {
+        Some(hwnd) => {
+            if let Ok(mut g) = SHIELD_HWND.lock() {
+                *g = Some(hwnd.0 as isize);
+            }
+            log::info!("罩子窗口已创建（透明全屏，默认隐藏）");
+        }
+        None => log::warn!("罩子窗口创建失败（桌面 hover 副作用可能回来）"),
+    }
     let _ = ready.send(Ok(tid));
 
     // 消息循环：GetMessageW 收到 WM_QUIT 返回 FALSE，循环结束
@@ -135,7 +219,15 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<u32>>) {
         }
     }
 
-    // 清理：卸钩子 + 释放通道（Sender 全部 drop 后消费线程自然退出）
+    // 清理：销毁罩子窗口 + 卸钩子 + 释放通道（Sender 全部 drop 后消费线程自然退出）
+    if let Ok(mut g) = SHIELD_HWND.lock() {
+        if let Some(raw) = g.take() {
+            let hwnd = HWND(raw as *mut c_void);
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
     unsafe {
         let _ = UnhookWindowsHookEx(keyboard_hook);
         let _ = UnhookWindowsHookEx(mouse_hook);

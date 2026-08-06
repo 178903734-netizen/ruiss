@@ -104,3 +104,16 @@
 - 文档：PROJECT.md（规划存档 + 项目地图）、CHANGELOG.md。
 - 图标生成脚本 scripts/gen-icon.mjs（node 生成 PNG）。
 - 原因：把规划落地为可运行的骨架，先跑通"托盘图标弹出来"，再按 M1→M4 迭代。
+
+## 2026-08-06 — 跨屏桌面零 hover 改用"全屏透明罩子窗口"方案（回退 Raw Input 后）
+
+- 背景：B 路线（Raw Input 相对位移）在 Windows 实测失败——吞掉本机
+  MouseMove 后系统钳制光标，Raw Input 增量也丢失（154a1c1 提交注释里
+  作者警告过的坑），对端光标钉死在边缘 → 回退到 16b6a0c（移动放行 +
+  绝对坐标转发）
+- 新方案：跨屏期间创建全屏透明罩子窗口（WS_EX_LAYERED + alpha=1 置顶），
+  鼠标消息打在罩子上、桌面收不到 → 桌面文件零 hover；低层钩子仍在罩子
+  之前拿到事件，绝对坐标转发数据链完全不变
+- 代价：跨屏期间本机 UI 本就不操作（点击转发对端），罩子挡住符合预期
+- 文件：win.rs（create_shield_window + SHIELD_HWND + set_local_input_blocked
+  联动开合）、Cargo.toml（加 Win32_Graphics_Gdi / Win32_System_LibraryLoader）

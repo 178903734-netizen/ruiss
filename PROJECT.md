@@ -132,3 +132,12 @@ cargo tauri build --manifest-path src-tauri/Cargo.toml
 - 本机（2026-08-05）：Windows + Git Bash；node v24.15.0 / npm 11.12.1 / git 2.54.0；Rust 尚未安装。
 - 首次运行前：装 Rust（上面命令），然后 `cargo check --manifest-path src-tauri/Cargo.toml` 验证骨架可编译，再 `cargo run` 跑托盘。
 - Windows 依赖 WebView2 Runtime（Win10/11 一般自带，没有的话装一下）。
+
+## 跨屏桌面零 hover：全屏透明罩子窗口（win.rs）
+
+- SHIELD_HWND：罩子窗口句柄（isize 存储，HWND 不 Send）
+- create_shield_window：WS_EX_LAYERED + WS_EX_TOPMOST + WS_EX_NOACTIVATE
+  全屏透明窗口，alpha=1（不可见但 hit-test 有效）
+- set_local_input_blocked(true/false) 与跨屏状态联动 ShowWindow
+- 原理：罩子接住鼠标消息 → 桌面收不到 → 零 hover；WH_MOUSE_LL 钩子
+  先于窗口拿到事件 → 转发链不受影响
