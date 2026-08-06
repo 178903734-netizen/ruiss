@@ -141,3 +141,10 @@ cargo tauri build --manifest-path src-tauri/Cargo.toml
 - set_local_input_blocked(true/false) 与跨屏状态联动 ShowWindow
 - 原理：罩子接住鼠标消息 → 桌面收不到 → 零 hover；WH_MOUSE_LL 钩子
   先于窗口拿到事件 → 转发链不受影响
+
+## 被控端防双鼠标（SINK_ACTIVE）
+
+- win.rs / mac.rs：static SINK_ACTIVE + set_sink_active(active)
+- 捕获侧：Sink 时吞本机 MouseMove（win.rs mouse_proc 返回 1；mac.rs tap 回调返回 None）
+- lib.rs：TakeControl 收到 → set_sink_active(true)；ReleaseControl / 断线复位 → false
+- 原理：被控时光标只跟对端注入走，本机输入不再移动光标 → 无双鼠标/乱跳

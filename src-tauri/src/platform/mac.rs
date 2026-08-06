@@ -55,6 +55,10 @@ static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
+/// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMoved——光标只跟对端注入走，
+/// 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
+static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// 跨屏期间是否应保持光标隐藏（Source 跨屏时 true）。
 /// macOS 的 NSCursor hide 是"一次性"隐藏——鼠标/触控板一移动系统就自动重显光标，
 /// 必须靠"移动补藏 + 周期补藏"持续压制（见 enforce_cursor_hidden）。
@@ -66,6 +70,11 @@ static CURSOR_HIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+}
+
+/// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMoved（防双鼠标）。
+pub fn set_sink_active(active: bool) {
+    SINK_ACTIVE.store(active, Ordering::Relaxed);
 }
 
 /// tap 回调往消费线程送事件的通道（线程局部：捕获线程装填）。
@@ -201,6 +210,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
             if pid != 0 {
                 return Some(event.clone());
+            }
+            // 被控端（Sink）：吞掉本机 MouseMoved——光标只跟对端注入走，
+            // 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
+            if SINK_ACTIVE.load(Ordering::Relaxed)
+                && matches!(event_type, CGEventType::MouseMoved)
+            {
+                return None;
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());

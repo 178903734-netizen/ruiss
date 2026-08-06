@@ -117,3 +117,12 @@
 - 代价：跨屏期间本机 UI 本就不操作（点击转发对端），罩子挡住符合预期
 - 文件：win.rs（create_shield_window + SHIELD_HWND + set_local_input_blocked
   联动开合）、Cargo.toml（加 Win32_Graphics_Gdi / Win32_System_LibraryLoader）
+
+## 2026-08-06 — Mac 双鼠标修复：被控端（Sink）吞掉本机 MouseMove
+
+- 现象：Mac 被 Windows 控制时偶现双鼠标/乱跳——本机触控板一动，
+  本机光标被"抢走"，与对端注入的移动打架（Windows 端对称存在）
+- 修复：新增 SINK_ACTIVE 标志，Sink 期间捕获侧吞掉本机 MouseMove
+  （win.rs mouse_proc / mac.rs tap 回调），光标只跟对端注入走
+- 状态同步：TakeControl 收到→true、ReleaseControl→false、断线复位→false
+- 文件：mac.rs / win.rs / lib.rs

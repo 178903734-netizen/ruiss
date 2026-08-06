@@ -63,6 +63,10 @@ fn suppress_injected() -> bool {
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
+/// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMove——光标只跟对端注入走，
+/// 否则本机鼠标一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
+static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// 全屏透明"罩子"窗口句柄（存 isize：HWND 是裸指针不 Send，不能进 static Mutex）。
 /// 跨屏期间盖住整个桌面，鼠标移动消息打在罩子上（桌面收不到）→ 桌面文件零 hover；
 /// 低层钩子仍在罩子之前拿到事件，转发数据链完全不受影响。
@@ -79,6 +83,11 @@ pub fn set_local_input_blocked(blocked: bool) {
             }
         }
     }
+}
+
+/// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMove（防双鼠标）。
+pub fn set_sink_active(active: bool) {
+    SINK_ACTIVE.store(active, Ordering::Relaxed);
 }
 
 /// 罩子窗口的窗口过程：什么都不做，默认处理即可（窗口只是"接住"鼠标消息）。
@@ -255,15 +264,19 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 {
             if let Some(p) = mouse_to_payload(wparam.0 as u32, ms) {
                 log::debug!("捕获: {p:?}");
-                // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）
+                // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）。
+                // 被控端（Sink）：本机 MouseMove 也吞掉——光标只跟对端注入走，
+                // 否则本机鼠标一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
                 let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
                     && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. });
+                let sink_swallow = SINK_ACTIVE.load(Ordering::Relaxed)
+                    && matches!(p, Payload::MouseMove { .. });
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);
                     }
                 });
-                if swallow {
+                if swallow || sink_swallow {
                     return LRESULT(1);
                 }
                 // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏

@@ -241,6 +241,7 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                         a.on_peer_release();
                         platform::show_cursor();
                         platform::set_local_input_blocked(false);
+                        platform::set_sink_active(false);
                     }
                 }
                 acts
@@ -307,6 +308,8 @@ async fn run_incoming_router(
                 // 这个系统光标，隐藏它会导致"被控但找不到鼠标"；本机输入恢复原样
                 platform::show_cursor();
                 platform::set_local_input_blocked(false);
+                // 标记本机为被控端（Sink）：吞掉本机 MouseMove，光标只跟对端注入走（防双鼠标）
+                platform::set_sink_active(true);
                 let entry = {
                     let mut r = match router.lock() {
                         Ok(g) => g,
@@ -332,6 +335,7 @@ async fn run_incoming_router(
                 log::info!("对端归还控制");
                 platform::show_cursor();
                 platform::set_local_input_blocked(false);
+                platform::set_sink_active(false);
                 let mut r = match router.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
