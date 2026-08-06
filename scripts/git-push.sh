@@ -8,8 +8,8 @@
 #
 # 说明：
 #   - 自动执行 git add -A + commit + push
+#   - push 前先 git pull（防两边改乱：Mac 本地旧文件覆盖远程新代码的事故）
 #   - 提交前检查：拒绝误提交 .rar/.zip 大文件（src-tauri.zip 1GB 事故教训）
-#   - 换机器开工前先 git pull，改完再跑本脚本
 # ============================================================
 
 # 切到项目根目录（脚本在 scripts/ 下）
@@ -32,7 +32,7 @@ if [ -z "$1" ]; then
     echo "⚠ 未提供提交说明，使用默认：自动提交"
 fi
 
-echo "=== 1/4 检查待提交文件 ==="
+echo "=== 1/5 检查待提交文件 ==="
 git status --short
 
 # 安全检查：拒绝 .rar/.zip（防止 1GB 大文件再次进历史）
@@ -54,15 +54,23 @@ if [ -z "$(git status --short)" ]; then
 fi
 
 echo ""
-echo "=== 2/4 提交 ==="
+echo "=== 2/5 提交 ==="
 git add -A
 git commit -m "$MSG" || exit 1
 
 echo ""
-echo "=== 3/4 推送到 GitHub ==="
-git push || { echo "❌ push 失败，可能原因：网络不通 / 未配 SSH / 需要先 git pull"; exit 1; }
+echo "=== 3/5 先拉取远程最新（防覆盖他人改动）==="
+git pull --rebase || {
+    echo "❌ pull 失败：可能网络不通，或本地与远程有冲突"
+    echo "   冲突时：git status 看冲突文件 → 手动解决 → git rebase --continue"
+    exit 1
+}
 
 echo ""
-echo "=== 4/4 完成 ==="
+echo "=== 4/5 推送到 GitHub ==="
+git push origin HEAD:master || { echo "❌ push 失败，可能原因：网络不通 / 未配 SSH"; exit 1; }
+
+echo ""
+echo "=== 5/5 完成 ==="
 git log --oneline -1
 echo "✅ 已推送到 GitHub（master）"
