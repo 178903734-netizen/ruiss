@@ -267,7 +267,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）。
                 // 被控端（Sink）：本机 MouseMove 不吞——光标跟随本机鼠标，用户可推到
                 // 出口边反向夺回控制权（自由双向切换，见 arbiter.on_cursor 的 Sink 分支）。
-                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                let swallow = (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
                     && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. });
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
@@ -295,7 +295,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             if let Some(p) = keyboard_to_payload(wparam.0 as u32, ks) {
                 log::debug!("捕获: {p:?}");
                 // 跨屏期间：键盘事件吞掉（只转发对端，本机不生效）
-                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
+                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed);
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);

@@ -274,8 +274,8 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 if matches!(event_type, CGEventType::MouseMoved) {
                     enforce_cursor_hidden();
                 }
-                // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
+                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
