@@ -72,9 +72,20 @@ pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
 }
 
+/// 被控端（Sink）：本机鼠标的虚拟位置（由相对位移 delta 累积）。
+/// 被控时光标不跟随本机鼠标（防双鼠标），但本机鼠标物理移动的
+/// delta 累积成虚拟位置——推到出口边即可反向夺回控制权（自由切换）。
+static LOCAL_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
 /// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMoved（防双鼠标）。
 pub fn set_sink_active(active: bool) {
     SINK_ACTIVE.store(active, Ordering::Relaxed);
+    if active {
+        // 新一輪被控：虚拟位置清空，等待首次移动用当前光标位置初始化
+        if let Ok(mut g) = LOCAL_VIRTUAL_POS.lock() {
+            *g = None;
+        }
+    }
 }
 
 /// tap 回调往消费线程送事件的通道（线程局部：捕获线程装填）。
@@ -218,9 +229,44 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             if pid != 0 {
                 return Some(event.clone());
             }
-            // 被控端（Sink）：本机 MouseMoved 放行进入仲裁器——本机鼠标推到
-            // 出口边停留可反向夺回控制权（自由切换）；非出口边由仲裁器过滤不转发，
-            // 光标位置仍跟随本机鼠标（用户可见），对端注入已停时不会打架。
+            // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
+            // 但相对位移 delta 累积成虚拟位置发送给仲裁器——本机鼠标推到
+            // 出口边即可反向夺回控制权（自由切换）。
+            if SINK_ACTIVE.load(Ordering::Relaxed)
+                && matches!(event_type, CGEventType::MouseMoved)
+            {
+                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                let (vx, vy) = {
+                    let mut g = match LOCAL_VIRTUAL_POS.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    match *g {
+                        Some((x, y)) => {
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            *g = Some((nx, ny));
+                            (nx, ny)
+                        }
+                        None => {
+                            // 首次移动：以当前光标位置（对端注入位置）为起点
+                            let loc = event.location();
+                            *g = Some((loc.x, loc.y));
+                            (loc.x, loc.y)
+                        }
+                    }
+                };
+                let (w, h) = screen_size();
+                let _ = tx.send(Payload::MouseMove {
+                    x: vx as i32,
+                    y: vy as i32,
+                    src_w: w as u32,
+                    src_h: h as u32,
+                });
+                // 吞掉真实事件：光标不跟随本机鼠标（防双鼠标）
+                return None;
+            }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
                 // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
