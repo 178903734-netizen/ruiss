@@ -275,9 +275,10 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     enforce_cursor_hidden();
                 }
                 // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
-                    || SINK_ACTIVE.load(Ordering::Relaxed)
-                    || CURSOR_SUPPRESS.load(Ordering::SeqCst))
+                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
+                // 注意：不用 CURSOR_SUPPRESS 兜底——它表示"光标隐藏中"，若 show_cursor 未配对执行
+                // 会卡 true 导致空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
+                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
