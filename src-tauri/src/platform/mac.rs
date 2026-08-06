@@ -275,7 +275,9 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     enforce_cursor_hidden();
                 }
                 // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
+                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    || SINK_ACTIVE.load(Ordering::Relaxed)
+                    || CURSOR_SUPPRESS.load(Ordering::SeqCst))
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
@@ -419,7 +421,17 @@ impl InputInjector {
                 CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn)
             }
             Payload::MouseWheel { dx, dy } => {
-                CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 1, *dy as i32, *dx as i32, 0)
+                // Win 端 wheel_delta 是格数（±1），LINE 单位注入 macOS 响应极弱（等同没滚）；
+                // 改 PIXEL 单位放大到 ~100px/格，保证对端滚轮在 Mac 上可感知。
+                let scale = 100;
+                CGEvent::new_scroll_event(
+                    source,
+                    ScrollEventUnit::PIXEL,
+                    1,
+                    (*dy as i32) * scale,
+                    (*dx as i32) * scale,
+                    0,
+                )
             }
             Payload::Key { key, down, .. } => {
                 let key = map_key(true, *key); // 目标为 Mac：Ctrl ↔ Command 映射
