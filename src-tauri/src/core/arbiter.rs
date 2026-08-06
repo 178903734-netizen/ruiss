@@ -52,6 +52,12 @@ pub enum Action {
 
 /// 边界像素余量（与 geometry::hit_edge 默认一致）
 const EDGE_MARGIN: i32 = 2;
+/// Sink 侧返回判定容差：注入光标进入出口边附近 30px 内即算"到边"
+/// （触控板/相对移动设备无法精确停在 2px 内，需要更宽的带）
+const RETURN_MARGIN: i32 = 30;
+/// 位置抖动容差：坐标变化不超过 3px 视为"停住"
+/// （触控板停手后仍有惯性/微移，变化 1~2px 不应重置停留计时）
+const JITTER_TOLERANCE: i32 = 3;
 /// 边缘停留防误触时长（规划 100~200ms）
 const DWELL: Duration = Duration::from_millis(150);
 /// 跨屏触发防抖：一次 Take/Release 后 1s 内不重复触发
@@ -166,10 +172,17 @@ impl Arbiter {
             self.last_injected = None;
             return Vec::new();
         };
-        let at_entry = geometry::hit_edge(x, y, w, h, EDGE_MARGIN) == self.exit_edge;
+        let at_entry = geometry::hit_edge(x, y, w, h, RETURN_MARGIN) == self.exit_edge;
 
-        // 注入位置变化 → 重置停留计时（只有真正停住/停住滑出才算停留）
-        if self.last_injected != Some((x, y)) {
+        // 注入位置变化超过抖动容差 → 重置停留计时
+        // （触控板停手后仍有惯性/微移，坐标变化 ≤ JITTER_TOLERANCE 视为停住）
+        let moved = match self.last_injected {
+            Some((px, py)) => {
+                (x - px).abs() > JITTER_TOLERANCE || (y - py).abs() > JITTER_TOLERANCE
+            }
+            None => true,
+        };
+        if moved {
             self.last_injected = Some((x, y));
             self.sink_dwell = if at_entry { Some(now) } else { None };
             return Vec::new();

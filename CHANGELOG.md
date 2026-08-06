@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-08-06 — Sink 侧原路返回判定放宽（触控板友好）
+
+- 根因：Mac→Windows 跨屏后无法原路返回。on_sink_tick 要求注入光标精确停在
+  出口边 2px 内且位置完全不变 150ms——触控板是相对移动 + 停手后惯性微移，
+  位置差 1px 就重置计时，150ms 永远凑不满 → 返回判定永不触发。
+- 修复（src-tauri/src/core/arbiter.rs）：
+  - 新增 RETURN_MARGIN = 30：Sink 侧返回判定用 30px 宽边缘带（原 EDGE_MARGIN=2 仅用于
+    Source 侧跨屏触发，保持精确防误触）。
+  - 新增 JITTER_TOLERANCE = 3：注入位置变化 ≤3px 视为"停住"，不重置停留计时，
+    抵消触控板惯性/微移。
+- 事故记录：Mac 端推送 git-push.sh（36af9a6）时带上了 Mac 本地旧版 arbiter.rs，
+  覆盖删除了本修复 → 已 reset 对齐远程后重新应用，确认两处修改在位。
+- 验证：cargo check 通过；打包 D:/ruiss-target/debug/ruiss.exe。
+- 同步：推送 GitHub，Mac 端 pull 后重新编译同版本测试。
+
 ## 2026-08-05 — M1 自测模式 v2：延迟回声 + 统计 + 注入测试
 
 - 修复回环看不到效果的问题：
