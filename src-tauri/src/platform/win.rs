@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
     CreateCursor, SetSystemCursor,
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
     SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
@@ -82,12 +82,17 @@ pub fn set_local_input_blocked(blocked: bool) {
 }
 
 /// 罩子窗口的窗口过程：什么都不做，默认处理即可（窗口只是"接住"鼠标消息）。
+/// WM_SETCURSOR 返回 TRUE：拦截系统自动设置光标——否则鼠标移到罩子上时
+/// Windows 可能显示忙碌转圈/箭头（SetSystemCursor 替换不覆盖的场景）。
 unsafe extern "system" fn shield_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_SETCURSOR {
+        return LRESULT(1); // TRUE：光标已处理，系统不要切换
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -348,12 +353,14 @@ pub fn hide_cursor() {
         return; // 已在隐藏状态
     }
 
-    // 需要替换的系统光标类型（覆盖最常用的）
-    let cursor_ids: [SYSTEM_CURSOR_ID; 4] = [
+    // 需要替换的系统光标类型（覆盖最常用的；32514 = OCR_WAIT 纯转圈也要盖，
+    // 否则跨屏时 Windows 切到忙碌光标会显示转圈）
+    let cursor_ids: [SYSTEM_CURSOR_ID; 5] = [
         SYSTEM_CURSOR_ID(32512), // OCR_NORMAL      — 箭头
         SYSTEM_CURSOR_ID(32513), // OCR_IBEAM       — 文本选择
+        SYSTEM_CURSOR_ID(32514), // OCR_WAIT        — 忙碌（纯转圈）
         SYSTEM_CURSOR_ID(32649), // OCR_HAND        — 手型（链接悬停）
-        SYSTEM_CURSOR_ID(32650), // OCR_APPSTARTING — 后台忙（等待光标）
+        SYSTEM_CURSOR_ID(32650), // OCR_APPSTARTING — 后台忙（转圈+箭头）
     ];
 
     for &id in &cursor_ids {
