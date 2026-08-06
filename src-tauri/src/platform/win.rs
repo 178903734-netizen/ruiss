@@ -10,6 +10,7 @@
 // TODO(M2)：多显示器坐标（虚拟屏幕归一化）、X 键鼠标按键、键位映射接入 keys.rs。
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{FALSE, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -29,10 +30,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT,
     LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW,
-    SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx,
+    SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    CreateCursor, SetSystemCursor, SystemParametersInfoW,
+    SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
 };
 
 use crate::core::keys::Key;
@@ -226,39 +229,72 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 }
 
 /// 跨屏期间是否抑制本机光标显示（Source linked 或 Sink 都为 true）。
-/// 移动补藏：鼠标移动事件时检查，发现显示计数被外部（tao 等）拉回就再藏。
+/// 使用 SetSystemCursor 替换系统光标资源为透明图标——内核级替换，
+/// 不受 per-thread ShowCursor 计数器或其他窗口 SetCursor 影响。
 static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
 
-/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
-/// ShowCursor 计数是全局的，tao/其他程序会频繁 ShowCursor(TRUE) 抵消，
-/// 循环压到负计数 + 移动补藏（mouse_proc 里）双重保障。
-pub fn hide_cursor() {
-    CURSOR_SUPPRESS.store(true, Ordering::Relaxed);
-    let mut n = unsafe { ShowCursor(FALSE) };
-    while n >= 0 {
-        n = unsafe { ShowCursor(FALSE) };
+/// 创建 1x1 全透明光标。
+/// AND 掩码全 1（不改变桌面像素），XOR 掩码全 0（不绘制任何像素）→ 完全透明。
+fn create_transparent_cursor() -> Option<HCURSOR> {
+    unsafe {
+        let and_mask: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+        let xor_mask: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+        CreateCursor(
+            None,
+            0, 0, 1, 1,
+            and_mask.as_ptr() as *const c_void,
+            xor_mask.as_ptr() as *const c_void,
+        )
+        .ok()
     }
-    log::info!("隐藏光标（计数 {n}）");
 }
 
-/// 恢复显示本机光标（循环归正计数）。
+/// 隐藏本机光标 — 用 SetSystemCursor 把系统光标资源替换为透明图标。
+/// 不管哪个窗口通过 LoadCursor/SetCursor 显示光标，拿到的都是透明图。
+pub fn hide_cursor() {
+    if CURSOR_SUPPRESS.swap(true, Ordering::Relaxed) {
+        return; // 已在隐藏状态
+    }
+
+    // 需要替换的系统光标类型（覆盖最常用的）
+    let cursor_ids: [SYSTEM_CURSOR_ID; 4] = [
+        SYSTEM_CURSOR_ID(32512), // OCR_NORMAL      — 箭头
+        SYSTEM_CURSOR_ID(32513), // OCR_IBEAM       — 文本选择
+        SYSTEM_CURSOR_ID(32649), // OCR_HAND        — 手型（链接悬停）
+        SYSTEM_CURSOR_ID(32650), // OCR_APPSTARTING — 后台忙（等待光标）
+    ];
+
+    for &id in &cursor_ids {
+        // SetSystemCursor 会销毁传入的光标句柄，所以每次新建一个
+        if let Some(c) = create_transparent_cursor() {
+            let _ = unsafe { SetSystemCursor(c, id) };
+        }
+    }
+
+    log::info!("已隐藏光标（SetSystemCursor 替换为透明图标）");
+}
+
+/// 恢复显示本机光标 — SPI_SETCURSORS 从注册表重新加载所有系统光标。
+/// 无条件执行（不检查 CURSOR_SUPPRESS）：即使上次运行崩溃/被强杀导致
+/// 系统光标停留在透明状态，本次启动调用也能恢复。
 pub fn show_cursor() {
     CURSOR_SUPPRESS.store(false, Ordering::Relaxed);
-    let mut n = unsafe { ShowCursor(TRUE) };
-    while n < 0 {
-        n = unsafe { ShowCursor(TRUE) };
+
+    // SPI_SETCURSORS：通知系统从 HKCU\Control Panel\Cursors 重新加载所有光标
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETCURSORS,
+            0,
+            None,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
     }
-    log::info!("恢复光标（计数 {n}）");
+
+    log::info!("已恢复光标（SPI_SETCURSORS 从注册表重载）");
 }
 
-/// 移动补藏：跨屏期间调用一次，对抗外部 ShowCursor(TRUE) 把计数拉回 0
-/// （光标重新显示）。调用点：mouse_proc 每个真实移动事件 + lib.rs tick 每 100ms
-/// （停手不动时也持续压制，不依赖移动事件）。
-pub fn enforce_cursor_hidden() {
-    if CURSOR_SUPPRESS.load(Ordering::Relaxed) {
-        let _ = unsafe { ShowCursor(FALSE) };
-    }
-}
+/// SetSystemCursor 是系统级替换，无需补藏。保留空实现兼容外部调用。
+pub fn enforce_cursor_hidden() {}
 
 /// 滚轮增量：高 16 位为有符号 delta，换算为"格"（Windows 一格 = 120）。
 fn wheel_delta(ms: &MSLLHOOKSTRUCT) -> i32 {

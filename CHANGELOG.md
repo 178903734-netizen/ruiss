@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2026-08-06 — Windows 光标隐藏升级：SetSystemCursor 系统级透明替换（协作改动）
+
+- 背景：ShowCursor 计数方案实测仍双鼠标（tao/其他窗口可把计数拉回），
+  协作智能体改用 SetSystemCursor 系统级替换，修复其编译错误 + 崩溃恢复 bug。
+- win.rs（Windows）：
+  - hide_cursor()：创建 1x1 全透明光标（AND 全 1 / XOR 全 0），SetSystemCursor
+    替换 4 种系统光标（箭头/文本/手型/等待）——内核级替换，任何窗口
+    LoadCursor/SetCursor 都拿到透明图，不再受 per-thread 计数影响。
+  - show_cursor()：SPI_SETCURSORS 从注册表重载所有系统光标。
+    改为无条件执行（不检查 CURSOR_SUPPRESS）——修复崩溃/强杀后重启时
+    show_cursor 因标志为 false 直接 return、系统光标永久透明的 bug。
+  - enforce_cursor_hidden() 保留空实现（SetSystemCursor 无需补藏）。
+  - 修复编译错误：CopyCursor 未解析 → 改为每次新建光标传给 SetSystemCursor
+    （它会销毁传入句柄）；TRANSPARENT_CURSOR 静态 OnceLock<HCURSOR> 不满足
+    Send/Sync → 删除静态缓存；CreateCursor 掩码指针类型 → *const c_void；
+    SetSystemCursor 第二参数 → SYSTEM_CURSOR_ID(id)。
+- mac.rs：enforce_cursor_hidden 的 NSCursor hide 改用
+  performSelectorOnMainThread 调度主线程（NSCursor 必须在主线程调用）。
+- 验证：Windows cargo check/build 通过（10:26 exe）；mac.rs 需 Mac 端编译确认。
+
 ## 2026-08-06 — 双鼠标根治：两端对称的"持续补藏"机制
 
 - 根因：光标隐藏是"一次性"的，会被外部/系统拉回显示：

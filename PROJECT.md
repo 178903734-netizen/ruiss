@@ -56,9 +56,11 @@ ruiss/
 - core/geometry.rs — 坐标换算。统一按"逻辑像素"算（Windows 缩放 125%/150%、Mac Retina 都避开物理像素问题）。
 - core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则。
 - platform/ — 事件捕获与注入，每端约 200 行。Windows: SetWindowsHookEx 捕获 + SendInput 注入；Mac: CGEventTap 捕获 + CGEventPost 注入。
-  - 光标隐藏（双鼠标对抗）：hide_cursor/show_cursor 由 lib.rs 跨屏状态驱动；
-    enforce_cursor_hidden() 持续补藏——macOS 移动自动重显、Windows tao 拉回计数时压回。
-    调用点：win.rs mouse_proc 移动事件 + 两端 lib.rs tick 每 100ms（linked 时）。
+  - 光标隐藏（双鼠标对抗）：Windows 用 SetSystemCursor 把系统光标替换为透明图标
+    （内核级，任何窗口 SetCursor 都拿透明图），show_cursor 用 SPI_SETCURSORS 从
+    注册表重载恢复（无条件执行，崩溃重启也能恢复）；Mac 用 NSCursor hide +
+    tap 回调移动补藏（macOS 移动自动重显）对抗。lib.rs tick 每 100ms 调
+    enforce_cursor_hidden()（Windows 已无需补藏，空实现）。
 - net/ — TCP（按键、剪贴板，可靠）+ UDP（鼠标高频移动）。二进制协议，粘包处理。
 - clipboard/ — 监听系统剪贴板变化（Win: AddClipboardFormatListener；Mac: NSPasteboard 通知），变化后经 TCP 发给对端；带标记位防回环（收到自己发的不再转发）。
 

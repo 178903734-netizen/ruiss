@@ -112,12 +112,18 @@ pub fn show_cursor() {
 
 /// 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
 /// （对抗 macOS 移动鼠标自动重显光标的行为；与 win.rs 同名机制对称）。
+/// 注意：NSCursor hide 必须在主线程调用——用 performSelectorOnMainThread 调度。
 pub fn enforce_cursor_hidden() {
     if CURSOR_SUPPRESS.load(Ordering::SeqCst) {
         CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
         unsafe {
             if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-                let _: () = objc::msg_send![cls, hide];
+                let _: () = objc::msg_send![
+                    cls,
+                    performSelectorOnMainThread: sel!(hide)
+                    withObject: nil
+                    waitUntilDone: false
+                ];
             }
         }
     }
