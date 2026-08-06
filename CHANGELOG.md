@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 2026-08-06 — 双鼠标根治：两端对称的"持续补藏"机制
+
+- 根因：光标隐藏是"一次性"的，会被外部/系统拉回显示：
+  - Windows：tao/WebView2 会不定期 ShowCursor(TRUE) 把计数拉回 0，原补藏只
+    在鼠标移动事件时触发（mouse_proc），用户停手不动时补藏停止 → 光标重新出现。
+  - macOS：NSCursor.hide 后系统在鼠标/触控板移动时自动重显光标，且 mac.rs
+    完全没有补藏逻辑 → 一滑动双鼠标必现。
+- 修复（两端对称三件事）：
+  - lib.rs spawn_tick_task：Source 跨屏期间（linked）每 100ms 主动调
+    platform::enforce_cursor_hidden()——停手不动也持续压制，不依赖移动事件。
+  - mac.rs：新增 enforce_cursor_hidden()（CURSOR_SUPPRESS 时再 hide 一次），
+    tap 回调里真实 MouseMoved 事件后调用（对抗 macOS 移动自动重显）；
+    hide/show 改为计数配对（CURSOR_HIDE_COUNT 记录 hide 次数，show 循环 unhide
+    同样次数，NSCursor 计数制防失衡）；CURSOR_HIDDEN 幂等标志废除（它会让
+    补藏失效：外部拉回显示后标志仍是 true，hide_cursor 直接跳过）。
+  - win.rs：enforce_cursor_hidden_on_move 改名为 pub enforce_cursor_hidden，
+    供 lib.rs tick 调用（原有 mouse_proc 移动补藏保留）。
+- 验证：cargo check 通过；mac.rs 改动需 Mac 端编译确认。
+
 ## 2026-08-06 — 修复返回光标位置 + 被控端光标可见性
 
 - 现象 1：原路返回后鼠标从屏幕另一头出现（跨屏时 Source 侧 Warp 到对侧，返回时没 warp 回来）。

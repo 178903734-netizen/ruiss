@@ -223,6 +223,12 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                 let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
                 if let Some(a) = r.arbiter.as_mut() {
                     let (w, h) = platform::screen_size();
+                    // 主动补藏：Source 跨屏期间每 100ms 压一次光标隐藏。
+                    // 对抗 tao ShowCursor(TRUE) / macOS 移动自动重显，
+                    // 停手不动时也持续压制（不依赖移动事件）。
+                    if a.linked {
+                        platform::enforce_cursor_hidden();
+                    }
                     if a.mode == Mode::Sink {
                         // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
                         acts.extend(a.on_sink_tick(platform::last_injected_pos(), w, h, Instant::now()));

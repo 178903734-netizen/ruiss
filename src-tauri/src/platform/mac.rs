@@ -55,9 +55,14 @@ static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
-/// 光标隐藏状态（NSCursor hide/unhide 是计数制：hide +1、unhide -1，
-/// 重复 hide 后单次 unhide 无法恢复。用标志位保证 hide/unhide 严格配对）。
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// 跨屏期间是否应保持光标隐藏（Source 跨屏时 true）。
+/// macOS 的 NSCursor hide 是"一次性"隐藏——鼠标/触控板一移动系统就自动重显光标，
+/// 必须靠"移动补藏 + 周期补藏"持续压制（见 enforce_cursor_hidden）。
+static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// hide 调用次数（NSCursor hide/unhide 是计数制：hide +1、unhide -1，
+/// 重复 hide 后必须 unhide 同样次数才恢复显示。记录次数保证配对）。
+static CURSOR_HIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
@@ -80,10 +85,11 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 }
 
 /// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+/// 无条件执行 NSCursor hide 并计数——macOS 移动鼠标会自动重显光标，
+/// 重复 hide 是刻意的（计数配对，show 时按次数恢复）。
 pub fn hide_cursor() {
-    if CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
-        return; // 已隐藏，避免 NSCursor 计数失衡
-    }
+    CURSOR_SUPPRESS.store(true, Ordering::SeqCst);
+    CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, hide];
@@ -91,14 +97,28 @@ pub fn hide_cursor() {
     }
 }
 
-/// 恢复显示本机光标。
+/// 恢复显示本机光标（按 hide 计数循环 unhide，严格配对恢复）。
 pub fn show_cursor() {
-    if !CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
-        return; // 未隐藏，避免多余 unhide
+    CURSOR_SUPPRESS.store(false, Ordering::SeqCst);
+    let n = CURSOR_HIDE_COUNT.swap(0, Ordering::SeqCst);
+    for _ in 0..n {
+        unsafe {
+            if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+                let _: () = objc::msg_send![cls, unhide];
+            }
+        }
     }
-    unsafe {
-        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-            let _: () = objc::msg_send![cls, unhide];
+}
+
+/// 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
+/// （对抗 macOS 移动鼠标自动重显光标的行为；与 win.rs 同名机制对称）。
+pub fn enforce_cursor_hidden() {
+    if CURSOR_SUPPRESS.load(Ordering::SeqCst) {
+        CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+                let _: () = objc::msg_send![cls, hide];
+            }
         }
     }
 }
@@ -178,6 +198,11 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
+                // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
+                // （macOS 移动鼠标会自动重显光标，必须持续压制）
+                if matches!(event_type, CGEventType::MouseMoved) {
+                    enforce_cursor_hidden();
+                }
                 // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
                 if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
                     && matches!(

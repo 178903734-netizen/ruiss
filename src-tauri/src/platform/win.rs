@@ -169,7 +169,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
                 // （对抗 tao 等外部 ShowCursor(TRUE) 把计数拉回 0）
                 if wparam.0 as u32 == WM_MOUSEMOVE {
-                    enforce_cursor_hidden_on_move();
+                    enforce_cursor_hidden();
                 }
             }
         }
@@ -251,10 +251,10 @@ pub fn show_cursor() {
     log::info!("恢复光标（计数 {n}）");
 }
 
-/// 移动补藏：跨屏期间每个真实鼠标移动事件后调用一次，
-/// 对抗外部 ShowCursor(TRUE) 把计数拉回 0（光标重新显示）。
-/// 移动事件频率（~125Hz）远高于外部 +1 频率（实测 ~2.6Hz），能完全压住。
-fn enforce_cursor_hidden_on_move() {
+/// 移动补藏：跨屏期间调用一次，对抗外部 ShowCursor(TRUE) 把计数拉回 0
+/// （光标重新显示）。调用点：mouse_proc 每个真实移动事件 + lib.rs tick 每 100ms
+/// （停手不动时也持续压制，不依赖移动事件）。
+pub fn enforce_cursor_hidden() {
     if CURSOR_SUPPRESS.load(Ordering::Relaxed) {
         let _ = unsafe { ShowCursor(FALSE) };
     }
