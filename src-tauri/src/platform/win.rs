@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
@@ -48,6 +48,13 @@ thread_local! {
 fn suppress_injected() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("RUISS_NO_SUPPRESS").as_deref() != Ok("1"))
+}
+
+/// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
+static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_local_input_blocked(blocked: bool) {
+    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
 }
 
 /// 捕获器：两个低层钩子 + 钩子线程 + 消费线程。
@@ -148,11 +155,22 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 {
             if let Some(p) = mouse_to_payload(wparam.0 as u32, ms) {
                 log::debug!("捕获: {p:?}");
+                // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）
+                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. });
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);
                     }
                 });
+                if swallow {
+                    return LRESULT(1);
+                }
+                // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
+                // （对抗 tao 等外部 ShowCursor(TRUE) 把计数拉回 0）
+                if wparam.0 as u32 == WM_MOUSEMOVE {
+                    enforce_cursor_hidden_on_move();
+                }
             }
         }
     }
@@ -165,11 +183,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         if !suppress_injected() || ks.flags.0 & LLKHF_INJECTED.0 == 0 {
             if let Some(p) = keyboard_to_payload(wparam.0 as u32, ks) {
                 log::debug!("捕获: {p:?}");
+                // 跨屏期间：键盘事件吞掉（只转发对端，本机不生效）
+                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);
                     }
                 });
+                if swallow {
+                    return LRESULT(1);
+                }
             }
         }
     }
@@ -194,9 +217,53 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
     }
 }
 
-/// 滚轮增量：高 16 位为有符号 delta。
+/// 注入侧最后已知光标位置（Sink 侧返回判定用）。
+static LAST_INJECTED: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// 最近一次注入到本机的光标位置（None = 还没注入过移动）。
+pub fn last_injected_pos() -> Option<(i32, i32)> {
+    *LAST_INJECTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 跨屏期间是否抑制本机光标显示（Source linked 或 Sink 都为 true）。
+/// 移动补藏：鼠标移动事件时检查，发现显示计数被外部（tao 等）拉回就再藏。
+static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+/// ShowCursor 计数是全局的，tao/其他程序会频繁 ShowCursor(TRUE) 抵消，
+/// 循环压到负计数 + 移动补藏（mouse_proc 里）双重保障。
+pub fn hide_cursor() {
+    CURSOR_SUPPRESS.store(true, Ordering::Relaxed);
+    let mut n = unsafe { ShowCursor(FALSE) };
+    while n >= 0 {
+        n = unsafe { ShowCursor(FALSE) };
+    }
+    log::info!("隐藏光标（计数 {n}）");
+}
+
+/// 恢复显示本机光标（循环归正计数）。
+pub fn show_cursor() {
+    CURSOR_SUPPRESS.store(false, Ordering::Relaxed);
+    let mut n = unsafe { ShowCursor(TRUE) };
+    while n < 0 {
+        n = unsafe { ShowCursor(TRUE) };
+    }
+    log::info!("恢复光标（计数 {n}）");
+}
+
+/// 移动补藏：跨屏期间每个真实鼠标移动事件后调用一次，
+/// 对抗外部 ShowCursor(TRUE) 把计数拉回 0（光标重新显示）。
+/// 移动事件频率（~125Hz）远高于外部 +1 频率（实测 ~2.6Hz），能完全压住。
+fn enforce_cursor_hidden_on_move() {
+    if CURSOR_SUPPRESS.load(Ordering::Relaxed) {
+        let _ = unsafe { ShowCursor(FALSE) };
+    }
+}
+
+/// 滚轮增量：高 16 位为有符号 delta，换算为"格"（Windows 一格 = 120）。
 fn wheel_delta(ms: &MSLLHOOKSTRUCT) -> i32 {
-    (ms.mouseData >> 16) as i16 as i32
+    let raw = (ms.mouseData >> 16) as i16 as i32;
+    raw / 120 // WHEEL_DELTA：协议统一按"格"传
 }
 
 fn keyboard_to_payload(wparam: u32, ks: &KBDLLHOOKSTRUCT) -> Option<Payload> {
@@ -268,6 +335,12 @@ impl InputInjector {
     /// 注入一条事件，返回 SendInput 实际注入的条数（0 = 失败/跳过）。
     /// M1：鼠标坐标按主屏物理像素归一化（多显示器 M2/M4 处理）。
     pub fn inject(&self, event: Payload) -> u32 {
+        // 记录最后注入位置（Sink 侧返回判定用；已是本机坐标系）
+        if let Payload::MouseMove { x, y, .. } = &event {
+            if let Ok(mut p) = LAST_INJECTED.lock() {
+                *p = Some((*x, *y));
+            }
+        }
         let inputs: Vec<INPUT> = match &event {
             Payload::MouseMove { x, y, .. } => mouse_move_inputs(*x, *y),
             Payload::MouseButton { button, down } => mouse_button_inputs(*button, *down),
@@ -341,7 +414,8 @@ fn mouse_button_inputs(button: u8, down: bool) -> Vec<INPUT> {
 }
 
 fn mouse_wheel_inputs(dx: i32, dy: i32) -> Vec<INPUT> {
-    // SendInput 的滚轮 delta 放在高 16 位
+    // 协议按"格"传，注入时还原为 Windows delta（一格 = 120，放高 16 位）
+    let to_delta = |clicks: i32| ((clicks * 120) as u32) << 16;
     let mut out = Vec::new();
     if dy != 0 {
         out.push(INPUT {
@@ -350,7 +424,7 @@ fn mouse_wheel_inputs(dx: i32, dy: i32) -> Vec<INPUT> {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: (dy as u32) << 16,
+                    mouseData: to_delta(dy),
                     dwFlags: MOUSEEVENTF_WHEEL,
                     time: 0,
                     dwExtraInfo: 0,
@@ -365,7 +439,7 @@ fn mouse_wheel_inputs(dx: i32, dy: i32) -> Vec<INPUT> {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: (dx as u32) << 16,
+                    mouseData: to_delta(dx),
                     dwFlags: MOUSEEVENTF_HWHEEL,
                     time: 0,
                     dwExtraInfo: 0,
@@ -412,28 +486,5 @@ pub fn screen_size() -> (i32, i32) {
 pub fn warp_cursor(x: i32, y: i32) {
     unsafe {
         let _ = SetCursorPos(x, y);
-    }
-}
-
-/// 光标隐藏状态（ShowCursor 是全局计数制，用标志位幂等化防计数失衡）
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
-pub fn hide_cursor() {
-    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
-        return; // 已隐藏，跳过（避免计数失衡）
-    }
-    unsafe {
-        let _ = ShowCursor(FALSE);
-    }
-}
-
-/// 恢复显示本机光标。
-pub fn show_cursor() {
-    if !CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
-        return; // 已显示，跳过（避免计数失衡）
-    }
-    unsafe {
-        let _ = ShowCursor(TRUE);
     }
 }

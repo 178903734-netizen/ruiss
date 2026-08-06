@@ -52,12 +52,19 @@ pub fn accessibility_trusted() -> bool {
 /// 捕获线程 runloop 指针（stop 时通知退出）。
 static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
+static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_local_input_blocked(blocked: bool) {
+    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+}
+
 /// tap 回调往消费线程送事件的通道（线程局部：捕获线程装填）。
 thread_local! {
     static HOOK_SENDER: RefCell<Option<Sender<Payload>>> = const { RefCell::new(None) };
 }
 
-/// 注入侧最后已知光标位置（点击/滚轮注入用）。
+/// 注入侧最后已知光标位置（点击/滚轮注入用；Sink 侧返回判定用）。
 static LAST_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// 最近一次注入到本机的光标位置（None = 还没注入过移动）。
@@ -68,12 +75,22 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
     }
 }
 
-/// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
-static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
+pub fn hide_cursor() {
+    unsafe {
+        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+            let _: () = objc::msg_send![cls, hide];
+        }
+    }
+}
 
-/// 设置跨屏期间本机输入拦截开关。
-pub fn set_local_input_blocked(blocked: bool) {
-    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+/// 恢复显示本机光标。
+pub fn show_cursor() {
+    unsafe {
+        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
+            let _: () = objc::msg_send![cls, unhide];
+        }
+    }
 }
 
 /// 捕获器：CGEventTap + 捕获线程 + 消费线程。
@@ -151,16 +168,14 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
-                // 跨屏期间（Source 侧）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）
-                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) {
-                    match &p {
-                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. } => {
-                            return None; // 吞掉事件
-                        }
-                        // 移动放行（转发对端）；但 macOS 会因移动自动恢复光标显示 → 立即补藏
-                        Payload::MouseMove { .. } => force_hide_cursor(),
-                        _ => {}
-                    }
+                // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
+                if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    && matches!(
+                        p,
+                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
+                    )
+                {
+                    return None;
                 }
             }
             // 监听模式：原样放行，绝不吞事件
@@ -264,7 +279,7 @@ impl InputInjector {
 
     /// 注入一条事件，返回 1 表示已投递（0 = 失败/跳过）。
     pub fn inject(&self, event: Payload) -> u32 {
-        // 记录最后光标位置（点击/滚轮注入落点）
+        // 记录最后光标位置（点击/滚轮注入落点；Sink 侧返回判定用）
         if let Payload::MouseMove { x, y, .. } = &event {
             if let Ok(mut p) = LAST_POS.lock() {
                 *p = Some((*x as f64, *y as f64));
@@ -341,44 +356,6 @@ pub fn warp_cursor(x: i32, y: i32) {
             CGMouseButton::Left,
         ) {
             ev.post(CGEventTapLocation::HID);
-        }
-    }
-}
-
-/// 光标隐藏状态（NSCursor hide/unhide 是计数制，用标志位幂等化防计数失衡）
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// 真正调用 NSCursor hide（不查状态标志）。
-fn raw_hide_cursor() {
-    unsafe {
-        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-            let _: () = objc::msg_send![cls, hide];
-        }
-    }
-}
-
-/// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
-pub fn hide_cursor() {
-    if CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
-        return; // 已隐藏，跳过（避免计数失衡）
-    }
-    raw_hide_cursor();
-}
-
-/// 强制再隐藏一次（跨屏源端：macOS 会因鼠标移动自动恢复光标显示，需立即补藏）。
-fn force_hide_cursor() {
-    CURSOR_HIDDEN.store(true, Ordering::Relaxed);
-    raw_hide_cursor();
-}
-
-/// 恢复显示本机光标。
-pub fn show_cursor() {
-    if !CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
-        return; // 已显示，跳过（避免计数失衡）
-    }
-    unsafe {
-        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-            let _: () = objc::msg_send![cls, unhide];
         }
     }
 }

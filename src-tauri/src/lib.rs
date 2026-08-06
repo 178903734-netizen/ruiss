@@ -37,6 +37,8 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             setup_tray(app)?;
+            // 启动兜底：恢复上次可能残留的光标状态（Ruiss 被强杀后光标计数可能仍为负）
+            platform::show_cursor();
 
             let injector = Arc::new(platform::InputInjector::new());
             let router = Arc::new(Mutex::new(RouterState::new(
@@ -88,6 +90,9 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ruiss");
+    // 退出兜底：还原系统光标（SetSystemCursor 替换不会随进程退出自动还原，
+    // 正常退出（托盘退出/关窗）必须走这里恢复）
+    platform::show_cursor();
 }
 
 /// 托盘：图标 + 右键菜单（显示设置窗口 / 退出）。
@@ -204,6 +209,7 @@ fn start_capturer(
 }
 
 /// 空闲心跳：每 100ms 推进仲裁器停留判定（光标停在边缘不动时也能触发）。
+/// Source 侧：发起跨屏；Sink 侧：注入光标停在入口边 → 返回；断线时复位。
 fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -255,6 +261,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
     match action {
         Action::TakeControl { x, y, src_w, src_h } => {
             log::info!("发起跨屏 → TakeControl({x}, {y})");
+            // 本机光标"离开"（隐藏），避免双光标；键盘/点击/滚轮被拦截，只转发对端
             platform::hide_cursor();
             platform::set_local_input_blocked(true);
             net.send(Message::ctrl(&name, Payload::TakeControl { x, y, src_w, src_h }));
@@ -290,6 +297,7 @@ async fn run_incoming_router(
         match &msg.payload {
             Payload::Heartbeat { .. } => {} // 保活，无需处理
             Payload::TakeControl { x, y, src_w, src_h } => {
+                // 被接管：隐藏本机真实光标（屏幕上只留注入的光标）；本机输入恢复原样
                 platform::hide_cursor();
                 platform::set_local_input_blocked(false);
                 let entry = {
@@ -410,10 +418,14 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
         };
         r.engine = Some(start.engine);
         r.net = Some(handle);
+        // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
         r.arbiter = if cross_enabled { Some(Arbiter::new(layout)) } else { None };
     }
     tauri::async_runtime::spawn(run_incoming_router(start.incoming, router.clone(), injector));
-    log::info!("网络已启动：对端 {peer_ip}");
+    log::info!(
+        "网络已启动：对端 {peer_ip}（跨屏{}）",
+        if cross_enabled { "开启" } else { "已关闭" }
+    );
     Ok(())
 }
 
@@ -428,16 +440,15 @@ struct Settings {
     peer_ip: String,
     /// 屏幕布局：left / right（对方在我哪边）
     layout: String,
+    /// 跨屏共享开关（默认开启；关闭后不再触发跨屏，网络保持连接）
+    #[serde(default = "default_true")]
+    cross_screen_enabled: bool,
     /// 剪贴板共享开关
     clipboard_enabled: bool,
     /// 开机自启
     autostart: bool,
-    /// 跨屏共享开关（默认开启；关闭后不再触发跨屏，网络保持连接）
-    #[serde(default = "default_true")]
-    cross_screen_enabled: bool,
 }
 
-/// serde 反序列化默认值：跨屏共享默认开启
 fn default_true() -> bool {
     true
 }
@@ -607,14 +618,16 @@ fn get_self_test_stats(state: State<'_, Arc<Mutex<RouterState>>>) -> SelftestSta
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NetStatusView {
+    /// 是否已配置对端 IP（网络层在跑）
     configured: bool,
+    /// 跨屏共享是否开启（开关决定是否建仲裁器）
+    cross_screen: bool,
     connected: bool,
     capture_ok: bool,
     mode: &'static str,
     linked: bool,
     sent: u64,
     received: u64,
-    cross_screen: bool,
 }
 
 #[tauri::command]
@@ -636,13 +649,13 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
     };
     NetStatusView {
         configured: r.net.is_some(),
+        cross_screen: r.arbiter.is_some(),
         connected,
         capture_ok: r.capture_ok,
         mode,
         linked,
         sent,
         received,
-        cross_screen: r.arbiter.is_some(),
     }
 }
 

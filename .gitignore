@@ -20,3 +20,8 @@ Thumbs.db
 
 # 工具备份
 .mini-code-backups/
+
+# 打包残留
+src-tauri.zip
+src-tauri/src.rar
+*.rar

@@ -36,23 +36,27 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
     pub ip: String,
+    /// 本机监听端口
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// 对端端口（双机场景 = 本机端口；单机双实例自测时可指到对方实例）
+    pub peer_tcp_port: u16,
+    pub peer_udp_port: u16,
 }
 
 impl PeerConfig {
-    /// 默认端口；可用环境变量 RUISS_TCP_PORT / RUISS_UDP_PORT 覆盖
-    /// （单机双实例自测时两台实例端口必须不同）。
+    /// 默认端口；可用环境变量覆盖（单机双实例自测用）：
+    ///   RUISS_TCP_PORT / RUISS_UDP_PORT      本机端口
+    ///   RUISS_PEER_TCP_PORT / RUISS_PEER_UDP_PORT  对端端口（默认=本机端口）
     pub fn new(ip: String) -> Self {
-        let tcp_port = std::env::var("RUISS_TCP_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(TCP_PORT);
-        let udp_port = std::env::var("RUISS_UDP_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(UDP_PORT);
-        Self { ip, tcp_port, udp_port }
+        let env_or = |name: &str, default: u16| {
+            std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        let tcp_port = env_or("RUISS_TCP_PORT", TCP_PORT);
+        let udp_port = env_or("RUISS_UDP_PORT", UDP_PORT);
+        let peer_tcp_port = env_or("RUISS_PEER_TCP_PORT", tcp_port);
+        let peer_udp_port = env_or("RUISS_PEER_UDP_PORT", udp_port);
+        Self { ip, tcp_port, udp_port, peer_tcp_port, peer_udp_port }
     }
 }
 
@@ -136,7 +140,7 @@ impl NetEngine {
 
         let udp = UdpSocket::bind(("0.0.0.0", cfg.udp_port)).await?;
         // connect 到对端 UDP：只收对端包，并拿到去对端的本机路由 IP
-        let _ = udp.connect((cfg.ip.as_str(), cfg.udp_port)).await;
+        let _ = udp.connect((cfg.ip.as_str(), cfg.peer_udp_port)).await;
         let my_ip = match udp.local_addr().map(|a| a.ip()) {
             Ok(ip) if !ip.is_unspecified() => ip,
             _ => IpAddr::from([127, 0, 0, 1]),
@@ -213,8 +217,13 @@ impl Connector {
             if self.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            match tcp::establish(self.my_ip, self.cfg.tcp_port, &self.cfg.ip, self.cfg.tcp_port)
-                .await
+            match tcp::establish(
+                self.my_ip,
+                self.cfg.tcp_port,
+                &self.cfg.ip,
+                self.cfg.peer_tcp_port,
+            )
+            .await
             {
                 Ok(stream) => {
                     log::info!("TCP 已连接 {}", self.cfg.ip);
@@ -307,9 +316,21 @@ mod tests {
 
     #[tokio::test]
     async fn two_engines_exchange_messages() {
-        // 同机双引擎：端口错开（A 地址小 → A 当 Server）
-        let cfg_a = PeerConfig { ip: "127.0.0.1".into(), tcp_port: 5200, udp_port: 5300 };
-        let cfg_b = PeerConfig { ip: "127.0.0.1".into(), tcp_port: 5201, udp_port: 5301 };
+        // 同机双引擎：端口错开，对端端口互指（A 地址小 → A 当 Server）
+        let cfg_a = PeerConfig {
+            ip: "127.0.0.1".into(),
+            tcp_port: 5200,
+            udp_port: 5300,
+            peer_tcp_port: 5201,
+            peer_udp_port: 5301,
+        };
+        let cfg_b = PeerConfig {
+            ip: "127.0.0.1".into(),
+            tcp_port: 5201,
+            udp_port: 5301,
+            peer_tcp_port: 5200,
+            peer_udp_port: 5300,
+        };
 
         let sa = NetEngine::start("A".into(), cfg_a).await.expect("A 启动失败");
         let sb = NetEngine::start("B".into(), cfg_b).await.expect("B 启动失败");

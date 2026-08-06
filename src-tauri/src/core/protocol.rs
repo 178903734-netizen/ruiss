@@ -35,7 +35,8 @@ pub enum Payload {
     MouseMove { x: i32, y: i32, src_w: u32, src_h: u32 },
     /// 鼠标按键：0 左键 / 1 右键 / 2 中键，down=true 按下，false 抬起
     MouseButton { button: u8, down: bool },
-    /// 滚轮：dy>0 向上滚，dx 为横向滚轮
+    /// 滚轮：dy>0 向上滚，dx 为横向滚轮。单位统一为"格"：
+    /// Windows 一格=120 delta（捕获 ÷120、注入 ×120），Mac 一格=1 行（原样）
     MouseWheel { dx: i32, dy: i32 },
     /// 键盘：key 为平台无关抽象键码（见 keys::Key，Win↔Mac 通用），
     /// down=true 按下，false 抬起。
