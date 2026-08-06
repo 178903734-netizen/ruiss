@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-08-06 — 修复返回光标位置 + 被控端光标可见性
+
+- 现象 1：原路返回后鼠标从屏幕另一头出现（跨屏时 Source 侧 Warp 到对侧，返回时没 warp 回来）。
+  - arbiter.rs：新增 exit_pos 字段记录跨屏出口位置 + exit_edge()/exit_pos() 访问器。
+  - lib.rs：收到 ReleaseControl 时，根据 exit_edge/exit_pos 把光标 warp 回出口边内侧。
+- 现象 2：Windows→Mac 跨屏后 Mac"显示被控但找不到鼠标"，必须大面积滑动才出现。
+  - 根因：lib.rs 收到 TakeControl 时调 hide_cursor()，把被控端唯一的系统光标藏了
+    （Mac 上注入事件移动的就是系统光标本身，没有第二个光标可显示）。
+  - 修复：Sink 侧收到 TakeControl 改为 show_cursor()（保持可见）；Source 侧照旧隐藏。
+- mac.rs：hide_cursor/show_cursor 幂等化（CURSOR_HIDDEN 标志位，NSCursor 计数制
+  防 hide 重复调用后 unhide 拉不回来）。
+- 验证：cargo check 通过；mac.rs 改动需 Mac 端编译确认。
+
 ## 2026-08-06 — Sink 侧原路返回判定放宽（触控板友好）
 
 - 根因：Mac→Windows 跨屏后无法原路返回。on_sink_tick 要求注入光标精确停在

@@ -52,7 +52,7 @@ ruiss/
 - core/protocol.rs — 定义对端事件消息：MouseMove/MouseButton/KeyDown/KeyUp/Clipboard(Text|Image) 等，serde 序列化。
 - core/arbiter.rs — 跨屏仲裁器：Source 侧边缘停留 150ms 触发跨屏（EDGE_MARGIN=2 精确判定）；
   Sink 侧注入光标停在出口边附近 150ms 触发返回（RETURN_MARGIN=30 宽带 + JITTER_TOLERANCE=3 抖动容差，
-  触控板惯性微移不重置计时）；Take/Release 间 1s 防抖。
+  触控板惯性微移不重置计时）；记录跨屏出口位置 exit_pos（返回时 warp 回出口边）；Take/Release 间 1s 防抖。
 - core/geometry.rs — 坐标换算。统一按"逻辑像素"算（Windows 缩放 125%/150%、Mac Retina 都避开物理像素问题）。
 - core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则。
 - platform/ — 事件捕获与注入，每端约 200 行。Windows: SetWindowsHookEx 捕获 + SendInput 注入；Mac: CGEventTap 捕获 + CGEventPost 注入。

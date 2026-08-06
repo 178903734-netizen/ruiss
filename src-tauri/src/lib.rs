@@ -297,8 +297,9 @@ async fn run_incoming_router(
         match &msg.payload {
             Payload::Heartbeat { .. } => {} // 保活，无需处理
             Payload::TakeControl { x, y, src_w, src_h } => {
-                // 被接管：隐藏本机真实光标（屏幕上只留注入的光标）；本机输入恢复原样
-                platform::hide_cursor();
+                // 被接管：本机系统光标保持可见——对端注入的事件移动的就是
+                // 这个系统光标，隐藏它会导致"被控但找不到鼠标"；本机输入恢复原样
+                platform::show_cursor();
                 platform::set_local_input_blocked(false);
                 let entry = {
                     let mut r = match router.lock() {
@@ -331,6 +332,17 @@ async fn run_incoming_router(
                 };
                 if let Some(a) = r.arbiter.as_mut() {
                     a.on_peer_release();
+                    // 返回后光标回到出口边内侧（跨屏时被 warp 到了对侧，
+                    // 不 warp 回来鼠标会从屏幕另一头出现）
+                    let (w, h) = platform::screen_size();
+                    if let Some((_, exit_y)) = a.exit_pos() {
+                        let (wx, wy) = match a.exit_edge() {
+                            crate::core::geometry::Edge::Right => (w - 2, exit_y),
+                            crate::core::geometry::Edge::Left => (1, exit_y),
+                            _ => (w / 2, h / 2),
+                        };
+                        platform::warp_cursor(wx, wy.clamp(0, h - 1));
+                    }
                 }
             }
             _ => {

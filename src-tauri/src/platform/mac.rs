@@ -55,6 +55,10 @@ static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
+/// 光标隐藏状态（NSCursor hide/unhide 是计数制：hide +1、unhide -1，
+/// 重复 hide 后单次 unhide 无法恢复。用标志位保证 hide/unhide 严格配对）。
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
 }
@@ -77,6 +81,9 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 
 /// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
 pub fn hide_cursor() {
+    if CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
+        return; // 已隐藏，避免 NSCursor 计数失衡
+    }
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, hide];
@@ -86,6 +93,9 @@ pub fn hide_cursor() {
 
 /// 恢复显示本机光标。
 pub fn show_cursor() {
+    if !CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
+        return; // 未隐藏，避免多余 unhide
+    }
     unsafe {
         if let Some(cls) = objc::runtime::Class::get("NSCursor") {
             let _: () = objc::msg_send![cls, unhide];

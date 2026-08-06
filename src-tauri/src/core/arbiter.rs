@@ -82,6 +82,8 @@ pub struct Arbiter {
     last_injected: Option<(i32, i32)>,
     /// 最近一次跨屏触发时间（Take/Release 防抖）
     last_trigger: Option<Instant>,
+    /// 最近一次跨屏出口位置（返回时 warp 回出口边用）
+    exit_pos: Option<(i32, i32)>,
 }
 
 impl Arbiter {
@@ -100,6 +102,7 @@ impl Arbiter {
             sink_dwell: None,
             last_injected: None,
             last_trigger: None,
+            exit_pos: None,
         }
     }
 
@@ -222,6 +225,16 @@ impl Arbiter {
         self.linked = false;
     }
 
+    /// 本机出口边（返回时 warp 回出口边用）。
+    pub fn exit_edge(&self) -> Edge {
+        self.exit_edge
+    }
+
+    /// 最近一次跨屏出口位置（返回时 warp 回出口边用）。
+    pub fn exit_pos(&self) -> Option<(i32, i32)> {
+        self.exit_pos
+    }
+
     /// 停留判定：dwell 到期 → 发起/夺回跨屏（返回走 Sink 侧 on_sink_tick）。
     fn check_dwell(&mut self, now: Instant, w: i32, h: i32) -> Vec<Action> {
         let (start, x, y) = match self.dwell {
@@ -252,6 +265,7 @@ impl Arbiter {
         self.mode = Mode::Source;
         self.linked = true;
         self.last_trigger = Some(now);
+        self.exit_pos = Some((x, y));
         let (peer_x, peer_y) = geometry::enter_position(self.exit_edge, y, x, w, h);
         let warp_x = match self.exit_edge {
             Edge::Right => 1,   // 回绕到左边缘内侧
