@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-08-07(2) — Mac 双鼠标再根治：CGDisplayHideCursor 只对前台应用生效
+
+- 现象：换上 CGDisplayHideCursor 后 mac→win 仍双鼠标（mac/win 光标都在动）。
+- 排查：代码链路无问题（win 光标能动证明 TakeControl 已触发，hide_cursor
+  必被调到）；幂等标志无失衡路径。真正根因是 Apple 官方文档明确：
+  CGDisplayHideCursor/ShowCursor **只对前台应用生效**（"To use these
+  functions, your application must be in the foreground"）。跨屏瞬间 mac 上
+  前台是桌面/其他窗口，ruiss 在后台 → hide 静默无效；返回值被 `let _ =`
+  吞掉，失败无任何痕迹。win→mac 完美是因为 SetSystemCursor 无前台限制，
+  且该方向 mac 作 Sink 本就不藏光标。
+- 修复（src-tauri/src/platform/mac.rs，照抄 Synergy/InputLeap 的
+  OSXScreen::hideCursor）：
+  - 新增 allow_background_cursor_control()：私有 CGS API
+    CGSSetConnectionProperty(_CGSDefaultConnection(), _CGSDefaultConnection(),
+    "SetsCursorInBackground", true)，允许后台进程控制光标；
+    hide_cursor/show_cursor 调 CG 前各执行一次（幂等设置，无副作用）。
+  - CGDisplayHideCursor/ShowCursor 后补 CGAssociateMouseAndMouseCursorPosition(1)
+    （InputLeap 注释：修 "mouse randomly not hiding/showing" 玄学 bug）。
+  - CG 调用返回值不再丢弃，err 打 info 日志（[MAC-CURSOR] 前缀），
+    下次再失效能直接从日志看到错误码。
+  - 私有符号由 CoreGraphics framework 导出；自用工具不上 App Store，无审核风险。
+- 验证：Windows 侧不编译 mac.rs（cfg gate），语法已审；需 Mac 端编译实测。
+
 ## 2026-08-07 — Mac 双鼠标根治：光标隐藏改 CGDisplayHideCursor 系统级
 
 - 现象：mac→win 跨屏后 mac 侧光标没消失，mac/win 两边都有鼠标且都在滑动；

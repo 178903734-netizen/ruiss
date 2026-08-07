@@ -19,7 +19,9 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
 use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::string::CFString;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CGMouseButton, EventField, ScrollEventUnit,
@@ -46,14 +48,52 @@ extern "C" {
 
 // 系统级光标隐藏（CoreGraphics）：与 Windows 的 SetSystemCursor 对称。
 // NSCursor hide 是 app 级——只在光标位于本应用窗口时生效，跨屏时光标在
-// 任意窗口上 hide 直接失效（mac→win 双鼠标根因）。CGDisplayHideCursor 是
+// 任意窗口上 hide 直接失效（mac→win 双鼠标根因之一）。CGDisplayHideCursor 是
 // 系统级，不挑窗口，且鼠标移动不会自动重显光标（无需"移动补藏"）。
-// CGDirectDisplayID = u32，CGError = i32。
+//
+// 但 CGDisplayHideCursor 只对【前台应用】生效（Apple 官方文档原话：
+// "To use these functions, your application must be in the foreground"）。
+// 跨屏瞬间本进程必在后台（焦点在桌面/其他窗口）→ hide 静默无效
+// （mac→win 双鼠标根因之二）。解法照抄 Synergy/InputLeap 的
+// OSXScreen::hideCursor()：先经私有 CGS API 设 "SetsCursorInBackground"=true
+// 允许后台进程控制光标，再调 CGDisplayHideCursor，最后补一句
+// CGAssociateMouseAndMouseCursorPosition(true)（InputLeap 注释：修
+// "mouse randomly not hiding" 玄学 bug）。私有符号由 CoreGraphics 导出，
+// 自用工具不上 App Store，无审核风险。
+// CGDirectDisplayID = u32，CGError = i32，CGSConnectionID = i32，boolean_t = i32。
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(
+        cid: i32,
+        target_cid: i32,
+        key: *const c_void,
+        value: *const c_void,
+    ) -> i32;
+}
+
+/// 允许后台进程控制光标（Synergy/InputLeap 同款前置步骤）。
+/// 不设它，CGDisplayHideCursor/ShowCursor 在本进程非前台时静默无效。
+/// hide/show 前各调一次（与 InputLeap 一致；属性是幂等设置，重复调无副作用）。
+fn allow_background_cursor_control() {
+    unsafe {
+        let key = CFString::from_static_string("SetsCursorInBackground");
+        let val = CFBoolean::true_value();
+        let cid = _CGSDefaultConnection();
+        let err = CGSSetConnectionProperty(
+            cid,
+            cid,
+            key.as_concrete_TypeRef() as *const c_void,
+            val.as_concrete_TypeRef() as *const c_void,
+        );
+        if err != 0 {
+            log::warn!("[MAC-CURSOR] CGSSetConnectionProperty(SetsCursorInBackground) err={err}");
+        }
+    }
 }
 
 /// 辅助功能是否已授权（捕获的前提）。
@@ -124,9 +164,13 @@ pub fn hide_cursor() {
     CURSOR_SUPPRESS.store(true, Ordering::SeqCst);
     // swap 返回旧值；原本未隐藏才真正调一次，避免计数叠加
     if !CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
+        allow_background_cursor_control(); // 后台进程也能控光标（关键！不设则 hide 静默无效）
         unsafe {
             let disp = CGMainDisplayID();
-            let _ = CGDisplayHideCursor(disp);
+            let err = CGDisplayHideCursor(disp);
+            // InputLeap：补一句重新关联鼠标与光标位置，修 "randomly not hiding" 玄学 bug
+            let _ = CGAssociateMouseAndMouseCursorPosition(1);
+            log::info!("[MAC-CURSOR] hide_cursor: CGDisplayHideCursor err={err}");
         }
     }
 }
@@ -136,9 +180,12 @@ pub fn hide_cursor() {
 pub fn show_cursor() {
     CURSOR_SUPPRESS.store(false, Ordering::SeqCst);
     if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
+        allow_background_cursor_control(); // show 同样要求前台，先开后台权限
         unsafe {
             let disp = CGMainDisplayID();
-            let _ = CGDisplayShowCursor(disp);
+            let err = CGDisplayShowCursor(disp);
+            let _ = CGAssociateMouseAndMouseCursorPosition(1);
+            log::info!("[MAC-CURSOR] show_cursor: CGDisplayShowCursor err={err}");
         }
     }
 }
