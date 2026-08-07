@@ -18,6 +18,11 @@ pub enum Key {
     Enter, Space, Backspace, Tab, Esc,
     ArrowUp, ArrowDown, ArrowLeft, ArrowRight,
     F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    // 导航键
+    Delete, Home, End, PageUp, PageDown, Insert, CapsLock,
+    // 标点符号（中英文输入必备）
+    Comma, Period, Slash, Semicolon, Quote,
+    LBracket, RBracket, Backslash, Minus, Equals, Backtick,
     Other(u32), // 未覆盖键：透传原始码
 }
 
