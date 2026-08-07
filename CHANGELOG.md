@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-08-08(2) — 回退到 8907359（Mac 端问题多，对齐已验证版本）
+
+- 原因：7775a7c（双击/滑动选中 + 键盘映射修复）在 Mac 端实测问题太多，
+  Mac 端暂时不可用 → 整体回退到 8907359（Sink 侧注入滚轮不吞）。
+- 方式：git revert 生成反向提交（61a8512 回退 docs、92f0429 回退 fix），
+  保留完整历史、可快进推送；代码状态与 8907359 完全一致（git diff 8907359 为空）。
+- 原版本保留在本地备份分支 backup-5657fe5（含 7775a7c + 5657fe5），
+  后续 Mac 端排查完可再 cherry-pick 回来。
+- 验证：git diff 8907359 HEAD --stat 为空；已推送远程（5657fe5..92f0429）。
+
 # 2026-08-07(3) — fix: Sink 侧注入滚轮不吞——对端滚动在本机生效
 - 根因：win.rs mouse_proc 的 swallow 在 3d3e906（滚动双滚）加了 SINK_ACTIVE 后，
   mac→win 时 win 是 Sink，从对端转发注入的滚轮（LLMHF_INJECTED）被吞掉
