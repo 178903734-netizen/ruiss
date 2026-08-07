@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -260,8 +260,14 @@ fn finish_hook_setup_failed(ready: Sender<Result<u32>>, msg: String) {
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        // 注入事件（含本机回环的回声）直接丢弃，防死循环
-        if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 {
+        let msg = wparam.0 as u32;
+        // 注入事件（含本机回环的回声）一般直接丢弃，防死循环。
+        // 但滚轮豁免：罗技 Options/G Hub 等第三方软件用 SendInput 注入平滑滚动事件，
+        // 这些事件也带 LLMHF_INJECTED 标记，过滤会导致滚动完全失效。
+        // 豁免是安全的——跨屏时注入发生在对端机器上，不产生本地回环；
+        // Sink 侧 Arbiter 不会转发任何事件，也不会形成死循环。
+        let is_wheel = msg == WM_MOUSEWHEEL || msg == 0x020E;
+        if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 || is_wheel {
             if let Some(p) = mouse_to_payload(wparam.0 as u32, ms) {
                 log::debug!("捕获: {p:?}");
                 // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）。
@@ -322,8 +328,17 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
         WM_RBUTTONUP => Some(Payload::MouseButton { button: 1, down: false }),
         WM_MBUTTONDOWN => Some(Payload::MouseButton { button: 2, down: true }),
         WM_MBUTTONUP => Some(Payload::MouseButton { button: 2, down: false }),
-        WM_MOUSEWHEEL => Some(Payload::MouseWheel { dx: 0, dy: wheel_delta(ms) }),
-        0x020E => Some(Payload::MouseWheel { dx: wheel_delta(ms), dy: 0 }), // WM_MOUSEHWHEEL（0.58 未导出该常量）
+        WM_MOUSEWHEEL => {
+            let dy = wheel_delta(ms, &WHEEL_ACCUM_V);
+            if dy == 0 { return None; }
+            Some(Payload::MouseWheel { dx: 0, dy })
+        }
+        0x020E => {
+            // WM_MOUSEHWHEEL（0.58 未导出该常量）
+            let dx = wheel_delta(ms, &WHEEL_ACCUM_H);
+            if dx == 0 { return None; }
+            Some(Payload::MouseWheel { dx, dy: 0 })
+        }
         _ => None, // WM_XBUTTON* 等 M2 再支持
     }
 }
@@ -406,10 +421,29 @@ pub fn show_cursor() {
 /// SetSystemCursor 是系统级替换，无需补藏。保留空实现兼容外部调用。
 pub fn enforce_cursor_hidden() {}
 
-/// 滚轮增量：高 16 位为有符号 delta，换算为"格"（Windows 一格 = 120）。
-fn wheel_delta(ms: &MSLLHOOKSTRUCT) -> i32 {
+/// 滚轮增量累积器：解决罗技 Options/G Hub 等平滑滚动软件将一次标准
+/// 滚轮（WHEEL_DELTA=120）拆成若干小增量（如 30×4）的问题。
+/// 小增量直接做 `/120` 整数除法会得 0 → 滚动丢失。
+/// 这里对小增量做累积，攒够 120 才发射一个"格"的滚轮事件，余数保留。
+static WHEEL_ACCUM_V: AtomicI32 = AtomicI32::new(0);
+static WHEEL_ACCUM_H: AtomicI32 = AtomicI32::new(0);
+
+/// 滚轮增量：高 16 位为有符号 delta，累积到整格后返回非零值。
+/// 标准增量（±120 的整数倍）直接放行不累积。
+fn wheel_delta(ms: &MSLLHOOKSTRUCT, accum: &AtomicI32) -> i32 {
     let raw = (ms.mouseData >> 16) as i16 as i32;
-    raw / 120 // WHEEL_DELTA：协议统一按"格"传
+    // 标准增量（±120 的整数倍）：直接放行，不参与累积
+    if raw % 120 == 0 {
+        return raw / 120;
+    }
+    // 非标准增量（罗技平滑滚动等）：累积
+    let total = accum.fetch_add(raw, Ordering::Relaxed) + raw;
+    let clicks = total / 120;
+    if clicks != 0 {
+        // 减去已发射的整格部分，保留余数（CAS 循环保证原子性）
+        accum.fetch_add(-clicks * 120, Ordering::Relaxed);
+    }
+    clicks
 }
 
 fn keyboard_to_payload(wparam: u32, ks: &KBDLLHOOKSTRUCT) -> Option<Payload> {

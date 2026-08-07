@@ -227,6 +227,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
             if pid != 0 {
+                // 本进程注入的事件（如 warp_cursor）：也要补藏光标。
+                // 不补藏的话 warp 会把隐藏的光标又显示出来（双鼠标）。
+                if CURSOR_SUPPRESS.load(Ordering::SeqCst)
+                    && matches!(event_type, CGEventType::MouseMoved)
+                {
+                    enforce_cursor_hidden();
+                }
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -275,16 +282,30 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     enforce_cursor_hidden();
                 }
                 // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
                 // 注意：不用 CURSOR_SUPPRESS 兜底——它表示"光标隐藏中"，若 show_cursor 未配对执行
                 // 会卡 true 导致空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
-                if (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
+                let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
+                let sink = SINK_ACTIVE.load(Ordering::Relaxed);
+                let is_scroll = matches!(p, Payload::MouseWheel { .. });
+                if is_scroll {
+                    log::info!(
+                        "[MAC-SCROLL-DIAG] delta={p:?} blocked={blocked} sink={sink} suppress={}",
+                        CURSOR_SUPPRESS.load(Ordering::SeqCst),
+                    );
+                }
+                if (blocked || sink)
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
                     )
                 {
+                    if is_scroll {
+                        log::info!("[MAC-SCROLL-DIAG] 滚轮被吞掉（blocked={blocked} sink={sink}）");
+                    }
                     return None;
+                }
+                if is_scroll {
+                    log::info!("[MAC-SCROLL-DIAG] 滚轮放行（本地生效）");
                 }
             }
             // 监听模式：原样放行，绝不吞事件
