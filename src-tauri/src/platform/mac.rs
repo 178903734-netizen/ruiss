@@ -429,15 +429,11 @@ fn modifier_down(key: &Key, event: &CGEvent) -> bool {
 }
 
 /// 注入器：CGEventPost 回放事件。
-/// 复用同一个 CGEventSource——macOS 按 event source 追踪点击计数（clickCount），
-/// 每次新建 source 会导致每次点击都是"第 1 次点击"，双击永远无法被识别。
-pub struct InputInjector {
-    source: Mutex<Option<CGEventSource>>,
-}
+pub struct InputInjector;
 
 impl InputInjector {
     pub fn new() -> Self {
-        Self { source: Mutex::new(None) }
+        Self
     }
 
     /// 注入一条事件，返回 1 表示已投递（0 = 失败/跳过）。
@@ -448,17 +444,9 @@ impl InputInjector {
                 *p = Some((*x as f64, *y as f64));
             }
         }
-        // 复用 CGEventSource：macOS 按 source 追踪点击计数与拖拽状态，
-        // 每次新建则 clickCount 永远为 1、拖拽无法关联——双击与滑动选中均失效。
-        let source = {
-            let mut guard = self.source.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.is_none() {
-                *guard = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok();
-            }
-            match guard.as_ref() {
-                Some(s) => s.clone(),
-                None => return 0,
-            }
+        let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+            Ok(s) => s,
+            Err(_) => return 0,
         };
         let cg = match &event {
             Payload::MouseMove { x, y, .. } => CGEvent::new_mouse_event(
@@ -560,17 +548,6 @@ const CG_MAP: &[(u16, Key)] = &[
     // 功能键
     (36, Key::Enter), (49, Key::Space), (51, Key::Backspace), (48, Key::Tab), (53, Key::Esc),
     (123, Key::ArrowLeft), (126, Key::ArrowUp), (124, Key::ArrowRight), (125, Key::ArrowDown),
-    // 导航/编辑键
-    (117, Key::Delete), // ForwardDelete（Fn+Delete 的效果）
-    (115, Key::Home), (119, Key::End),
-    (116, Key::PageUp), (121, Key::PageDown),
-    (114, Key::Insert), // Mac 全键盘 Insert 位是 Help 键，这里映射为 Help
-    (57, Key::CapsLock),
-    // 标点符号（中英文输入必备）
-    (43, Key::Comma), (47, Key::Period), (44, Key::Slash),
-    (41, Key::Semicolon), (39, Key::Quote),
-    (33, Key::LBracket), (30, Key::RBracket), (42, Key::Backslash),
-    (27, Key::Minus), (24, Key::Equals), (50, Key::Backtick),
     (122, Key::F1), (120, Key::F2), (99, Key::F3), (118, Key::F4), (96, Key::F5),
     (97, Key::F6), (98, Key::F7), (100, Key::F8), (101, Key::F9), (109, Key::F10),
     (103, Key::F11), (111, Key::F12),

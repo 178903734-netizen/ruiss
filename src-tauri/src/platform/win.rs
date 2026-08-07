@@ -488,15 +488,6 @@ const VK_MAP: &[(u32, Key)] = &[
     (0x09, Key::Tab), (0x1B, Key::Esc),
     (0x25, Key::ArrowLeft), (0x26, Key::ArrowUp), (0x27, Key::ArrowRight),
     (0x28, Key::ArrowDown),
-    // 导航/编辑键
-    (0x2E, Key::Delete), (0x24, Key::Home), (0x23, Key::End),
-    (0x21, Key::PageUp), (0x22, Key::PageDown), (0x2D, Key::Insert),
-    (0x14, Key::CapsLock),
-    // 标点符号（中英文输入必备）
-    (0xBC, Key::Comma), (0xBE, Key::Period), (0xBF, Key::Slash),
-    (0xBA, Key::Semicolon), (0xDE, Key::Quote),
-    (0xDB, Key::LBracket), (0xDD, Key::RBracket), (0xDC, Key::Backslash),
-    (0xBD, Key::Minus), (0xBB, Key::Equals), (0xC0, Key::Backtick),
     (0x70, Key::F1), (0x71, Key::F2), (0x72, Key::F3), (0x73, Key::F4),
     (0x74, Key::F5), (0x75, Key::F6), (0x76, Key::F7), (0x77, Key::F8),
     (0x78, Key::F9), (0x79, Key::F10), (0x7A, Key::F11), (0x7B, Key::F12),
