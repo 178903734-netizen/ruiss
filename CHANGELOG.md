@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2026-08-07 — Mac 双鼠标根治：光标隐藏改 CGDisplayHideCursor 系统级
+
+- 现象：mac→win 跨屏后 mac 侧光标没消失，mac/win 两边都有鼠标且都在滑动；
+  win 侧已完美（SetSystemCursor 内核级替换）。
+- 根因：mac.rs 用 NSCursor hide 隐藏光标——这是 app 级 API，苹果文档明确
+  "只在光标位于本应用窗口时生效"。跨屏时光标在桌面/别的 app 窗口上，hide
+  直接失效；之前的"移动补藏 + 100ms tick 补藏"调的也是 NSCursor hide，app 级
+  补藏治不了 app 级失效。Source 侧移动放行转发，光标没藏住 → 看见 mac 本机
+  光标动 + win 注入光标动 = 两边都有鼠标都在滑。
+- 修复（src-tauri/src/platform/mac.rs）：hide_cursor/show_cursor 从 NSCursor
+  hide/unhide 换成 CGDisplayHideCursor/CGDisplayShowCursor（CoreGraphics 系统级，
+  与 win 的 SetSystemCursor 对称）。系统级隐藏不挑窗口，鼠标移动不自动重显。
+  - 幂等：新增 CURSOR_HIDDEN 标志，hide 仅 false→true 调一次、show 仅 true→false
+    调一次，严格配对，避免 CG 内部计数叠加导致 show 不回来。
+  - 删除 CURSOR_HIDE_COUNT 计数（幂等后不再需要）。
+  - enforce_cursor_hidden 改空实现（CGDisplayHideCursor 移动不重显，无需补藏）；
+    tap 回调里两处补藏调用（pid!=0 注入分支、真实移动分支）删除。
+  - 删除未使用的 use objc::{sel, sel_impl}。
+- 验证：Windows 侧不编译 mac.rs（cfg gate），语法已审；mac.rs 需 Mac 端编译确认。
+
 ## 2026-08-06 — Windows 光标隐藏升级：SetSystemCursor 系统级透明替换（协作改动）
 
 - 背景：ShowCursor 计数方案实测仍双鼠标（tao/其他窗口可把计数拉回），

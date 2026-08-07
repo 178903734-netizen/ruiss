@@ -26,7 +26,6 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
-use objc::{sel, sel_impl};
 
 use crate::core::keys::{map_key, Key};
 use crate::core::protocol::Payload;
@@ -42,6 +41,18 @@ extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRunLoopStop(rl: *const c_void);
+}
+
+// 系统级光标隐藏（CoreGraphics）：与 Windows 的 SetSystemCursor 对称。
+// NSCursor hide 是 app 级——只在光标位于本应用窗口时生效，跨屏时光标在
+// 任意窗口上 hide 直接失效（mac→win 双鼠标根因）。CGDisplayHideCursor 是
+// 系统级，不挑窗口，且鼠标移动不会自动重显光标（无需"移动补藏"）。
+// CGDirectDisplayID = u32，CGError = i32。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
 }
 
 /// 辅助功能是否已授权（捕获的前提）。
@@ -60,13 +71,13 @@ static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 跨屏期间是否应保持光标隐藏（Source 跨屏时 true）。
-/// macOS 的 NSCursor hide 是"一次性"隐藏——鼠标/触控板一移动系统就自动重显光标，
-/// 必须靠"移动补藏 + 周期补藏"持续压制（见 enforce_cursor_hidden）。
+/// 仅作状态标记（tap 回调判断/日志用）；实际隐藏由 CURSOR_HIDDEN 幂等驱动。
 static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
 
-/// hide 调用次数（NSCursor hide/unhide 是计数制：hide +1、unhide -1，
-/// 重复 hide 后必须 unhide 同样次数才恢复显示。记录次数保证配对）。
-static CURSOR_HIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// 光标是否已实际隐藏（幂等标志，防 CGDisplayHideCursor/ShowCursor 重复调用失衡）。
+/// hide_cursor 在 false→true 时调一次 CGDisplayHideCursor；show_cursor 在 true→false
+/// 时调一次 CGDisplayShowCursor，严格配对一次，绝不叠加（CG 系列内部也有计数语义）。
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
@@ -105,56 +116,35 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 }
 
 /// 隐藏本机光标（跨屏期间源端光标"离开"本机屏幕，避免双光标）。
-/// 无条件执行 NSCursor hide 并计数——macOS 移动鼠标会自动重显光标，
-/// 重复 hide 是刻意的（计数配对，show 时按次数恢复）。
-/// 注意：NSCursor hide 必须在主线程调用，此处与 enforce_cursor_hidden
-/// 一致用 performSelectorOnMainThread 调度（本函数可能被仲裁器线程调用）。
+/// 用 CGDisplayHideCursor 系统级隐藏——不挑光标在哪个窗口，且鼠标移动
+/// 不会自动重显（无需"移动补藏"，与 Windows 的 SetSystemCursor 对称）。
+/// 幂等：仅在 false→true 时调一次 CGDisplayHideCursor，重复调用不叠加。
 pub fn hide_cursor() {
     CURSOR_SUPPRESS.store(true, Ordering::SeqCst);
-    CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
-    unsafe {
-        if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-            let _: () = objc::msg_send![
-                cls,
-                performSelectorOnMainThread: sel!(hide)
-                withObject: std::ptr::null_mut::<objc::runtime::Object>()
-                waitUntilDone: false
-            ];
+    // swap 返回旧值；原本未隐藏才真正调一次，避免计数叠加
+    if !CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
+        unsafe {
+            let disp = CGMainDisplayID();
+            let _ = CGDisplayHideCursor(disp);
         }
     }
 }
 
-/// 恢复显示本机光标（按 hide 计数循环 unhide，严格配对恢复）。
+/// 恢复显示本机光标（幂等：仅 true→false 时调一次 CGDisplayShowCursor，
+/// 与 hide_cursor 严格配对一次）。
 pub fn show_cursor() {
     CURSOR_SUPPRESS.store(false, Ordering::SeqCst);
-    let n = CURSOR_HIDE_COUNT.swap(0, Ordering::SeqCst);
-    for _ in 0..n {
+    if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
         unsafe {
-            if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-                let _: () = objc::msg_send![cls, unhide];
-            }
+            let disp = CGMainDisplayID();
+            let _ = CGDisplayShowCursor(disp);
         }
     }
 }
 
-/// 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
-/// （对抗 macOS 移动鼠标自动重显光标的行为；与 win.rs 同名机制对称）。
-/// 注意：NSCursor hide 必须在主线程调用——用 performSelectorOnMainThread 调度。
-pub fn enforce_cursor_hidden() {
-    if CURSOR_SUPPRESS.load(Ordering::SeqCst) {
-        CURSOR_HIDE_COUNT.fetch_add(1, Ordering::SeqCst);
-        unsafe {
-            if let Some(cls) = objc::runtime::Class::get("NSCursor") {
-                let _: () = objc::msg_send![
-                    cls,
-                    performSelectorOnMainThread: sel!(hide)
-                    withObject: std::ptr::null_mut::<objc::runtime::Object>()
-                    waitUntilDone: false
-                ];
-            }
-        }
-    }
-}
+/// 跨屏期间补藏光标。CGDisplayHideCursor 是系统级、鼠标移动不重显，无需补藏，
+/// 此处保留空实现供 lib.rs tick 统一调用（与 win.rs 同名函数对称）。
+pub fn enforce_cursor_hidden() {}
 
 /// 捕获器：CGEventTap + 捕获线程 + 消费线程。
 pub struct InputCapturer {
@@ -227,13 +217,8 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
             if pid != 0 {
-                // 本进程注入的事件（如 warp_cursor）：也要补藏光标。
-                // 不补藏的话 warp 会把隐藏的光标又显示出来（双鼠标）。
-                if CURSOR_SUPPRESS.load(Ordering::SeqCst)
-                    && matches!(event_type, CGEventType::MouseMoved)
-                {
-                    enforce_cursor_hidden();
-                }
+                // 本进程注入的事件（如 warp_cursor）。CGDisplayHideCursor 系统级、
+                // 鼠标移动不重显，注入移动不会再把光标拉回显示，无需补藏。
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -276,11 +261,7 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
-                // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
-                // （macOS 移动鼠标会自动重显光标，必须持续压制）
-                if matches!(event_type, CGEventType::MouseMoved) {
-                    enforce_cursor_hidden();
-                }
+                // CGDisplayHideCursor 系统级、鼠标移动不重显，无需"移动补藏"。
                 // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
                 // 注意：不用 CURSOR_SUPPRESS 兜底——它表示"光标隐藏中"，若 show_cursor 未配对执行
                 // 会卡 true 导致空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
