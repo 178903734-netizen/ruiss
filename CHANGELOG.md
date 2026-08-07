@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-08-08(3) — 键盘映射补齐：导航键 + 标点符号（只改映射表，不动注入器）
+
+- 背景：7775a7c 曾补齐键盘映射但连带 CGEventSource 复用导致 Mac 编译报
+  NonNull<CGEventSource> cannot be sent between threads（21 个错误），
+  回退后又丢了键盘映射修复。本次只做映射表补齐，不碰 InputInjector，
+  Mac 端无编译风险。
+- keys.rs：Key 枚举新增导航/编辑键（Delete/Home/End/PageUp/PageDown/Insert/CapsLock）
+  和标点符号（Comma/Period/Slash/Semicolon/Quote/LBracket/RBracket/Backslash/Minus/Equals/Backtick）。
+- win.rs：VK_MAP 补齐对应 Windows VK 码（0x2E/0x24/0x23/0x21/0x22/0x2D/0x14、
+  0xBC-0xC0 等），解决 Win 按键在捕获侧变成 Other、目标端乱码/丢键。
+- mac.rs：CG_MAP 补齐对应 CGKeyCode（Delete→117、Home→115、End→119、PageUp→116、
+  PageDown→121、Insert→114、CapsLock→57、标点→43/47/44/41/39/33/30/42/27/24/50）。
+- 验证：Windows cargo check 通过（1.97s 零错误）；mac.rs 改动为纯数据表，
+  Windows 不编译，需 Mac 端编译确认。
+
 ## 2026-08-08(2) — 回退到 8907359（Mac 端问题多，对齐已验证版本）
 
 - 原因：7775a7c（双击/滑动选中 + 键盘映射修复）在 Mac 端实测问题太多，

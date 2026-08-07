@@ -54,7 +54,7 @@ ruiss/
   Sink 侧注入光标停在出口边附近 150ms 触发返回（RETURN_MARGIN=30 宽带 + JITTER_TOLERANCE=3 抖动容差，
   触控板惯性微移不重置计时）；记录跨屏出口位置 exit_pos（返回时 warp 回出口边）；Take/Release 间 1s 防抖。
 - core/geometry.rs — 坐标换算。统一按"逻辑像素"算（Windows 缩放 125%/150%、Mac Retina 都避开物理像素问题）。
-- core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则。
+- core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则（2026-08-08 补齐导航键与标点符号枚举：Delete/Home/End/PageUp/PageDown/Insert/CapsLock + 逗号句号等）。
 - platform/ — 事件捕获与注入，每端约 200 行。Windows: SetWindowsHookEx 捕获 + SendInput 注入；Mac: CGEventTap 捕获 + CGEventPost 注入。
   - 光标隐藏（双鼠标对抗）：Windows 用 SetSystemCursor 把系统光标替换为透明图标
     （内核级，任何窗口 SetCursor 都拿透明图），show_cursor 用 SPI_SETCURSORS 从
