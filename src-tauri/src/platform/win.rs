@@ -267,14 +267,20 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // 豁免是安全的——跨屏时注入发生在对端机器上，不产生本地回环；
         // Sink 侧 Arbiter 不会转发任何事件，也不会形成死循环。
         let is_wheel = msg == WM_MOUSEWHEEL || msg == 0x020E;
+        // 注入滚轮放行标记：对端注入的滚轮（LLMHF_INJECTED + 滚轮消息）不得吞——
+        // Sink 侧吞掉注入滚轮会导致对端滚动在本机失效（mac→win 滚动失效根因）。
+        // 罗技平滑滚动同样带 INJECTED，一并放行；Sink 时本机无人操作，无双滚副作用。
+        let injected_wheel = is_wheel && ms.flags & LLMHF_INJECTED != 0;
         if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 || is_wheel {
             if let Some(p) = mouse_to_payload(wparam.0 as u32, ms) {
                 log::debug!("捕获: {p:?}");
                 // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）。
                 // 被控端（Sink）：本机 MouseMove 不吞——光标跟随本机鼠标，用户可推到
                 // 出口边反向夺回控制权（自由双向切换，见 arbiter.on_cursor 的 Sink 分支）。
+                // 例外：注入滚轮（injected_wheel）不吞——那是对端转发来的滚动，放行让本机页面滚动。
                 let swallow = (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
-                    && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. });
+                    && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. })
+                    && !injected_wheel;
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);

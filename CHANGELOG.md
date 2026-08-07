@@ -1,5 +1,13 @@
 # CHANGELOG
 
+# 2026-08-07(3) — fix: Sink 侧注入滚轮不吞——对端滚动在本机生效
+- 根因：win.rs mouse_proc 的 swallow 在 3d3e906（滚动双滚）加了 SINK_ACTIVE 后，
+  mac→win 时 win 是 Sink，从对端转发注入的滚轮（LLMHF_INJECTED）被吞掉
+  → win 应用收不到滚动，对端滚动在本机失效（mac 动、win 不动）。
+- 修复：swallow 排除 injected_wheel（LLMHF_INJECTED 的滚轮消息）——放行对端注入的滚动；
+  罗技平滑滚动同样带 INJECTED 一并放行；Sink 时本机无人操作，无双滚副作用。
+- 验证：cargo build 通过；双机实测 mac→win 滚动恢复、win 本机滚轮仍被吞（防双滚）。
+
 ## 2026-08-07(2) — Mac 双鼠标再根治：CGDisplayHideCursor 只对前台应用生效
 
 - 现象：换上 CGDisplayHideCursor 后 mac→win 仍双鼠标（mac/win 光标都在动）。
