@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-08-08 — 修复 Mac 端双击/滑动选中失效 + 补齐跨平台键盘映射
+
+- 现象：Win 电脑跨屏到 Mac 后，Mac 端双击、滑动选中（按住左键拖动）不生效；
+  Win 键盘部分按键（Delete/Home/End/PageUp/PageDown、逗号句号分号等标点）在 Mac 端不能用。
+- 根因 1（双击/滑动选中）：mac.rs 的 inject() 每次调用都新建 CGEventSource。
+  macOS 按 event source 追踪点击计数（clickCount）与拖拽状态——每次新建 source，
+  每次点击都是"第 1 次点击"→ 双击永远不被识别；拖拽关联同样断裂。
+- 根因 2（按键失效）：VK_MAP / CG_MAP 只覆盖字母数字、修饰键、方向键、F1-F12，
+  大量常用键未映射。未映射键变成 Key::Other(Windows VK 码)，到 Mac 端 key_to_cg 把
+  Windows VK 码直接当 CGKeyCode 用——两个平台键码完全不同，注入的是乱键或空键。
+- 修复：
+  - mac.rs：InputInjector 新增 source: Mutex<Option<CGEventSource>> 字段，首次注入时
+    创建一次，后续所有注入复用同一个 source（双击/拖拽恢复识别）。
+  - keys.rs：Key 枚举新增导航键（Delete/Home/End/PageUp/PageDown/Insert/CapsLock）和
+    标点符号（Comma/Period/Slash/Semicolon/Quote/LBracket/RBracket/Backslash/Minus/Equals/Backtick）。
+  - win.rs：VK_MAP 补齐对应 Windows VK 码（0x2E/0x24/0x23/0x21/0x22/0x2D/0x14、
+    0xBC-0xC0 等），解决捕获侧变成 Other。
+  - mac.rs：CG_MAP 补齐对应 CGKeyCode（Delete→117 ForwardDelete、Home→115、End→119、
+    PageUp→116、PageDown→121、Insert→114、CapsLock→57、标点→43/47/44/41/39/33/30/42/27/24/50），
+    解决注入侧映射正确。
+- 验证：Windows 侧不编译 mac.rs（cfg gate）；mac.rs 需 Mac 端编译实测（双击、滑动选中、标点输入）。
+- 提交：7775a7c。
+
 # 2026-08-07(3) — fix: Sink 侧注入滚轮不吞——对端滚动在本机生效
 - 根因：win.rs mouse_proc 的 swallow 在 3d3e906（滚动双滚）加了 SINK_ACTIVE 后，
   mac→win 时 win 是 Sink，从对端转发注入的滚轮（LLMHF_INJECTED）被吞掉
