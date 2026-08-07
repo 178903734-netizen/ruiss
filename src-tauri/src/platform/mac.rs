@@ -26,6 +26,7 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use objc::{sel, sel_impl};
 
 use crate::core::keys::{map_key, Key};
 use crate::core::protocol::Payload;
