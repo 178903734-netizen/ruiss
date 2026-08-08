@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use core_foundation::base::TCFType;
@@ -428,12 +429,42 @@ fn modifier_down(key: &Key, event: &CGEvent) -> bool {
     }
 }
 
+/// 双击识别窗口：两次点击间隔超过 500ms 不算双击（对齐 macOS 系统默认阈值）。
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+/// 双击位置容差：两次点击落点偏差超过 4px 不算双击
+/// （略大于跨屏抖动容差 JITTER_TOLERANCE=3，给注入坐标取整留余量）。
+const DOUBLE_CLICK_DISTANCE: f64 = 4.0;
+
+/// 点击计数状态：注入侧维护，识别"连续两次点击同一位置"= 双击。
+/// macOS 双击识别依赖注入事件的 kCGMouseEventClickState 字段，
+/// 不设置时系统把两次点击当两次单击 → Finder 双击打开失效。
+struct ClickState {
+    last_time: Instant,
+    last_pos: (f64, f64),
+    count: u32,
+}
+
+impl ClickState {
+    fn new() -> Self {
+        Self {
+            last_time: Instant::now(),
+            last_pos: (f64::NAN, f64::NAN),
+            count: 0,
+        }
+    }
+}
+
 /// 注入器：CGEventPost 回放事件。
-pub struct InputInjector;
+pub struct InputInjector {
+    /// 点击计数状态（跨线程：注入可能在消费线程/主线程被调用）。
+    click: Mutex<ClickState>,
+}
 
 impl InputInjector {
     pub fn new() -> Self {
-        Self
+        Self {
+            click: Mutex::new(ClickState::new()),
+        }
     }
 
     /// 注入一条事件，返回 1 表示已投递（0 = 失败/跳过）。
@@ -469,7 +500,35 @@ impl InputInjector {
                     Ok(g) => g.unwrap_or((0.0, 0.0)),
                     Err(_) => (0.0, 0.0),
                 };
-                CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn)
+                let ev = CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn);
+                // 双击识别：macOS 靠注入事件的 kCGMouseEventClickState 字段识别双击，
+                // 不设置时系统把两次注入点击当成两次单击 → Finder 双击打开失效。
+                // 只有按下事件携带 click state（抬起事件保持默认值）。
+                if *down {
+                    if let Ok(ev) = &ev {
+                        let mut st = match self.click.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        let now = Instant::now();
+                        let same_spot = (st.last_pos.0 - x).abs() <= DOUBLE_CLICK_DISTANCE
+                            && (st.last_pos.1 - y).abs() <= DOUBLE_CLICK_DISTANCE;
+                        st.count = if now.duration_since(st.last_time) <= DOUBLE_CLICK_WINDOW
+                            && same_spot
+                        {
+                            st.count + 1
+                        } else {
+                            1
+                        };
+                        st.last_time = now;
+                        st.last_pos = (x, y);
+                        ev.set_integer_value_field(
+                            EventField::MOUSE_EVENT_CLICK_STATE,
+                            st.count as i64,
+                        );
+                    }
+                }
+                ev
             }
             Payload::MouseWheel { dx, dy } => {
                 // Win 端 wheel_delta 是格数（±1），LINE 单位注入 macOS 响应极弱（等同没滚）；

@@ -56,6 +56,9 @@ ruiss/
 - core/geometry.rs — 坐标换算。统一按"逻辑像素"算（Windows 缩放 125%/150%、Mac Retina 都避开物理像素问题）。
 - core/keys.rs — 键位映射：Ctrl ↔ Command（Mac 上 Command 才是 Ctrl 的位）；Win 键 → Mac Command；Shift/Alt 不动。第一版就这三条规则（2026-08-08 补齐导航键与标点符号枚举：Delete/Home/End/PageUp/PageDown/Insert/CapsLock + 逗号句号等）。
 - platform/ — 事件捕获与注入，每端约 200 行。Windows: SetWindowsHookEx 捕获 + SendInput 注入；Mac: CGEventTap 捕获 + CGEventPost 注入。
+  - 双击识别（Mac 注入侧，2026-08-08）：注入按下事件必须写 kCGMouseEventClickState
+    字段（双击=count 2），否则 macOS 把两次注入点击当两次单击 → Finder 双击打开失效。
+    InputInjector 内 ClickState 维护 last_time/last_pos/count（500ms 窗口 + 4px 容差）。
   - 光标隐藏（双鼠标对抗）：Windows 用 SetSystemCursor 把系统光标替换为透明图标
     （内核级，任何窗口 SetCursor 都拿透明图），show_cursor 用 SPI_SETCURSORS 从
     注册表重载恢复（无条件执行，崩溃重启也能恢复）；Mac 用 NSCursor hide +

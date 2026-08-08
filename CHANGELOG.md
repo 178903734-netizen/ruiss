@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## 2026-08-08(4) — 修复 Mac 端双击失效：注入事件补 click state
+
+- 现象：跨屏到 Mac 后双击（进文件夹/打开应用）失效，变成两次单击只选中不打开。
+- 根因：mac.rs InputInjector 注入鼠标按下事件时未设置 kCGMouseEventClickState 字段，
+  macOS 窗口服务把两次注入点击识别为两次独立单击而非一次双击（Finder 双击打开依赖该字段）。
+  7775a7c 曾修过但连带 CGEventSource 跨线程问题被回退，本次只动注入 click state。
+- 修复（src-tauri/src/platform/mac.rs，仅 InputInjector，不碰 CGEventSource）：
+  - 新增 ClickState（last_time / last_pos / count）+ 常量 DOUBLE_CLICK_WINDOW=500ms、
+    DOUBLE_CLICK_DISTANCE=4px。
+  - InputInjector 增加 Mutex<ClickState> 字段（new() 初始化）。
+  - inject() 的 MouseButton down 分支：距上次点击 ≤500ms 且落点偏移 ≤4px → count+1，
+    否则重置为 1；通过 ev.set_integer_value_field(MOUSE_EVENT_CLICK_STATE, count)
+    写入事件字段；up 分支不写（保持默认）。
+- 验证：Windows 侧不编译 mac.rs（cfg gate），cargo check 仅确认项目整体未破坏；
+  mac.rs 需 Mac 端编译实测（双击打开文件夹、滑动选中、单击拖拽）。
+
 ## 2026-08-08(3) — 键盘映射补齐：导航键 + 标点符号（只改映射表，不动注入器）
 
 - 背景：7775a7c 曾补齐键盘映射但连带 CGEventSource 复用导致 Mac 编译报
