@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -146,6 +146,11 @@ thread_local! {
     static HOOK_SENDER: RefCell<Option<Sender<Payload>>> = const { RefCell::new(None) };
 }
 
+/// 注入侧当前按住的鼠标按钮（-1 = 未按住）。
+/// macOS 拖选/拖拽要求按住按钮期间的移动事件类型为 *MouseDragged
+/// （MouseMoved 不会更新选区）；注入移动时按此状态选择事件类型。
+static HELD_BUTTON: AtomicI32 = AtomicI32::new(-1);
+
 /// 注入侧最后已知光标位置（点击/滚轮注入用；Sink 侧返回判定用）。
 static LAST_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
@@ -246,6 +251,9 @@ impl InputCapturer {
 fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
     let event_types = vec![
         CGEventType::MouseMoved,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::OtherMouseDragged,
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
         CGEventType::RightMouseDown,
@@ -375,7 +383,12 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
 
 fn event_to_payload(event_type: CGEventType, event: &CGEvent) -> Option<Payload> {
     match event_type {
-        CGEventType::MouseMoved => {
+        // 拖动（按住按键期间移动）与普通移动统一转 MouseMove 转发：
+        // 对端注入时会根据自身的按住状态还原为对应 Dragged 类型
+        CGEventType::MouseMoved
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => {
             let p = event.location();
             let (w, h) = screen_size();
             Some(Payload::MouseMove { x: p.x as i32, y: p.y as i32, src_w: w as u32, src_h: h as u32 })
@@ -480,13 +493,27 @@ impl InputInjector {
             Err(_) => return 0,
         };
         let cg = match &event {
-            Payload::MouseMove { x, y, .. } => CGEvent::new_mouse_event(
-                source,
-                CGEventType::MouseMoved,
-                CGPoint::new(*x as f64, *y as f64),
-                CGMouseButton::Left,
-            ),
+            Payload::MouseMove { x, y, .. } => {
+                // 按住左键拖动期间必须注入 LeftMouseDragged（MouseMoved 不会更新选区
+                // → 拖选文字失效）；右键/中键同理。未按住时正常 MouseMoved。
+                let held = HELD_BUTTON.load(Ordering::Relaxed);
+                let ty = match held {
+                    0 => CGEventType::LeftMouseDragged,
+                    1 => CGEventType::RightMouseDragged,
+                    2 => CGEventType::OtherMouseDragged,
+                    _ => CGEventType::MouseMoved,
+                };
+                let btn = match held {
+                    1 => CGMouseButton::Right,
+                    2 => CGMouseButton::Center,
+                    _ => CGMouseButton::Left,
+                };
+                CGEvent::new_mouse_event(source, ty, CGPoint::new(*x as f64, *y as f64), btn)
+            }
             Payload::MouseButton { button, down } => {
+                // 记录当前按住的按钮：拖动期间的移动要注入为 *Dragged 类型
+                // （up 后清空；macOS 拖选依赖这个状态还原事件类型）
+                HELD_BUTTON.store(if *down { *button as i32 } else { -1 }, Ordering::Relaxed);
                 let (ty, btn) = match (button, down) {
                     (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
                     (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
@@ -503,13 +530,15 @@ impl InputInjector {
                 let ev = CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn);
                 // 双击识别：macOS 靠注入事件的 kCGMouseEventClickState 字段识别双击，
                 // 不设置时系统把两次注入点击当成两次单击 → Finder 双击打开失效。
-                // 只有按下事件携带 click state（抬起事件保持默认值）。
-                if *down {
-                    if let Ok(ev) = &ev {
-                        let mut st = match self.click.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
+                // 关键：down 和 up 都必须携带 click state，且抬起与按下用同一个计数
+                // （cliclick 同款：down1/up1 → down2/up2）。只给 down 设置、up 保持
+                // 默认值时，系统把第二次 up 当第二次单击，双击永远凑不成。
+                if let Ok(ev) = &ev {
+                    let mut st = match self.click.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    if *down {
                         let now = Instant::now();
                         let same_spot = (st.last_pos.0 - x).abs() <= DOUBLE_CLICK_DISTANCE
                             && (st.last_pos.1 - y).abs() <= DOUBLE_CLICK_DISTANCE;
@@ -522,11 +551,9 @@ impl InputInjector {
                         };
                         st.last_time = now;
                         st.last_pos = (x, y);
-                        ev.set_integer_value_field(
-                            EventField::MOUSE_EVENT_CLICK_STATE,
-                            st.count as i64,
-                        );
                     }
+                    // down 计算/更新计数，up 沿用当前计数（不重置、不再判定）
+                    ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, st.count as i64);
                 }
                 ev
             }
