@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-08-08(5) — 回退 4e4ffc5（mac 跨屏双滚 + Dock 隔空触发），对齐 2b01364
+
+- 原因：4e4ffc5 在 Mac 端实测有问题（用户反馈"好像改了东西"），回退到
+  已验证的 2b01364（双击 click state + MouseDragged 拖动修复）。
+- 方式：git revert --no-edit 4e4ffc5 生成反向提交 f20075d，保留完整历史、
+  可正常推送；代码状态与 2b01364 完全一致（git diff 2b01364 HEAD 仅剩
+  .workbuddy 记忆文档差异，mac.rs 已一致）。
+- 验证：git diff 2b01364 HEAD --stat 无 mac.rs；cargo 不重新编译
+  （mac.rs 不参与 Windows 编译）。
+
 ## 2026-08-08(4) — 修复 Mac 端双击失效：注入事件补 click state
 
 - 现象：跨屏到 Mac 后双击（进文件夹/打开应用）失效，变成两次单击只选中不打开。
