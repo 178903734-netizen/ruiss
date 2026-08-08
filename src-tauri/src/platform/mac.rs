@@ -271,18 +271,11 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event| {
-            // 防回环：仅【本进程自己注入】的事件才直通放行（不转发、不吞）。
-            // 关键修正：原判断 `pid != 0` 会把【所有软件合成事件】都放行，
-            // 而 macOS 触控板惯性滚动（momentum 段）由 WindowServer 合成、其
-            // source pid 非 0 → 也走直通 → 跨屏期间 mac 本地照滚（双屏同滚根因）。
-            // 改成 `pid == 本进程 pid`：只有 ruiss 经 CGEventPost 注入的事件
-            // （warp_cursor / 对端转发来的注入）才放行；WindowServer 惯性滚动、
-            // 第三方软件事件都落回正常路径——跨屏时被吞掉且转发对端。
-            let own_pid = std::process::id() as i64;
+            // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
-            if pid == own_pid {
-                // 本进程注入的事件（如 warp_cursor）：放行，不转发、不吞（防回环）。
-                // CGDisplayHideCursor 系统级、鼠标移动不重显，注入移动不会把光标拉回显示。
+            if pid != 0 {
+                // 本进程注入的事件（如 warp_cursor）。CGDisplayHideCursor 系统级、
+                // 鼠标移动不重显，注入移动不会再把光标拉回显示，无需补藏。
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -326,38 +319,26 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
                 // CGDisplayHideCursor 系统级、鼠标移动不重显，无需"移动补藏"。
-                // 跨屏期间：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动在 Source 侧也吞
-                // （隐藏光标停住，不跟物理鼠标滑向 Dock/菜单栏——见下方 swallow）；Sink 侧的本机
-                // 移动已在上方单独吞（防双鼠标）。所有分支转发都先于吞执行（tx.send 已发出）。
+                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
                 // 注意：不用 CURSOR_SUPPRESS 兜底——它表示"光标隐藏中"，若 show_cursor 未配对执行
                 // 会卡 true 导致空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
                 let sink = SINK_ACTIVE.load(Ordering::Relaxed);
                 let is_scroll = matches!(p, Payload::MouseWheel { .. });
-                let is_move = matches!(p, Payload::MouseMove { .. });
                 if is_scroll {
                     log::info!(
                         "[MAC-SCROLL-DIAG] delta={p:?} blocked={blocked} sink={sink} suppress={}",
                         CURSOR_SUPPRESS.load(Ordering::SeqCst),
                     );
                 }
-                // 跨屏（Source 出本机）期间：键盘/点击/滚轮/移动 全部吞掉（只转发对端，
-                // 本机不生效）。移动被吞后隐藏光标停在原地，不再跟物理鼠标同步滑向 Dock/
-                // 菜单栏——否则 win 光标到任务栏时 mac 隐藏光标也到 Dock 热区，触发悬停动画
-                // 且 macOS 在这些系统 UI 区域不约束 CGDisplayHideCursor（光标重显）。
-                // 注：Sink 侧本机 MouseMove 已在上方单独吞掉（防双鼠标），此处 blocked 分支
-                // 只覆盖 Source 出屏路径；move 吞掉不应影响转发（tx.send 已先于此处执行）。
-                let swallow = ((blocked || sink)
+                if (blocked || sink)
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
-                    ))
-                    || (blocked && is_move);
-                if swallow {
+                    )
+                {
                     if is_scroll {
                         log::info!("[MAC-SCROLL-DIAG] 滚轮被吞掉（blocked={blocked} sink={sink}）");
-                    } else if is_move {
-                        log::debug!("[MAC-MOVE] 跨屏期间本机移动被吞（只转发对端）");
                     }
                     return None;
                 }
@@ -622,20 +603,11 @@ pub fn screen_size() -> (i32, i32) {
 
 /// 光标跳转（跨屏回绕用）：注入移动事件代替 CGWarpMouseCursorPosition。
 pub fn warp_cursor(x: i32, y: i32) {
-    // 跨屏（Source 出本机）期间隐藏光标不能停在 Dock/菜单栏热区：这里改停到
-    // 屏幕中心安全区（这些系统 UI 区域不约束 CGDisplayHideCursor，隐藏光标滑进去
-    // 会重显并触发悬停动画）。返回时 blocked 已置 false，用调用方给的原坐标。
-    let (tx, ty) = if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) {
-        let (w, h) = screen_size();
-        (w / 2, h / 2)
-    } else {
-        (x, y)
-    };
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
         if let Ok(ev) = CGEvent::new_mouse_event(
             source,
             CGEventType::MouseMoved,
-            CGPoint::new(tx as f64, ty as f64),
+            CGPoint::new(x as f64, y as f64),
             CGMouseButton::Left,
         ) {
             ev.post(CGEventTapLocation::HID);
