@@ -1,18 +1,5 @@
 # CHANGELOG
 
-## 2026-08-08(7) — 侧键注入加固：调试日志 + 完整 Cmd 序列（排查 Mac 端侧键不生效）
-
-- 现象：Win 端侧键跨屏到 Mac 后 iPhone 镜像快捷键不生效（用户实测反馈）。
-- 加固（mac.rs）：
-  - inject_side_button 加 log::debug!：记录 button/down、前台 App bundle id、走的分支
-    （iPhone 镜像快捷键 / 原生侧键），开 RUST_LOG=ruiss_lib=debug 即可定位卡在哪个环节；
-  - 键盘快捷键注入改为完整序列：Cmd(Super) 按下 → 按键按下 → 按键抬起 → Cmd 抬起
-    （cliclick 同款），替代原来只给按键事件打 Command flag 的写法（个别 App 不识别）；
-  - 新增 post_key_event 辅助函数（每次重建 CGEventSource，CGEventSource 不可 Clone）。
-- 存疑待实测：IPHONE_MIRRORING_BUNDLE_ID=com.apple.ScreenContinuity 是从系统服务 plist
-  名推断的，若与 App 实际 bundle id 不符，日志会显示"前台bundle=实际值"，改常量即可。
-- 验证：Windows cargo build 通过（0.70s 增量）；mac.rs 需 Mac 端编译实测。
-
 ## 2026-08-08(6) — 鼠标侧键支持：罗技 XButton 捕获 + Mac 端 iPhone 镜像快捷键映射
 
 - 需求：罗技无线鼠标侧键在跨屏到 Mac 后控制 iPhone 镜像——后退→Cmd+1（主屏幕）、
