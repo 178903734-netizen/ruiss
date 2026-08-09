@@ -334,20 +334,6 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
         WM_RBUTTONUP => Some(Payload::MouseButton { button: 1, down: false }),
         WM_MBUTTONDOWN => Some(Payload::MouseButton { button: 2, down: true }),
         WM_MBUTTONUP => Some(Payload::MouseButton { button: 2, down: false }),
-        // 侧键（罗技等游戏鼠标的 XButton）：WM_XBUTTONDOWN(0x020B) / WM_XBUTTONUP(0x020C)。
-        // LL 钩子中 MSLLHOOKSTRUCT.mouseData 的【低位字】是 X 按钮标识：
-        //   XBUTTON1=0x0001（后退侧键）→ 协议 button 3
-        //   XBUTTON2=0x0002（前进侧键）→ 协议 button 4
-        // （windows crate 0.58 未导出 WM_XBUTTON* 常量，用裸数字）
-        0x020B | 0x020C => {
-            let x = (ms.mouseData & 0xFFFF) as u16;
-            let button = match x {
-                0x0001 => 3,
-                0x0002 => 4,
-                _ => return None,
-            };
-            Some(Payload::MouseButton { button, down: wparam == 0x020B })
-        }
         WM_MOUSEWHEEL => {
             let dy = wheel_delta(ms, &WHEEL_ACCUM_V);
             if dy == 0 { return None; }
@@ -359,7 +345,7 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
             if dx == 0 { return None; }
             Some(Payload::MouseWheel { dx, dy: 0 })
         }
-        _ => None,
+        _ => None, // WM_XBUTTON* 等 M2 再支持
     }
 }
 

@@ -33,8 +33,7 @@ pub enum Payload {
     /// 鼠标移动到源端逻辑坐标 (x, y)；src_w/src_h 为源端屏幕尺寸
     /// （接收端按自己的屏幕等比映射，支持两端分辨率不同）
     MouseMove { x: i32, y: i32, src_w: u32, src_h: u32 },
-    /// 鼠标按键：0 左键 / 1 右键 / 2 中键 / 3 XButton1（后退侧键）/ 4 XButton2（前进侧键），
-    /// down=true 按下，false 抬起
+    /// 鼠标按键：0 左键 / 1 右键 / 2 中键，down=true 按下，false 抬起
     MouseButton { button: u8, down: bool },
     /// 滚轮：dy>0 向上滚，dx 为横向滚轮。单位统一为"格"：
     /// Windows 一格=120 delta（捕获 ÷120、注入 ×120），Mac 一格=1 行（原样）

@@ -37,10 +37,6 @@ use crate::core::protocol::Payload;
 /// 平台标记：来源端是否 Mac（用于键位映射方向）。
 pub const TARGET_IS_MAC: bool = true;
 
-/// iPhone 镜像（macOS Sequoia 15+）的 bundle identifier（进程名 ScreenContinuity）。
-/// 侧键映射快捷键只在该 App 前台时生效；若实测不匹配（bundle id 变动）改这里即可。
-const IPHONE_MIRRORING_BUNDLE_ID: &str = "com.apple.ScreenContinuity";
-
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> i32;
@@ -515,12 +511,6 @@ impl InputInjector {
                 CGEvent::new_mouse_event(source, ty, CGPoint::new(*x as f64, *y as f64), btn)
             }
             Payload::MouseButton { button, down } => {
-                // 侧键（罗技 XButton1/XButton2 → 协议 button 3/4）：
-                // iPhone 镜像前台时映射为快捷键（后退→Cmd+1 主屏幕 / 前进→Cmd+2 App 切换），
-                // 其他 App 注入原生侧键事件，保持浏览器前进/后退等原语义。
-                if *button == 3 || *button == 4 {
-                    return self.inject_side_button(*button, *down);
-                }
                 // 记录当前按住的按钮：拖动期间的移动要注入为 *Dragged 类型
                 // （up 后清空；macOS 拖选依赖这个状态还原事件类型）
                 HELD_BUTTON.store(if *down { *button as i32 } else { -1 }, Ordering::Relaxed);
@@ -592,67 +582,6 @@ impl InputInjector {
         let Ok(cg) = cg else { return 0 };
         cg.post(CGEventTapLocation::HID);
         1
-    }
-
-    /// 侧键（协议 button 3/4）注入：
-    /// - iPhone 镜像前台 → 注入 Cmd+1 / Cmd+2 键盘快捷键（带 Command flag，不碰修饰键状态）；
-    /// - 其他 App → 注入原生侧键鼠标事件（OtherMouseDown/Up + button number 3/4）。
-    /// 返回 1 表示已投递。
-    fn inject_side_button(&self, button: u8, down: bool) -> u32 {
-        if frontmost_bundle_id().as_deref() == Some(IPHONE_MIRRORING_BUNDLE_ID) {
-            // 后退侧键(3) → Cmd+1 主屏幕；前进侧键(4) → Cmd+2 App 切换
-            let key = if button == 3 { Key::Digit1 } else { Key::Digit2 };
-            let Some(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()
-            else {
-                return 0;
-            };
-            if let Ok(ev) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) {
-                ev.set_flags(CGEventFlags::CGEventFlagCommand);
-                ev.post(CGEventTapLocation::HID);
-            }
-            return 1;
-        }
-        // 非 iPhone 镜像：注入原生侧键事件（不改变系统前进/后退语义）
-        let Some(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()
-        else {
-            return 0;
-        };
-        let (x, y) = match LAST_POS.lock() {
-            Ok(g) => g.unwrap_or((0.0, 0.0)),
-            Err(_) => (0.0, 0.0),
-        };
-        let ty = if down {
-            CGEventType::OtherMouseDown
-        } else {
-            CGEventType::OtherMouseUp
-        };
-        if let Ok(ev) = CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), CGMouseButton::Center)
-        {
-            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
-            ev.post(CGEventTapLocation::HID);
-        }
-        1
-    }
-}
-
-/// 前台 App 的 bundle identifier（NSWorkspace.frontmostApplication）。
-/// 失败（无权限/异常）返回 None —— 侧键按"非 iPhone 镜像"处理，注入原生事件。
-fn frontmost_bundle_id() -> Option<String> {
-    unsafe {
-        let cls = objc::runtime::Class::get("NSWorkspace")?;
-        let ws: *mut objc::runtime::Object = objc::msg_send![cls, sharedWorkspace];
-        if ws.is_null() {
-            return None;
-        }
-        let app: *mut objc::runtime::Object = objc::msg_send![ws, frontmostApplication];
-        if app.is_null() {
-            return None;
-        }
-        let nsid: *mut objc::runtime::Object = objc::msg_send![app, bundleIdentifier];
-        if nsid.is_null() {
-            return None;
-        }
-        Some(CFString::wrap_under_get_rule(nsid as *const _).to_string())
     }
 }
 

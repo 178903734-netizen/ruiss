@@ -1,20 +1,5 @@
 # CHANGELOG
 
-## 2026-08-08(6) — 鼠标侧键支持：罗技 XButton 捕获 + Mac 端 iPhone 镜像快捷键映射
-
-- 需求：罗技无线鼠标侧键在跨屏到 Mac 后控制 iPhone 镜像——后退→Cmd+1（主屏幕）、
-  前进→Cmd+2（App 切换）；只在 iPhone 镜像前台时映射，其他 App 保持侧键原语义。
-- win.rs（捕获侧）：mouse_to_payload 补 WM_XBUTTONDOWN(0x020B)/WM_XBUTTONUP(0x020C)，
-  读 MSLLHOOKSTRUCT.mouseData 低位字区分 XBUTTON1=0x0001 → 协议 button 3（后退）、
-  XBUTTON2=0x0002 → button 4（前进）。（windows crate 0.58 未导出 WM_XBUTTON*，用裸数字）
-- protocol.rs：MouseButton 注释更新（3=后退侧键 / 4=前进侧键）。
-- mac.rs（注入侧）：MouseButton 3/4 走新方法 inject_side_button——前台 App bundle id 为
-  com.apple.ScreenContinuity（iPhone 镜像，常量 IPHONE_MIRRORING_BUNDLE_ID）时，注入带
-  Command flag 的 Cmd+1/Cmd+2 键盘事件（只注入按键事件、不碰修饰键状态，副作用最小）；
-  否则注入原生侧键事件（OtherMouseDown/Up + MOUSE_EVENT_BUTTON_NUMBER）。
-- 验证：Windows cargo check 通过（win.rs 参与编译）；mac.rs 改动需 Mac 端编译实测
-  （前台 bundle id 若与实际不符，改 IPHONE_MIRRORING_BUNDLE_ID 常量即可）。
-
 ## 2026-08-08(5) — 回退 4e4ffc5（mac 跨屏双滚 + Dock 隔空触发），对齐 2b01364
 
 - 原因：4e4ffc5 在 Mac 端实测有问题（用户反馈"好像改了东西"），回退到
