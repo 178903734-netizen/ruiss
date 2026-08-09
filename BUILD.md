@@ -54,11 +54,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/set-ruiss-env.ps1
 
 ```bash
 # 编译（debug，首次 10~20 分钟，之后增量几秒~几十秒）
-cd src-tauri && cargo build
+# 必须固定用这一条命令 + 固定 target 目录，才能命中增量缓存（见下方铁律）
+cd "C:/Users/23764/Desktop/ruiss"
+CARGO_TARGET_DIR="D:/ruiss-target" cargo build --manifest-path src-tauri/Cargo.toml
 
 # 带调试日志运行
 RUST_LOG=ruiss_lib=debug cargo run
 ```
+
+> ⚠️ 增量缓存铁律（2026-08-08 踩坑后固化，以后别再纠结"为什么编译慢"）：
+>
+> - 永远只用上面这一条 build 命令，不要换写法、不要混用默认 target 目录；
+> - **不删 `D:\ruiss-target`、不做 `cargo clean`**——删了/清了 = 全量重编所有依赖（20 分钟+）；
+> - 跑任何 cargo 命令（包括 cargo check）都要带 `CARGO_TARGET_DIR="D:/ruiss-target"`，
+>   否则会在 `src-tauri\target` 下另起炉灶，把全部依赖再全量编译一遍；
+> - 正常改代码后重跑 build，只重编 ruiss 自己，一分钟内完成；
+> - cargo 的增量指纹很敏感：命令写法、环境变量、cargo 版本变化都可能让缓存失效 → 全量重编。
 
 ### 2.3 产物位置
 
