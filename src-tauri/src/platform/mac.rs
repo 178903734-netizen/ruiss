@@ -599,20 +599,31 @@ impl InputInjector {
     /// - 其他 App → 注入原生侧键鼠标事件（OtherMouseDown/Up + button number 3/4）。
     /// 返回 1 表示已投递。
     fn inject_side_button(&self, button: u8, down: bool) -> u32 {
-        if frontmost_bundle_id().as_deref() == Some(IPHONE_MIRRORING_BUNDLE_ID) {
+        let bundle = frontmost_bundle_id();
+        log::debug!(
+            "侧键注入: button={} down={} 前台bundle={:?} 期望bundle={}",
+            button, down, bundle, IPHONE_MIRRORING_BUNDLE_ID
+        );
+        if bundle.as_deref() == Some(IPHONE_MIRRORING_BUNDLE_ID) {
             // 后退侧键(3) → Cmd+1 主屏幕；前进侧键(4) → Cmd+2 App 切换
+            log::debug!(
+                "侧键 → iPhone 镜像前台，注入 Cmd+{}",
+                if button == 3 { "1（主屏幕）" } else { "2（App 切换）" }
+            );
             let key = if button == 3 { Key::Digit1 } else { Key::Digit2 };
-            let Some(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()
-            else {
-                return 0;
-            };
-            if let Ok(ev) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) {
-                ev.set_flags(CGEventFlags::CGEventFlagCommand);
-                ev.post(CGEventTapLocation::HID);
+            if down {
+                // 完整序列：Cmd 按下 → 按键按下（带 Cmd flag）
+                post_key_event(Key::Super, true, CGEventFlags::CGEventFlagCommand);
+                post_key_event(key, true, CGEventFlags::CGEventFlagCommand);
+            } else {
+                // 松开：按键抬起 → Cmd 抬起
+                post_key_event(key, false, CGEventFlags::CGEventFlagCommand);
+                post_key_event(Key::Super, false, CGEventFlags::empty());
             }
             return 1;
         }
         // 非 iPhone 镜像：注入原生侧键事件（不改变系统前进/后退语义）
+        log::debug!("侧键 → 非 iPhone 镜像，注入原生侧键事件");
         let Some(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()
         else {
             return 0;
@@ -632,6 +643,17 @@ impl InputInjector {
             ev.post(CGEventTapLocation::HID);
         }
         1
+    }
+}
+
+/// 注入一个键盘事件（带修饰 flag）。CGEventSource 每次重新创建（不可 Clone）。
+fn post_key_event(key: Key, down: bool, flags: CGEventFlags) {
+    let Some(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok() else {
+        return;
+    };
+    if let Ok(ev) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) {
+        ev.set_flags(flags);
+        ev.post(CGEventTapLocation::HID);
     }
 }
 
