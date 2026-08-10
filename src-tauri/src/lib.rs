@@ -11,6 +11,7 @@
 
 mod clipboard;
 mod core;
+mod file_transfer;
 mod net;
 mod platform;
 
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
 use crate::core::keys::Key;
@@ -35,6 +36,7 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             setup_tray(app)?;
             // 启动兜底：恢复上次可能残留的光标状态（Ruiss 被强杀后光标计数可能仍为负）
@@ -69,11 +71,19 @@ pub fn run() {
             // 空闲心跳：光标停在边缘不动也能触发跨屏判定
             spawn_tick_task(router.clone());
 
+            // 文件接收器（监听对端 FileStart/Chunk/End，写下载目录 + 写剪贴板 + 通知前端）
+            let file_receiver = Arc::new(file_transfer::FileReceiver::new(app.handle().clone()));
+            {
+                let mut r = router.lock().unwrap();
+                r.file_receiver = Some(file_receiver);
+            }
+
             // 若已配置对端 IP，启动网络
             if !router.lock().unwrap().settings.peer_ip.trim().is_empty() {
                 let r = router.clone();
+                let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = apply_link_config(&r).await {
+                    if let Err(e) = apply_link_config(&r, &app_handle).await {
                         log::error!("网络启动失败: {e}");
                     }
                 });
@@ -87,6 +97,8 @@ pub fn run() {
             get_self_test_stats,
             get_net_status,
             test_inject,
+            send_file,
+            pick_and_send_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ruiss");
@@ -147,6 +159,12 @@ struct RouterState {
     /// 网络引擎（持有任务，Drop 即停止）
     engine: Option<net::NetEngine>,
     injector: Arc<platform::InputInjector>,
+    /// 剪贴板同步器（Drop 即停止监听）
+    clipboard: Option<clipboard::ClipboardSync>,
+    /// 文件发送器（无状态，可克隆）
+    file_sender: Option<file_transfer::FileSender>,
+    /// 文件接收器（处理对端 FileStart/Chunk/End）
+    file_receiver: Option<Arc<file_transfer::FileReceiver>>,
 }
 
 impl RouterState {
@@ -160,6 +178,9 @@ impl RouterState {
             net: None,
             engine: None,
             injector,
+            clipboard: None,
+            file_sender: None,
+            file_receiver: None,
         }
     }
 }
@@ -272,6 +293,46 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             platform::hide_cursor();
             platform::set_local_input_blocked(true);
             net.send(Message::ctrl(&name, Payload::TakeControl { x, y, src_w, src_h }));
+            // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
+            if platform::is_left_button_down() {
+                let content = platform::clipboard_read();
+                let (has_text, has_image, has_files) = match &content {
+                    platform::ClipboardContent::Text(_) => (true, false, false),
+                    platform::ClipboardContent::Image(_) => (false, true, false),
+                    platform::ClipboardContent::Files(_) => (false, false, true),
+                    platform::ClipboardContent::Empty => (false, false, false),
+                };
+                if has_text || has_image || has_files {
+                    log::info!("拖拽跨屏：携带剪贴板内容 text={has_text} image={has_image} files={has_files}");
+                    net.send(Message::ctrl(&name, Payload::DragOffer {
+                        drag: true, has_text, has_image, has_files,
+                    }));
+                    match content {
+                        platform::ClipboardContent::Text(t) => {
+                            net.send(Message::clipboard(&name, Payload::ClipboardText { text: t }));
+                        }
+                        platform::ClipboardContent::Image(png) => {
+                            net.send(Message::clipboard(&name, Payload::ClipboardImage { png }));
+                        }
+                        platform::ClipboardContent::Files(paths) => {
+                            // 每个文件走分块传输
+                            let sender = {
+                                let r = match router.lock() {
+                                    Ok(g) => g,
+                                    Err(e) => e.into_inner(),
+                                };
+                                r.file_sender.clone()
+                            };
+                            if let Some(sender) = sender {
+                                for p in paths {
+                                    sender.send_file(std::path::PathBuf::from(p));
+                                }
+                            }
+                        }
+                        platform::ClipboardContent::Empty => {}
+                    }
+                }
+            }
         }
         Action::ReleaseControl => {
             log::info!("返回本机 → ReleaseControl");
@@ -355,6 +416,32 @@ async fn run_incoming_router(
                     }
                 }
             }
+            Payload::ClipboardText { .. } | Payload::ClipboardImage { .. } | Payload::ClipboardFiles { .. } => {
+                clipboard::handle_remote(&msg.payload);
+            }
+            Payload::FileStart { .. } | Payload::FileChunk { .. } | Payload::FileEnd { .. } | Payload::FileCancel { .. } => {
+                let fr = {
+                    let r = match router.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    r.file_receiver.clone()
+                };
+                if let Some(fr) = fr {
+                    fr.handle(&msg.payload);
+                }
+            }
+            Payload::DragOffer { drag, has_text, has_image, has_files: _ } => {
+                // 文字/图片拖拽：剪贴板内容随后到达写入，延迟注入粘贴
+                // 文件拖拽：文件传完路径已入剪贴板，用户手动 Ctrl+V（传输耗时不确定）
+                if *drag && (*has_text || *has_image) {
+                    let inj = injector.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        inject_paste(&inj);
+                    });
+                }
+            }
             _ => {
                 let sink = {
                     let r = match router.lock() {
@@ -390,9 +477,19 @@ async fn run_incoming_router(
     log::info!("网络路由任务结束");
 }
 
+/// 注入"粘贴"组合键：本机是 Mac 用 Command+V，Windows 用 Ctrl+V。
+/// 跨屏拖拽文字/图片到对端后，对端在光标处自动粘贴。
+fn inject_paste(injector: &platform::InputInjector) {
+    let mod_key = if platform::TARGET_IS_MAC { Key::Super } else { Key::Ctrl };
+    injector.inject(Payload::Key { key: mod_key, scan: 0, extended: false, down: true });
+    injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: true });
+    injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: false });
+    injector.inject(Payload::Key { key: mod_key, scan: 0, extended: false, down: false });
+}
+
 /// 按当前设置（重）配置网络与仲裁器。
-async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), String> {
-    let (peer_ip, layout, name, cross_enabled) = {
+async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -> Result<(), String> {
+    let (peer_ip, layout, name, cross_enabled, clip_enabled) = {
         let r = match router.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -402,6 +499,7 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
             r.settings.layout.clone(),
             r.settings.name.trim().to_string(),
             r.settings.cross_screen_enabled,
+            r.settings.clipboard_enabled,
         )
     };
     // 停旧引擎
@@ -413,6 +511,8 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
         r.engine = None; // Drop → 任务中止
         r.net = None;
         r.arbiter = None;
+        r.clipboard = None; // Drop → 停止剪贴板监听
+        r.file_sender = None;
     }
     if peer_ip.is_empty() {
         log::info!("未配置对端 IP，网络关闭");
@@ -439,14 +539,32 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>) -> Result<(), Strin
             Err(e) => e.into_inner(),
         };
         r.engine = Some(start.engine);
-        r.net = Some(handle);
+        r.net = Some(handle.clone());
         // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
         r.arbiter = if cross_enabled { Some(Arbiter::new(layout)) } else { None };
+        // 文件发送器（剪贴板文件 + GUI 手动发送 + 拖拽，都用它）
+        let file_sender = file_transfer::FileSender::new(handle.clone(), name.clone());
+        r.file_sender = Some(file_sender.clone());
+        // 剪贴板同步：监听本机剪贴板变化发对端，剪贴板开关关闭时不启动
+        if clip_enabled {
+            let clip = clipboard::ClipboardSync::start(
+                name.clone(),
+                handle.clone(),
+                std::sync::Arc::new(move |paths: Vec<String>| {
+                    // 本机剪贴板出现文件路径 → 逐个发送
+                    for p in paths {
+                        file_sender.send_file(std::path::PathBuf::from(p));
+                    }
+                }),
+            );
+            r.clipboard = Some(clip);
+        }
     }
     tauri::async_runtime::spawn(run_incoming_router(start.incoming, router.clone(), injector));
     log::info!(
-        "网络已启动：对端 {peer_ip}（跨屏{}）",
-        if cross_enabled { "开启" } else { "已关闭" }
+        "网络已启动：对端 {peer_ip}（跨屏{}，剪贴板{}）",
+        if cross_enabled { "开启" } else { "已关闭" },
+        if clip_enabled { "开启" } else { "已关闭" }
     );
     Ok(())
 }
@@ -466,6 +584,7 @@ struct Settings {
     #[serde(default = "default_true")]
     cross_screen_enabled: bool,
     /// 剪贴板共享开关
+    #[serde(default)]
     clipboard_enabled: bool,
     /// 开机自启
     autostart: bool,
@@ -514,7 +633,7 @@ async fn save_settings(
         let mut r = state.inner().lock().map_err(|e| e.to_string())?;
         r.settings = settings.clone();
     }
-    apply_link_config(state.inner()).await?;
+    apply_link_config(state.inner(), &app).await?;
     log::info!("设置已保存: {}", settings.peer_ip);
     Ok(())
 }
@@ -695,4 +814,42 @@ fn test_inject(text: String) -> Result<u32, String> {
         ok += injector.inject(Payload::Key { key, scan: 0, extended: false, down: false });
     }
     Ok(ok)
+}
+
+/// 发送指定路径的文件到对端（前端传完整路径）。
+#[tauri::command]
+fn send_file(
+    state: State<'_, Arc<Mutex<RouterState>>>,
+    path: String,
+) -> Result<(), String> {
+    let sender = {
+        let r = state.inner().lock().map_err(|e| e.to_string())?;
+        r.file_sender.clone()
+    };
+    let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
+    sender.send_file(std::path::PathBuf::from(path));
+    Ok(())
+}
+
+/// 弹出文件选择框，选完即发送（用 tauri-plugin-dialog）。
+#[tauri::command]
+async fn pick_and_send_file(
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<RouterState>>>,
+) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("所有文件", &["*"])
+        .blocking_pick_file();
+    let Some(picked) = picked else { return Ok(()); };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let sender = {
+        let r = state.inner().lock().map_err(|e| e.to_string())?;
+        r.file_sender.clone()
+    };
+    let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
+    sender.send_file(path);
+    Ok(())
 }

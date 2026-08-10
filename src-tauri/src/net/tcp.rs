@@ -12,8 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::core::protocol::Message;
 
-/// 单帧最大长度（1MB，防异常帧撑爆内存）。
-const MAX_FRAME: usize = 1024 * 1024;
+/// 单帧最大长度（16MB：剪贴板图片 PNG 可能几 MB；大文件走 FileChunk 分块，
+/// 每块 256KB 不会超限。再大就拒绝，防异常帧撑爆内存）。
+const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// 写一帧：4 字节大端长度 + JSON。
 pub async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, msg: &Message) -> Result<()> {

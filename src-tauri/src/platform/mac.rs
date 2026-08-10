@@ -666,3 +666,290 @@ pub fn key_to_cg(key: Key) -> u16 {
         k => CG_MAP.iter().find(|(_, m)| *m == k).map(|(c, _)| *c).unwrap_or(0),
     }
 }
+
+// ======================== M3：剪贴板 + 拖拽检测 ========================
+//
+// 注意：本段为 Mac 实现，Windows 上不编译（cfg gate）。API 用 objc 0.2 调
+// NSPasteboard / NSEvent。CFString 与 NSString toll-free bridged，用作类型参数。
+// 首次 Mac 编译若有 API 签名差异，把错误信息发回迭代。
+
+use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
+use objc::runtime::{Class, Object, NSInteger, NO, YES};
+use objc::{class, msg_send, sel, sel_impl};
+use std::ffi::c_void;
+use std::sync::atomic::AtomicBool;
+
+use core_foundation::base::{CFTypeRef, TCFType};
+use core_foundation::string::{CFString, CFStringRef};
+
+/// 本机写入标志：本机主动写剪贴板时置 true，监听器跳过本次变化（防回环）。
+static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// 取全局 NSPasteboard。
+unsafe fn general_pasteboard() -> *mut Object {
+    msg_send![class!(NSPasteboard), generalPasteboard]
+}
+
+/// CFString → NSString（toll-free bridge）作为 NSPasteboard 类型参数。
+unsafe fn ns_type(name: &str) -> *mut Object {
+    let cf = CFString::new(name);
+    cf.as_concrete_TypeRef() as *mut Object
+}
+
+/// NSString → Rust String。
+unsafe fn nsstring_to_string(nsstr: *mut Object) -> Option<String> {
+    if nsstr.is_null() {
+        return None;
+    }
+    let utf8: *const std::os::raw::c_char = msg_send![nsstr, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+    std::ffi::CStr::from_ptr(utf8)
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// NSData（字节）→ Vec<u8>。
+unsafe fn nsdata_to_vec(data: *mut Object) -> Option<Vec<u8>> {
+    if data.is_null() {
+        return None;
+    }
+    let len: usize = msg_send![data, length];
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let bytes: *const c_void = msg_send![data, bytes];
+    let slice = std::slice::from_raw_parts(bytes as *const u8, len);
+    Some(slice.to_vec())
+}
+
+/// Rust String → autoreleased NSString。
+unsafe fn string_to_nsstring(s: &str) -> *mut Object {
+    let bytes = s.as_bytes();
+    let ns: *mut Object = msg_send![class!(NSString), alloc];
+    msg_send![ns, initWithBytes: bytes.as_ptr() length: bytes.len() encoding: 4 /* NSUTF8StringEncoding */]
+}
+
+/// 读当前剪贴板（优先级 files > image > text）。
+pub fn clipboard_read() -> ClipboardContent {
+    unsafe {
+        let pb = general_pasteboard();
+        if pb.is_null() {
+            return ClipboardContent::Empty;
+        }
+        // 文件优先
+        if let Some(files) = read_files(pb) {
+            if !files.is_empty() {
+                return ClipboardContent::Files(files);
+            }
+        }
+        // 图片：PNG 优先，否则 TIFF→PNG
+        if let Some(png) = read_image(pb) {
+            return ClipboardContent::Image(png);
+        }
+        // 文本
+        if let Some(text) = read_text(pb) {
+            return ClipboardContent::Text(text);
+        }
+        ClipboardContent::Empty
+    }
+}
+
+unsafe fn read_text(pb: *mut Object) -> Option<String> {
+    let t = ns_type("public.utf8-plain-text");
+    let nsstr: *mut Object = msg_send![pb, stringForType: t];
+    nsstring_to_string(nsstr)
+}
+
+unsafe fn read_image(pb: *mut Object) -> Option<Vec<u8>> {
+    // 1. PNG 直接取
+    let t = ns_type("public.png");
+    let data: *mut Object = msg_send![pb, dataForType: t];
+    if !data.is_null() {
+        if let Some(v) = nsdata_to_vec(data) {
+            return Some(v);
+        }
+    }
+    // 2. TIFF → PNG（截图默认 TIFF）
+    let t = ns_type("public.tiff");
+    let tiff: *mut Object = msg_send![pb, dataForType: t];
+    if tiff.is_null() {
+        return None;
+    }
+    let tiff_bytes = nsdata_to_vec(tiff)?;
+    tiff_to_png(&tiff_bytes)
+}
+
+/// TIFF 字节 → PNG 字节（用 NSBitmapImageRep）。
+fn tiff_to_png(tiff: &[u8]) -> Option<Vec<u8>> {
+    unsafe {
+        let nsdata: *mut Object = msg_send![
+            class!(NSData),
+            dataWithBytes: tiff.as_ptr()
+            length: tiff.len()
+        ];
+        if nsdata.is_null() {
+            return None;
+        }
+        let rep: *mut Object = msg_send![class!(NSBitmapImageRep), imageRepWithData: nsdata];
+        if rep.is_null() {
+            return None;
+        }
+        let props: *mut Object = msg_send![class!(NSDictionary), dictionary];
+        // NSBitmapImageRep representationUsingType:properties: 4 = NSPNGFileType
+        let png: *mut Object = msg_send![rep, representationUsingType: 4 properties: props];
+        nsdata_to_vec(png)
+    }
+}
+
+unsafe fn read_files(pb: *mut Object) -> Option<Vec<String>> {
+    let classes: *mut Object = msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
+    let options: *mut Object = msg_send![class!(NSDictionary), dictionary];
+    let urls: *mut Object = msg_send![pb, readObjectsForClasses: classes options: options];
+    if urls.is_null() {
+        return Some(Vec::new());
+    }
+    let count: usize = msg_send![urls, count];
+    let mut files = Vec::with_capacity(count);
+    for i in 0..count {
+        let url: *mut Object = msg_send![urls, objectAtIndex: i];
+        let path: *mut Object = msg_send![url, path];
+        if let Some(s) = nsstring_to_string(path) {
+            files.push(s);
+        }
+    }
+    Some(files)
+}
+
+/// 写文本到剪贴板。
+pub fn clipboard_write_text(text: &str) {
+    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let pb = general_pasteboard();
+        let _: () = msg_send![pb, clearContents];
+        let nsstr = string_to_nsstring(text);
+        let t = ns_type("public.utf8-plain-text");
+        let _: () = msg_send![pb, setString: nsstr forType: t];
+    }
+}
+
+/// 写 PNG 图片到剪贴板（同时写 PNG 和 TIFF 类型，兼容性最好）。
+pub fn clipboard_write_image(png_bytes: &[u8]) {
+    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let pb = general_pasteboard();
+        let _: () = msg_send![pb, clearContents];
+        let data: *mut Object = msg_send![
+            class!(NSData),
+            dataWithBytes: png_bytes.as_ptr()
+            length: png_bytes.len()
+        ];
+        let t = ns_type("public.png");
+        let _: () = msg_send![pb, setData: data forType: t];
+        // 同时写 TIFF（部分应用只认 TIFF）
+        if let Some(tiff) = png_to_tiff(png_bytes) {
+            let t2 = ns_type("public.tiff");
+            let tdata: *mut Object = msg_send![
+                class!(NSData),
+                dataWithBytes: tiff.as_ptr()
+                length: tiff.len()
+            ];
+            let _: () = msg_send![pb, setData: tdata forType: t2];
+        }
+    }
+}
+
+/// PNG → TIFF（NSBitmapImageRep 中转）。
+fn png_to_tiff(png: &[u8]) -> Option<Vec<u8>> {
+    unsafe {
+        let nsdata: *mut Object = msg_send![
+            class!(NSData),
+            dataWithBytes: png.as_ptr()
+            length: png.len()
+        ];
+        let rep: *mut Object = msg_send![class!(NSBitmapImageRep), imageRepWithData: nsdata];
+        if rep.is_null() {
+            return None;
+        }
+        let props: *mut Object = msg_send![class!(NSDictionary), dictionary];
+        // NSTIFFFileType = 0
+        let tiff: *mut Object = msg_send![rep, representationUsingType: 0 properties: props];
+        nsdata_to_vec(tiff)
+    }
+}
+
+/// 写文件路径列表到剪贴板（NSURL 数组 writeObjects）。
+pub fn clipboard_write_files(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let pb = general_pasteboard();
+        let _: () = msg_send![pb, clearContents];
+        // 构造 NSURL 数组
+        let n = paths.len();
+        let mut urls: Vec<*mut Object> = Vec::with_capacity(n);
+        for p in paths {
+            let path_ns = string_to_nsstring(p);
+            let url: *mut Object = msg_send![
+                class!(NSURL),
+                fileURLWithPath: path_ns
+            ];
+            urls.push(url);
+        }
+        let arr: *mut Object = msg_send![
+            class!(NSArray),
+            arrayWithObjects: urls.as_ptr()
+            count: n
+        ];
+        let _: BOOL = msg_send![pb, writeObjects: arr];
+    }
+}
+
+/// 鼠标左键是否按下（拖拽跨屏检测用）。NSEvent pressedMouseButtons 位掩码 bit0=左键。
+pub fn is_left_button_down() -> bool {
+    unsafe {
+        let pressed: NSInteger = msg_send![class!(NSEvent), pressedMouseButtons];
+        (pressed & 1) != 0
+    }
+}
+
+/// 启动剪贴板监听：1s 轮询 NSPasteboard changeCount，变化时读 + 回调。
+/// Mac 没有像 Windows AddClipboardFormatListener 那样的通知机制，轮询最稳。
+pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static>) -> ClipboardWatcherHandle {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    std::thread::spawn(move || unsafe {
+        let pb = general_pasteboard();
+        let mut last: NSInteger = msg_send![pb, changeCount];
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let cur: NSInteger = msg_send![pb, changeCount];
+            if cur == last {
+                continue;
+            }
+            last = cur;
+            // 本机写入触发跳过（防回环）
+            if LOCAL_WRITE
+                .compare_exchange(true, false, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                continue;
+            }
+            let content = clipboard_read();
+            if !content.is_empty() {
+                cb(content);
+            }
+        }
+    });
+    ClipboardWatcherHandle {
+        stop: Some(Box::new(move || {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        })),
+    }
+}

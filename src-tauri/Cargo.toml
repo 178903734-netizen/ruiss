@@ -24,6 +24,13 @@ log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 arboard = "3"
+# M3：文件传输下载目录 + 文件选择对话框
+tauri-plugin-dialog = "2"
+# M3：剪贴板图片 PNG 编解码 + 文件传输下载目录
+png = "0.17"
+dirs = "5"
+# M3：文件传输唯一 id
+uuid = { version = "1", features = ["v4"] }
 
 # ---- 平台依赖（M1 启用：Windows 低层钩子捕获 + SendInput 注入）----
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -31,9 +38,13 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_System_LibraryLoader",
-  "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

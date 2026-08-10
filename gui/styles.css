@@ -71,3 +71,27 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
 .test-btn:hover { border-color: #4f8ff7; }
 
 .hint { margin-top: 16px; font-size: 11px; color: #8a93a8; line-height: 1.6; }
+.hint.small { margin-top: 8px; font-size: 10.5px; }
+
+.file-send { display: flex; align-items: center; gap: 10px; }
+
+.file-log {
+  list-style: none;
+  margin: 10px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.file-log li {
+  font-size: 11.5px;
+  color: #1f2430;
+  background: #eaf6ee;
+  border: 1px solid #cfe9d6;
+  border-radius: 6px;
+  padding: 6px 9px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.file-log .path { color: #7a8aa0; font-size: 10.5px; font-family: Consolas, "Courier New", monospace; }

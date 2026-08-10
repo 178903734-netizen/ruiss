@@ -46,6 +46,9 @@ pub enum Payload {
     ClipboardText { text: String },
     /// 剪贴板图片（PNG 字节）
     ClipboardImage { png: Vec<u8> },
+    /// 剪贴板文件（路径列表）。接收端把这些路径写入本机剪贴板的文件类型
+    /// （Win: CF_HDROP；Mac: NSFilenamesPboardType），用户可直接 Ctrl+V 粘贴文件。
+    ClipboardFiles { paths: Vec<String> },
     /// 心跳（保活 + 角色仲裁）
     Heartbeat { seq: u64 },
     /// 令牌：成为主控（对端进入 Sink），携带对端坐标系入口位置 (x, y)
@@ -53,6 +56,27 @@ pub enum Payload {
     TakeControl { x: i32, y: i32, src_w: u32, src_h: u32 },
     /// 释放令牌（本机鼠标回到出口边，对端恢复自主）
     ReleaseControl,
+
+    // ===== M3：文件传输（分块流，支持任意大小文件）=====
+    /// 文件传输开始：声明一个新文件流。id 为本次传输唯一标识（uuid），
+    /// name 为文件名（不含路径，接收端据此命名），size 为字节数。
+    FileStart { id: String, name: String, size: u64 },
+    /// 文件数据块：id 对应 FileStart，seq 从 0 递增（接收端按序写盘，
+    /// 丢块则整文件作废），data 为原始字节（建议 256KB/块）。
+    FileChunk { id: String, seq: u32, data: Vec<u8> },
+    /// 文件传输结束：id 对应 FileStart。接收端校验已写字节 = size 后
+    /// 把文件路径写入剪贴板并通知前端。
+    FileEnd { id: String },
+    /// 取消文件传输（发送方主动取消或接收方拒绝）。
+    FileCancel { id: String },
+
+    // ===== M3：跨屏拖拽（拖动文件/图片跨屏到对端放下）=====
+    /// 拖拽跨屏通告：Source 侧鼠标拖着东西滑到对端时随 TakeControl 一并发送，
+    /// kinds 告知对端"拖拽里有什么"（text/image/files），对端收到后：
+    /// 1) 等待后续 Clipboard*/File* 消息把内容补齐到本机剪贴板；
+    /// 2) 在光标位置注入 Ctrl+V（Mac: Cmd+V）模拟"放下"。
+    /// 若 drag=false 表示只是普通跨屏（不注入粘贴）。
+    DragOffer { drag: bool, has_text: bool, has_image: bool, has_files: bool },
 }
 
 /// 便捷构造。

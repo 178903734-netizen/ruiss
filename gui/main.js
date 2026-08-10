@@ -116,10 +116,46 @@
     setTimeout(() => (status.textContent = ''), 3000);
   }
 
+  // 跨屏文件传输：选文件发对端
+  async function pickAndSendFile() {
+    const status = $('fileStatus');
+    status.textContent = '选择文件中…';
+    try {
+      await invoke('pick_and_send_file');
+      status.textContent = '已发送 ✓';
+    } catch (e) {
+      status.textContent = '发送失败：' + e;
+    }
+    setTimeout(() => (status.textContent = ''), 2500);
+  }
+
+  // 收到对端传来的文件：追加一条记录
+  function logReceived(name, path) {
+    const ul = $('fileLog');
+    if (!ul) return;
+    const li = document.createElement('li');
+    li.innerHTML = `<b>收到</b> ${name}<br><span class="path">${path}</span>`;
+    ul.prepend(li);
+    if (ul.children.length > 20) ul.lastChild.remove();
+  }
+
+  // 监听后端 file-received 事件（对端发来文件完成时触发）
+  function listenFileReceived() {
+    const t = tauri();
+    if (t && t.event && typeof t.event.listen === 'function') {
+      t.event.listen('file-received', (e) => {
+        const p = e.payload || {};
+        logReceived(p.name || '文件', p.path || '');
+      });
+    }
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     $('saveBtn').addEventListener('click', save);
     $('selfTest').addEventListener('change', toggleSelfTest);
     $('testInjectBtn').addEventListener('click', runTestInject);
+    $('pickFileBtn').addEventListener('click', pickAndSendFile);
+    listenFileReceived();
     setInterval(refreshStats, 300);
     setInterval(refreshNet, 500);
     load();

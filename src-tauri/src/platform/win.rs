@@ -43,10 +43,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
     SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
     HICON,
+    WM_CLIPBOARDUPDATE,
 };
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+    OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::UI::Shell::DragQueryFileW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
 use crate::core::keys::Key;
 use crate::core::protocol::Payload;
+
+/// 平台标记：来源端是否 Mac（用于键位映射方向）。
+pub const TARGET_IS_MAC: bool = false;
 
 // 钩子回调往消费线程送事件的通道（线程局部：钩子线程装填）
 thread_local! {
@@ -682,4 +694,431 @@ pub fn warp_cursor(x: i32, y: i32) {
     unsafe {
         let _ = SetCursorPos(x, y);
     }
+}
+
+// ======================== M3：剪贴板 + 拖拽检测 ========================
+
+use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
+
+/// 本机写入标志：本机主动写剪贴板时置 true，监听器见此标志跳过本次变化（防回环）。
+static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// UTF-16 字符串转 owned String。
+fn wstr_to_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice).into()
+    }
+}
+
+/// 读当前剪贴板内容（优先级 files > image > text）。读不出返回 Empty。
+pub fn clipboard_read() -> ClipboardContent {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return ClipboardContent::Empty;
+        }
+        let result = read_inner();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+unsafe fn read_inner() -> ClipboardContent {
+    // 文件优先
+    if let Ok(h) = GetClipboardData(CF_HDROP.0 as u32) {
+        if let Some(files) = read_hdrop(h.0 as *mut c_void) {
+            if !files.is_empty() {
+                return ClipboardContent::Files(files);
+            }
+        }
+    }
+    // 图片：优先 CF_PNG（注册格式 "PNG"），否则 CF_DIB
+    let png_fmt = RegisterClipboardFormatW(w!("PNG"));
+    if let Ok(fmt) = png_fmt {
+        if let Ok(h) = GetClipboardData(fmt.0 as u32) {
+            if let Some(png) = read_global_bytes(h.0 as *mut c_void) {
+                return ClipboardContent::Image(png);
+            }
+        }
+    }
+    if let Ok(h) = GetClipboardData(CF_DIB.0 as u32) {
+        if let Some(png) = dib_to_png(h.0 as *mut c_void) {
+            return ClipboardContent::Image(png);
+        }
+    }
+    // 文本
+    if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
+        if let Some(s) = read_global_string(h.0 as *mut c_void) {
+            return ClipboardContent::Text(s);
+        }
+    }
+    ClipboardContent::Empty
+}
+
+/// 读取 CF_HDROP 文件列表。
+unsafe fn read_hdrop(hdrop: *mut c_void) -> Option<Vec<String>> {
+    let h = windows::Win32::UI::Shell::HDROP(hdrop);
+    let count = DragQueryFileW(h, 0xFFFFFFFF, None, 0);
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let mut files = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let len = DragQueryFileW(h, i, None, 0);
+        if len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; (len + 1) as usize];
+        DragQueryFileW(h, i, Some(buf.as_mut_slice()), len + 1);
+        if let Some(nul) = buf.iter().position(|&c| c == 0) {
+            buf.truncate(nul);
+        }
+        files.push(String::from_utf16_lossy(&buf));
+    }
+    Some(files)
+}
+
+/// 读取全局内存为字节 Vec。
+unsafe fn read_global_bytes(h: *mut c_void) -> Option<Vec<u8>> {
+    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
+    let ptr = GlobalLock(hgl).ok()?;
+    let size = windows::Win32::System::Memory::GlobalSize(hgl);
+    let slice = std::slice::from_raw_parts(ptr as *const u8, size);
+    let data = slice.to_vec();
+    let _ = GlobalUnlock(hgl);
+    Some(data)
+}
+
+/// 读取全局内存为 UTF-16 String。
+unsafe fn read_global_string(h: *mut c_void) -> Option<String> {
+    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
+    let ptr = GlobalLock(hgl).ok()?;
+    let size = windows::Win32::System::Memory::GlobalSize(hgl);
+    let u16_len = size / 2;
+    let slice = std::slice::from_raw_parts(ptr as *const u16, u16_len);
+    let end = slice.iter().position(|&c| c == 0).unwrap_or(u16_len);
+    let s = String::from_utf16_lossy(&slice[..end]);
+    let _ = GlobalUnlock(hgl);
+    Some(s)
+}
+
+/// CF_DIB（BITMAPINFOHEADER + 像素）→ PNG 字节。
+unsafe fn dib_to_png(h: *mut c_void) -> Option<Vec<u8>> {
+    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
+    let ptr = GlobalLock(hgl).ok()?;
+    let size = windows::Win32::System::Memory::GlobalSize(hgl);
+    let data = std::slice::from_raw_parts(ptr as *const u8, size);
+    let png = dib_bytes_to_png(data);
+    let _ = GlobalUnlock(hgl);
+    png
+}
+
+/// BITMAPINFOHEADER(40B) + 像素 → PNG。
+/// 支持 24bit(BGR)/32bit(BGRA) bottom-up 与 top-down。
+fn dib_bytes_to_png(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 40 {
+        return None;
+    }
+    let bi_width = i32::from_le_bytes(data[4..8].try_into().ok()?);
+    let bi_height_raw = i32::from_le_bytes(data[8..12].try_into().ok()?);
+    let bi_bit_count = u16::from_le_bytes(data[14..16].try_into().ok()?);
+    let _bi_compression = u32::from_le_bytes(data[16..20].try_into().ok()?);
+
+    let width = bi_width as u32;
+    let top_down = bi_height_raw < 0;
+    let height = bi_height_raw.unsigned_abs();
+
+    let bytes_per_pixel = match bi_bit_count {
+        24 => 3,
+        32 => 4,
+        _ => return None,
+    };
+    let row_size = ((bi_bit_count as usize * width as usize + 31) / 32) * 4; // 4 字节对齐
+    let pixels_offset = 40usize;
+    if data.len() < pixels_offset + row_size * height as usize {
+        return None;
+    }
+
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height as usize {
+        let src_row = if top_down { y } else { height as usize - 1 - y };
+        let dst_row = y;
+        let src_start = pixels_offset + src_row * row_size;
+        for x in 0..width as usize {
+            let s = src_start + x * bytes_per_pixel;
+            let b = data[s];
+            let g = data[s + 1];
+            let r = data[s + 2];
+            let a = if bytes_per_pixel == 4 { data[s + 3] } else { 255 };
+            let d = (dst_row * width as usize + x) * 4;
+            rgba[d] = r;
+            rgba[d + 1] = g;
+            rgba[d + 2] = b;
+            rgba[d + 3] = a;
+        }
+    }
+
+    let mut out = Vec::with_capacity((width * height) as usize * 4);
+    {
+        let mut enc = png::Encoder::new(&mut out, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// 写文本到剪贴板。
+pub fn clipboard_write_text(text: &str) {
+    LOCAL_WRITE.store(true, Ordering::Relaxed);
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            LOCAL_WRITE.store(false, Ordering::Relaxed);
+            return;
+        }
+        let _ = EmptyClipboard();
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = wide.align_to::<u8>().1; // u16 → bytes
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
+            if let Ok(ptr) = GlobalLock(hmem) {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+                let _ = GlobalUnlock(hmem);
+                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// 写 PNG 图片到剪贴板（写入 CF_DIB + CF_PNG，兼容性最好）。
+pub fn clipboard_write_image(png_bytes: &[u8]) {
+    LOCAL_WRITE.store(true, Ordering::Relaxed);
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            LOCAL_WRITE.store(false, Ordering::Relaxed);
+            return;
+        }
+        let _ = EmptyClipboard();
+        // 解码 PNG → RGBA → CF_DIB
+        if let Some(dib) = png_to_dib(png_bytes) {
+            if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, dib.len()) {
+                if let Ok(ptr) = GlobalLock(hmem) {
+                    std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr as *mut u8, dib.len());
+                    let _ = GlobalUnlock(hmem);
+                    let _ = SetClipboardData(CF_DIB.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                }
+            }
+        }
+        // 同时写 CF_PNG（注册格式 "PNG"），方便对端直接取 PNG
+        if let Ok(fmt) = RegisterClipboardFormatW(w!("PNG")) {
+            if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, png_bytes.len()) {
+                if let Ok(ptr) = GlobalLock(hmem) {
+                    std::ptr::copy_nonoverlapping(png_bytes.as_ptr(), ptr as *mut u8, png_bytes.len());
+                    let _ = GlobalUnlock(hmem);
+                    let _ = SetClipboardData(fmt.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                }
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// PNG → CF_DIB（BITMAPINFOHEADER 32bit BGRA bottom-up + 像素）。
+fn png_to_dib(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let width = info.width;
+    let height = info.height;
+
+    let mut dib = Vec::with_capacity(40 + (width * height * 4) as usize);
+    // BITMAPINFOHEADER
+    dib.extend_from_slice(&40u32.to_le_bytes());          // biSize
+    dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
+    dib.extend_from_slice(&(height as i32).to_le_bytes());// biHeight (正=bottom-up)
+    dib.extend_from_slice(&1u16.to_le_bytes());           // biPlanes
+    dib.extend_from_slice(&32u16.to_le_bytes());          // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes());           // biCompression = BI_RGB
+    dib.extend_from_slice(&(width * height * 4).to_le_bytes()); // biSizeImage
+    dib.extend_from_slice(&0u32.to_le_bytes());           // biXPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes());           // biYPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes());           // biClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes());           // biClrImportant
+    // 像素：RGBA → BGRA，bottom-up
+    let row = (width * 4) as usize;
+    for y in (0..height).rev() {
+        for x in 0..width {
+            let s = ((y as usize) * (width as usize) + (x as usize)) * 4;
+            let r = buf[s];
+            let g = buf[s + 1];
+            let b = buf[s + 2];
+            let a = buf[s + 3];
+            dib.push(b);
+            dib.push(g);
+            dib.push(r);
+            dib.push(a);
+        }
+        let _ = row; // 抑制未用警告
+    }
+    Some(dib)
+}
+
+/// 写文件路径列表到剪贴板（CF_HDROP）。
+pub fn clipboard_write_files(paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    // 构造 DROPFILES + UTF-16 路径列表（每条 \0 分隔，末尾 \0\0）
+    let mut payload: Vec<u16> = Vec::new();
+    for p in paths {
+        payload.extend_from_slice(p.encode_utf16().collect::<Vec<u16>>().as_slice());
+        payload.push(0);
+    }
+    payload.push(0); // 双 0 结尾
+
+    let dropfiles_size = 20usize; // sizeof(DROPFILES) = 20
+    let total = dropfiles_size + payload.len() * 2;
+
+    LOCAL_WRITE.store(true, Ordering::Relaxed);
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            LOCAL_WRITE.store(false, Ordering::Relaxed);
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total) {
+            if let Ok(ptr) = GlobalLock(hmem) {
+                let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total);
+                // DROPFILES: pFiles=20, pt=(0,0), fNC=0, fWide=1
+                buf[0..4].copy_from_slice(&20u32.to_le_bytes());
+                buf[4..8].copy_from_slice(&0i32.to_le_bytes());
+                buf[8..12].copy_from_slice(&0i32.to_le_bytes());
+                buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // fNC=0
+                buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // fWide=1
+                let bytes = payload.align_to::<u8>().1;
+                buf[dropfiles_size..].copy_from_slice(bytes);
+                let _ = GlobalUnlock(hmem);
+                let _ = SetClipboardData(CF_HDROP.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// 鼠标左键是否按下（拖拽跨屏检测用）。
+pub fn is_left_button_down() -> bool {
+    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16) & 0x8000 != 0 }
+}
+
+/// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，
+/// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（本机写入触发的变化跳过防回环）。
+pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static>) -> ClipboardWatcherHandle {
+    use std::sync::OnceLock;
+    static WATCHER_TID: OnceLock<u32> = OnceLock::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+
+    std::thread::spawn(move || {
+        unsafe {
+            let class = w!("RuissClipboardListener");
+            let hinst: HINSTANCE = GetModuleHandleW(None).ok().unwrap().into();
+            let wc = WNDCLASSW {
+                style: WNDCLASS_STYLES(0),
+                lpfnWndProc: Some(clip_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinst,
+                hIcon: HICON::default(),
+                hCursor: HCURSOR::default(),
+                hbrBackground: HBRUSH::default(),
+                lpszMenuName: PCWSTR::null(),
+                lpszClassName: class,
+            };
+            let _ = RegisterClassW(&wc);
+            // 记录线程 id，stop 时用 PostThreadMessageW 唤醒 GetMessageW
+            let _ = WATCHER_TID.set(GetCurrentThreadId());
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                class,
+                w!("ruiss-clip"),
+                WS_POPUP,
+                0, 0, 0, 0,
+                None, None, hinst, None,
+            );
+            let hwnd = match hwnd {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+            };
+            let _ = AddClipboardFormatListener(hwnd);
+            let _ = ready_tx.send(());
+
+            CLIP_CB.with(|c| *c.borrow_mut() = Some(cb));
+
+            let mut msg = MSG::default();
+            // GetMessageW 收到 WM_QUIT 返回 false → 退出循环
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = DestroyWindow(hwnd);
+            let _ = UnregisterClassW(class, hinst);
+        }
+    });
+
+    let _ = ready_rx.recv();
+    ClipboardWatcherHandle {
+        stop: Some(Box::new(move || {
+            if let Some(&tid) = WATCHER_TID.get() {
+                unsafe {
+                    let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
+            }
+        })),
+    }
+}
+
+thread_local! {
+    static CLIP_CB: RefCell<Option<Box<dyn Fn(ClipboardContent) + Send>>> = const { RefCell::new(None) };
+}
+
+/// 监听窗口过程：WM_CLIPBOARDUPDATE 触发读剪贴板 + 回调。
+unsafe extern "system" fn clip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CLIPBOARDUPDATE {
+        // 本机写入触发的变化跳过（防回环）
+        if LOCAL_WRITE
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return LRESULT(0);
+        }
+        let content = clipboard_read();
+        if !content.is_empty() {
+            CLIP_CB.with(|c| {
+                if let Some(cb) = c.borrow().as_ref() {
+                    cb(content);
+                }
+            });
+        }
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
