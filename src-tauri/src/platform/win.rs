@@ -696,6 +696,13 @@ pub fn warp_cursor(x: i32, y: i32) {
     }
 }
 
+/// 跨屏触发时的光标回绕（Action::Warp 专用）。Windows 与 warp_cursor 等价：
+/// 光标是 SetSystemCursor 替换的透明图标，无 Dock/菜单栏热区重显问题，
+/// 本机移动也不吞（不冻结），无需虚拟位置种子。仅为平台接口对称保留。
+pub fn warp_cursor_cross(x: i32, y: i32) {
+    warp_cursor(x, y);
+}
+
 // ======================== M3：剪贴板 + 拖拽检测 ========================
 
 use crate::platform::{ClipboardContent, ClipboardWatcherHandle};

@@ -342,7 +342,9 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
         }
         Action::Warp { x, y } => {
             log::debug!("光标回绕 → ({x}, {y})");
-            platform::warp_cursor(x, y);
+            // 跨屏专用回绕：Mac 端落点避开 Dock/菜单栏热区并播种 Source 虚拟位置
+            // （详见 mac.rs warp_cursor_cross）；Win 端与 warp_cursor 等价。
+            platform::warp_cursor_cross(x, y);
         }
         Action::Forward(payload) => match payload {
             Payload::MouseMove { x, y, .. } => {

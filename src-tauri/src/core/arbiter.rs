@@ -286,8 +286,12 @@ impl Arbiter {
             _ => x,
         };
         vec![
-            Action::TakeControl { x: peer_x, y: peer_y, src_w: w as u32, src_h: h as u32 },
+            // 顺序重要：先 Warp 后 TakeControl。Mac 端 Source 跨屏时 tap 要吞本机
+            // MouseMoved 并用 warp 落点做虚拟位置种子（mac.rs SOURCE_VIRTUAL_POS），
+            // warp 必须先于 TakeControl 的 blocked=true 执行，否则首个被吞的移动以
+            // 跨屏前位置为种子 → 对端光标镜像错位。Win 端无此依赖，顺序无影响。
             Action::Warp { x: warp_x, y },
+            Action::TakeControl { x: peer_x, y: peer_y, src_w: w as u32, src_h: h as u32 },
         ]
     }
 }
@@ -319,8 +323,8 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Action::TakeControl { x: ENTRY_X, y: 100, src_w: W as u32, src_h: H as u32 },
                 Action::Warp { x: 1, y: 100 },
+                Action::TakeControl { x: ENTRY_X, y: 100, src_w: W as u32, src_h: H as u32 },
             ]
         );
         assert!(a.linked);
@@ -441,8 +445,8 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                Action::TakeControl { x: W - 1, y: 100, src_w: W as u32, src_h: H as u32 },
                 Action::Warp { x: W - 2, y: 100 },
+                Action::TakeControl { x: W - 1, y: 100, src_w: W as u32, src_h: H as u32 },
             ]
         );
     }
