@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -105,9 +105,6 @@ pub fn accessibility_trusted() -> bool {
 /// 捕获线程 runloop 指针（stop 时通知退出）。
 static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 
-/// 本进程 pid（tap 防回环判断用；OnceLock 避免每事件调 getpid）。
-static OWN_PID: OnceLock<i64> = OnceLock::new();
-
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
@@ -119,38 +116,13 @@ static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 仅作状态标记（tap 回调判断/日志用）；实际隐藏由 CURSOR_HIDDEN 幂等驱动。
 static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
 
-/// Dock 热区高度（屏幕底部，逻辑像素）：隐藏光标不能停在里面——macOS 在
-/// Dock/菜单栏等系统 UI 区域不约束 CGDisplayHideCursor（光标会被强制重显），
-/// 且 Dock 悬停放大动画只看光标位置、不检查可见性，进热区必触发。
-const DOCK_HOT_ZONE: i32 = 20;
-/// 菜单栏高度（屏幕顶部，逻辑像素）：同上，隐藏光标不能停在里面。
-const MENUBAR_HOT_ZONE: i32 = 25;
-
-/// Source 跨屏（出本机）期间：本机鼠标移动的虚拟位置（由相对位移 delta 累积）。
-/// 跨屏时本机 MouseMoved/Dragged 被吞掉（光标冻结在安全位，不滑向 Dock/菜单栏
-/// 热区），转发用这个虚拟位置维持"1:1 镜像"——吞事件后系统光标不再推进，
-/// 触控板相对位移的 location 会停在冻结位，必须用 delta 累积补上转发坐标。
-/// 种子 = 跨屏 warp 落点的原始坐标（对端入口同 y，镜像不断）。
-static SOURCE_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-
 /// 光标是否已实际隐藏（幂等标志，防 CGDisplayHideCursor/ShowCursor 重复调用失衡）。
 /// hide_cursor 在 false→true 时调一次 CGDisplayHideCursor；show_cursor 在 true→false
 /// 时调一次 CGDisplayShowCursor，严格配对一次，绝不叠加（CG 系列内部也有计数语义）。
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
-    let was = BLOCK_LOCAL_INPUT.swap(blocked, Ordering::Relaxed);
-    if !blocked && was {
-        // 跨屏结束（Source 返回本机）：把冻结在安全位的光标送回最后转发的
-        // 虚拟位置（= 用户手所在处），否则释放后光标从屏幕边缘重新出现。
-        let restore = match SOURCE_VIRTUAL_POS.lock() {
-            Ok(g) => *g,
-            Err(p) => p.into_inner(),
-        };
-        if let Some((x, y)) = restore {
-            warp_cursor(x as i32, y as i32);
-        }
-    }
+    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
 }
 
 /// 被控端（Sink）：本机鼠标的虚拟位置（由相对位移 delta 累积）。
@@ -299,19 +271,11 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event| {
-            // 防回环：仅【本进程自己注入】的事件才直通放行（不转发、不吞）。
-            // 关键修正：原判断 `pid != 0` 会把【所有软件合成事件】都放行——macOS
-            // 触控板惯性滚动（momentum 段）由 WindowServer 合成、其 source pid 非 0
-            // → 也走直通 → 跨屏期间 mac 本地照滚（mac→win 双滚根因，见 2026-08-08
-            // 记忆）。改成 `pid == 本进程 pid`：只有 ruiss 经 CGEventPost 注入的事件
-            // （warp_cursor / 对端转发来的注入）才放行；WindowServer 惯性滚动、第三方
-            // 软件合成事件都落回正常路径——跨屏时被吞掉且转发对端（惯性滚动转发后
-            // 对端继续惯性滚完，符合直觉）。
-            let own_pid = *OWN_PID.get_or_init(|| std::process::id() as i64);
+            // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
-            if pid == own_pid {
-                // 本进程注入的事件（如 warp_cursor）：放行，不转发、不吞（防回环）。
-                // CGDisplayHideCursor 系统级、鼠标移动不重显，注入移动不会把光标拉回显示。
+            if pid != 0 {
+                // 本进程注入的事件（如 warp_cursor）。CGDisplayHideCursor 系统级、
+                // 鼠标移动不重显，注入移动不会再把光标拉回显示，无需补藏。
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -350,52 +314,6 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     src_h: h as u32,
                 });
                 // 吞掉真实事件：光标不跟随本机鼠标（防双鼠标）
-                return None;
-            }
-            // Source 跨屏（出本机）：本机 MouseMoved/Dragged 吞掉——光标冻结在
-            // 跨屏安全位（warp_cursor_cross 的落点），不跟物理鼠标滑向 Dock/菜单栏
-            // 热区（否则 win 光标到任务栏时 mac 隐藏光标也到 Dock 热区 → macOS 强制
-            // 重显光标 + Dock 悬停动画只看位置必触发）。转发用虚拟位置（delta 累积，
-            // 见 SOURCE_VIRTUAL_POS：吞事件后 location 停在冻结位，不累积会转发不动）。
-            if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
-                && matches!(
-                    event_type,
-                    CGEventType::MouseMoved
-                        | CGEventType::LeftMouseDragged
-                        | CGEventType::RightMouseDragged
-                        | CGEventType::OtherMouseDragged
-                )
-            {
-                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                let (vx, vy) = {
-                    let mut g = match SOURCE_VIRTUAL_POS.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    match *g {
-                        Some((x, y)) => {
-                            let nx = x + dx;
-                            let ny = y + dy;
-                            *g = Some((nx, ny));
-                            (nx, ny)
-                        }
-                        None => {
-                            // 兜底：正常路径先有跨屏 warp 播种（warp 先于 blocked=true 执行），
-                            // 这里几乎不会走到；用事件位置兜底保证转发不断。
-                            let loc = event.location();
-                            *g = Some((loc.x, loc.y));
-                            (loc.x, loc.y)
-                        }
-                    }
-                };
-                let (w, h) = screen_size();
-                let _ = tx.send(Payload::MouseMove {
-                    x: vx as i32,
-                    y: vy as i32,
-                    src_w: w as u32,
-                    src_h: h as u32,
-                });
                 return None;
             }
             if let Some(p) = event_to_payload(event_type, event) {
@@ -695,26 +613,6 @@ pub fn warp_cursor(x: i32, y: i32) {
             ev.post(CGEventTapLocation::HID);
         }
     }
-}
-
-/// 跨屏触发时的光标回绕（Action::Warp 专用）：与 warp_cursor 相同，但落点
-/// y 避开屏幕底部 Dock / 顶部菜单栏热区——隐藏光标停进热区会被 macOS 强制重显
-/// 并触发悬停动画；同时把【原始坐标】（对端入口同 y，镜像不断）播种为 Source
-/// 虚拟位置种子（tap 吞掉本机移动后靠它累积转发）。
-/// 注意：必须先于 TakeControl（blocked=true）执行——execute_action 按 Action
-/// 顺序执行，仲裁器把 Warp 排在 TakeControl 前（见 arbiter.check_dwell）。
-/// 返回路径（ReleaseControl / Sink 侧）用普通 warp_cursor，不做热区限制。
-pub fn warp_cursor_cross(x: i32, y: i32) {
-    if let Ok(mut g) = SOURCE_VIRTUAL_POS.lock() {
-        *g = Some((x as f64, y as f64));
-    }
-    let (_, h) = screen_size();
-    let ty = if h > MENUBAR_HOT_ZONE + DOCK_HOT_ZONE + 1 {
-        y.clamp(MENUBAR_HOT_ZONE, h - 1 - DOCK_HOT_ZONE)
-    } else {
-        y
-    };
-    warp_cursor(x, ty);
 }
 
 // ---- Mac CGKeyCode ↔ 抽象键码（keys::Key）映射（标准 ANSI 键位）----

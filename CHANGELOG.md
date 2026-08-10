@@ -1,35 +1,5 @@
 # CHANGELOG
 
-## 2026-08-10 — 修复 Mac 跨屏两个老问题：触控板双滚 + Dock 隔空触发（重做 4e4ffc5，规避其副作用）
-
-背景：用户反馈两个问题仍在（4e4ffc5 当时修复后"实测有问题"被回退，但未记录具体问题）：
-1. Mac 跨屏到 Win 后，滑 Mac 触控板 → Win 滚 + Mac 自己也在滚（双滚）；
-2. Win 光标到任务栏位置时，Mac 隐藏光标在 Dock 热区被强制重显 + 应用 hover 动画触发。
-
-- **问题 1 根因（双滚）**：mac.rs tap 回调防回环早退 `pid != 0` 放行一切软件合成事件——
-  macOS 触控板惯性滚动（momentum 段）由 WindowServer 合成、pid 非 0 → 跨屏期间绕过
-  吞输入逻辑 → Mac 本地照滚。改为 `pid == 本进程 pid`（OWN_PID OnceLock），只豁免
-  自有注入（warp/对端注入），惯性滚动落回正常"吞+转发"（转发后对端惯性滚完，符合直觉）。
-- **问题 2 根因（Dock 隔空触发）**：Source 跨屏期间本机 MouseMoved 只转发不吞 →
-  隐藏光标与物理鼠标 1:1 滑动 → 进底部 Dock/顶部菜单栏热区 → macOS 不约束
-  CGDisplayHideCursor（强制重显）+ 悬停动画只看位置必触发。修复：
-  - Source 跨屏（BLOCK_LOCAL_INPUT）期间吞掉本机 MouseMoved/Dragged（光标冻结在
-    安全位，转发先行）——应用收不到事件 → 本地零 hover；
-  - 新增 warp_cursor_cross：跨屏回绕落点 y 避开热区（DOCK_HOT_ZONE=20 /
-    MENUBAR_HOT_ZONE=25），并播种 SOURCE_VIRTUAL_POS 虚拟位置；
-  - 吞事件后 location 停在冻结位，转发坐标用 delta 累积的虚拟位置（SOURCE_VIRTUAL_POS，
-    与 Sink 侧 LOCAL_VIRTUAL_POS 同款机制）维持 1:1 镜像；
-  - 释放（blocked true→false）时把冻结光标送回最后虚拟位置（= 用户手所在处），
-    否则光标从屏幕边缘重新出现。
-- **仲裁器改动**：check_dwell 动作顺序 [TakeControl, Warp] → [Warp, TakeControl]——
-  warp 必须先于 blocked=true 执行（虚拟位置种子确定），两个测试断言同步更新。
-- **与 4e4ffc5 的区别（本次规避了它的副作用）**：① 回绕仍到对侧边缘（x=1/w-2），
-  不改屏幕中心——中心 warp 会切断绝对坐标镜像（对端光标首次移动跳屏中央），大概率是
-  4e4ffc5 实测"好像改了东西"的原因；② 补了释放时光标恢复（4e4ffc5 缺失，释放后
-  光标会从冻结位重新出现）；③ 虚拟位置转发使冻结不破坏对端移动。
-- 验证：Windows `cargo check` 通过（mac.rs 不参与 Windows 编译，需 Mac 端编译实测）；
-  cargo test 本机已知 0xc0000139 不可用，仲裁器测试已人工核对断言。
-
 ## 2026-08-10 — 修复 M3 剪贴板/文件功能 Windows 编译错误（15 处）+ 清理 warning
 
 - 背景：M3 跨屏剪贴板（文字/图片/文件）+ 文件传输 + 跨屏拖拽功能代码未提交且 Windows 侧编译失败（15 个 error，全部在 win.rs 新增剪贴板实现段）。
