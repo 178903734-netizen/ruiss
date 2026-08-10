@@ -1,20 +1,5 @@
 # CHANGELOG
 
-## 2026-08-10 — 修复 Mac 被控（Sink）时 Dock 不弹出
-
-- 现象：Win 跨屏到 Mac（Mac 是被控端）后，鼠标移到 Mac 屏幕底部 Dock 位置，Dock 不弹出。
-- 根因：macOS 的 Dock 自动显示（reveal）只响应光标位置变化，对合成 MouseMoved 事件
-  （CGEventPost 注入）不响应——跨屏后 Mac 端鼠标移动全是 Windows 注入的合成事件，
-  所以光标到位了 Dock 却不弹。与历史 4e4ffc5（Mac 作 Source 出屏 warp 误触 Dock）是
-  两个方向不同的问题：那是不该弹时弹了，这是该弹时没弹。
-- 修复（src-tauri/src/platform/mac.rs，仅 Sink 注入路径）：
-  - 新增 DOCK_HOT_ZONE=20（屏幕底部逻辑像素热区）+ DOCK_TRIGGERED 标志（防每帧重复 warp）。
-  - inject() 的 MouseMove 分支：Sink 且注入光标 y 进入底部热区时，用
-    CGWarpMouseCursorPosition 直接移动光标位置（WindowServer 位置检测会响应 → Dock 弹出），
-    离开热区重置标志。Source 出屏路径完全不动，不重蹈 4e4ffc5 误触问题。
-- 验证：Windows cargo check 通过（mac.rs 为 cfg gate 不参与 Windows 编译）；
-  mac.rs 需 Mac 端编译实测（Dock 自动隐藏 + Win→Mac 跨屏移到底部）。
-
 ## 2026-08-10 — 修复 M3 剪贴板/文件功能 Windows 编译错误（15 处）+ 清理 warning
 
 - 背景：M3 跨屏剪贴板（文字/图片/文件）+ 文件传输 + 跨屏拖拽功能代码未提交且 Windows 侧编译失败（15 个 error，全部在 win.rs 新增剪贴板实现段）。
