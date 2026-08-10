@@ -674,13 +674,11 @@ pub fn key_to_cg(key: Key) -> u16 {
 // 首次 Mac 编译若有 API 签名差异，把错误信息发回迭代。
 
 use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
-use objc::runtime::{Class, Object, NSInteger, NO, YES};
-use objc::{class, msg_send, sel, sel_impl};
-use std::ffi::c_void;
-use std::sync::atomic::AtomicBool;
+use objc::runtime::{Class, Object, NO, YES};
+use objc::{class, msg_send};
 
-use core_foundation::base::{CFTypeRef, TCFType};
-use core_foundation::string::{CFString, CFStringRef};
+use core_foundation::base::CFTypeRef;
+use core_foundation::string::CFStringRef;
 
 /// 本机写入标志：本机主动写剪贴板时置 true，监听器跳过本次变化（防回环）。
 static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
@@ -905,14 +903,14 @@ pub fn clipboard_write_files(paths: &[String]) {
             arrayWithObjects: urls.as_ptr()
             count: n
         ];
-        let _: BOOL = msg_send![pb, writeObjects: arr];
+        let _: bool = msg_send![pb, writeObjects: arr];
     }
 }
 
 /// 鼠标左键是否按下（拖拽跨屏检测用）。NSEvent pressedMouseButtons 位掩码 bit0=左键。
 pub fn is_left_button_down() -> bool {
     unsafe {
-        let pressed: NSInteger = msg_send![class!(NSEvent), pressedMouseButtons];
+        let pressed: isize = msg_send![class!(NSEvent), pressedMouseButtons];
         (pressed & 1) != 0
     }
 }
@@ -926,10 +924,10 @@ pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static
     let stop_clone = stop.clone();
     std::thread::spawn(move || unsafe {
         let pb = general_pasteboard();
-        let mut last: NSInteger = msg_send![pb, changeCount];
+        let mut last: isize = msg_send![pb, changeCount];
         while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(800));
-            let cur: NSInteger = msg_send![pb, changeCount];
+            let cur: isize = msg_send![pb, changeCount];
             if cur == last {
                 continue;
             }
