@@ -31,6 +31,15 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use objc::{sel, sel_impl};
 
+/// CGWarpMouseCursorPosition：直接移动系统光标位置（不产生应用可见的鼠标事件）。
+/// macOS 的 Dock 自动弹出（reveal）只对光标位置变化响应，合成 MouseMoved 事件不触发；
+/// warp 改变的是位置本身，WindowServer 位置检测立即生效 → Dock 正常弹出。
+/// 声明方式与 CGDisplayHideCursor 一致（core-graphics crate 未导出此自由函数）。
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+}
+
 use crate::core::keys::{map_key, Key};
 use crate::core::protocol::Payload;
 
@@ -111,6 +120,14 @@ static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 /// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMoved——光标只跟对端注入走，
 /// 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
 static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Sink 时注入光标进入底部 Dock 热区已触发过一次 warp（防止每帧重复 warp 抖动）。
+static DOCK_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+/// Dock 自动隐藏的 reveal 热区：屏幕底部边缘此距离内（逻辑像素）。
+/// macOS 的 Dock 弹出只响应光标位置变化，合成 MouseMoved 事件不触发；
+/// 进入热区时用 CGWarpMouseCursorPosition 直接移动光标位置 → Dock 正常弹出。
+const DOCK_HOT_ZONE: i32 = 20;
 
 /// 跨屏期间是否应保持光标隐藏（Source 跨屏时 true）。
 /// 仅作状态标记（tap 回调判断/日志用）；实际隐藏由 CURSOR_HIDDEN 幂等驱动。
@@ -494,6 +511,24 @@ impl InputInjector {
         };
         let cg = match &event {
             Payload::MouseMove { x, y, .. } => {
+                // Dock 弹出修复（Sink 被控方向）：注入光标进入屏幕底部 Dock 热区时，
+                // 合成 MouseMoved 事件不触发 macOS Dock reveal（系统限制，Dock 弹出只
+                // 响应光标位置变化）→ 改用 CGWarpMouseCursorPosition 直接移动光标位置，
+                // WindowServer 位置检测响应 → Dock 正常弹出。离开热区后重置标志，
+                // 防止每帧重复 warp 抖动。仅在 Sink 时生效，Source 出屏路径不受影响
+                // （不重蹈 4e4ffc5 "跨屏路径 warp 误触 Dock" 的历史问题）。
+                if SINK_ACTIVE.load(Ordering::Relaxed) {
+                    let (_, sh) = screen_size();
+                    let in_zone = *y >= sh - DOCK_HOT_ZONE;
+                    if in_zone && !DOCK_TRIGGERED.load(Ordering::Relaxed) {
+                        DOCK_TRIGGERED.store(true, Ordering::Relaxed);
+                        unsafe {
+                            CGWarpMouseCursorPosition(CGPoint::new(*x as f64, *y as f64));
+                        }
+                    } else if !in_zone && DOCK_TRIGGERED.load(Ordering::Relaxed) {
+                        DOCK_TRIGGERED.store(false, Ordering::Relaxed);
+                    }
+                }
                 // 按住左键拖动期间必须注入 LeftMouseDragged（MouseMoved 不会更新选区
                 // → 拖选文字失效）；右键/中键同理。未按住时正常 MouseMoved。
                 let held = HELD_BUTTON.load(Ordering::Relaxed);
