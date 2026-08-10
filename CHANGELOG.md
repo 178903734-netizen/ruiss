@@ -1,5 +1,53 @@
 # CHANGELOG
 
+## 2026-08-10 — 修复 M3 剪贴板/文件功能 Windows 编译错误（15 处）+ 清理 warning
+
+- 背景：M3 跨屏剪贴板（文字/图片/文件）+ 文件传输 + 跨屏拖拽功能代码未提交且 Windows 侧编译失败（15 个 error，全部在 win.rs 新增剪贴板实现段）。
+- 根因（windows crate 0.58 API 签名误用）：
+  - GlobalLock 返回裸指针 `*mut c_void`（不是 Result）→ `.ok()?` 和 `if let Ok(ptr)` 全部编译失败，
+    改为判空：`let ptr = GlobalLock(h); if ptr.is_null() { return None; }`（read_global_bytes /
+    read_global_string / dib_to_png / 三处 clipboard_write_* 共 7 处）。
+  - DragQueryFileW 只收 3 参数（windows crate 用 `Option<&mut [u16]>` 自带长度，不再传 cch）
+    → 删掉第 4 参（read_hdrop 三处）。
+  - RegisterClipboardFormatW 返回 u32（不是 Result）→ `if let Ok(fmt)` 改为 `if fmt != 0`
+    （read_inner / clipboard_write_image 两处）。
+  - HGLOBAL 在 Win32::Foundation 模块而非 System::Memory → 修正路径 + 顶部 import 补 HGLOBAL。
+- 清理新增 warning：lib.rs 未使用的 Emitter import、win.rs 未使用的 wstr_to_string 函数。
+- 验证：`CARGO_TARGET_DIR=D:/ruiss-target cargo check` 通过（EXIT_CODE=0，5s 增量）。
+- 备注：期间曾遇 os error 32（文件被占用）——是 ruiss.exe 应用运行中锁住了 build 产物，
+  关掉应用后编译正常；与代码无关。
+
+## 2026-08-10 — M3：跨屏剪贴板（文字/图片/文件）+ 文件传输 + 跨屏拖拽
+
+- 目标：在已完成的 M0/M1/M2（键鼠跨屏）之上，解锁"跨屏复制粘贴文字/图片/文件"
+  和"跨屏拖拽图片/文件"。原 PROJECT.md「明确不做：文件拖拽」本次解锁。
+- 协议（core/protocol.rs）：保留并启用 ClipboardText / ClipboardImage；新增
+  ClipboardFiles（路径列表）、文件分块流 FileStart/FileChunk/FileEnd/FileCancel（256KB/块）、
+  DragOffer（拖拽跨屏通告）。网络单帧上限 1MB→16MB（net/tcp.rs MAX_FRAME）。
+- 平台剪贴板层（platform/win.rs + mac.rs）：
+  - 读：clipboard_read() 按 files>image>text 优先级返回（Win: CF_HDROP / CF_PNG+CF_DIB→PNG /
+    CF_UNICODETEXT；Mac: NSPasteboard NSFilenames/PNG/TIFF→PNG/NSString）。
+  - 写：clipboard_write_text / write_image / write_files（Win: CF_UNICODETEXT /
+    CF_DIB+CF_PNG / CF_HDROP；Mac: NSPasteboard 对应类型）。
+  - 监听：start_clipboard_watcher（Win 用 AddClipboardFormatListener + 隐藏窗口；
+    Mac 用 NSPasteboard changeCount 轮询）。LOCAL_WRITE 标志防回环（本机写入触发的变化跳过）。
+- 剪贴板同步（clipboard/mod.rs）：本机变化→发对端；对端 Clipboard* 消息→写本机剪贴板。
+- 文件传输（file_transfer/mod.rs）：FileSender 分块发送（uuid 标识，下载目录 dirs::download_dir，
+  重名自动加 (1)(2)）；FileReceiver 状态机写盘，完成后路径写入本机剪贴板 + emit
+  "file-received" 通知前端。
+- 跨屏拖拽（lib.rs execute_action）：TakeControl 时若左键按下，读本机剪贴板（文件/图片/文字）
+  带过去；对端收到 DragOffer 后文字/图片在光标处注入粘贴（Mac: Cmd+V / Win: Ctrl+V），
+  文件传完路径已入剪贴板供手动粘贴。
+- 集成（lib.rs）：apply_link_config 按 clipboard_enabled 启动 ClipboardSync；注册
+  send_file / pick_and_send_file 命令（tauri-plugin-dialog）；run_incoming_router 分发
+  剪贴板/文件/拖拽消息。前端 gui：加"跨屏文件传输"区（选文件发送 + 传输记录）。
+- 依赖：arboard(已有) + png / dirs / uuid / tauri-plugin-dialog。
+- 验证：Windows cargo check 通过（需在 C: 盘 target 编，D: 盘 .cargo-build-lock 有
+  safe-delete 拦截导致的拒绝访问，无法复用）。Mac 端 mac.rs 新增剪贴板/拖拽代码为首次
+  编写，需 Mac 端编译实测（NSPasteboard API 签名若有误，按报错迭代）。
+- 已知待 Mac 验证：clipboard_read/write 的 NSPasteboard 调用、拖拽检测用 NSEvent
+  修饰键判定；Win 端可编译但双机行为需实机联测。
+
 ## 2026-08-08(5) — 回退 4e4ffc5（mac 跨屏双滚 + Dock 隔空触发），对齐 2b01364
 
 - 原因：4e4ffc5 在 Mac 端实测有问题（用户反馈"好像改了东西"），回退到

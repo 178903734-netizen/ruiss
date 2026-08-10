@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
 use crate::core::keys::Key;

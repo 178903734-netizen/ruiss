@@ -19,7 +19,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, HGLOBAL};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -703,21 +703,6 @@ use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
 /// 本机写入标志：本机主动写剪贴板时置 true，监听器见此标志跳过本次变化（防回环）。
 static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
 
-/// UTF-16 字符串转 owned String。
-fn wstr_to_string(ptr: *const u16) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    unsafe {
-        let mut len = 0usize;
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
-        let slice = std::slice::from_raw_parts(ptr, len);
-        String::from_utf16_lossy(slice).into()
-    }
-}
-
 /// 读当前剪贴板内容（优先级 files > image > text）。读不出返回 Empty。
 pub fn clipboard_read() -> ClipboardContent {
     unsafe {
@@ -741,8 +726,8 @@ unsafe fn read_inner() -> ClipboardContent {
     }
     // 图片：优先 CF_PNG（注册格式 "PNG"），否则 CF_DIB
     let png_fmt = RegisterClipboardFormatW(w!("PNG"));
-    if let Ok(fmt) = png_fmt {
-        if let Ok(h) = GetClipboardData(fmt.0 as u32) {
+    if png_fmt != 0 {
+        if let Ok(h) = GetClipboardData(png_fmt) {
             if let Some(png) = read_global_bytes(h.0 as *mut c_void) {
                 return ClipboardContent::Image(png);
             }
@@ -765,18 +750,18 @@ unsafe fn read_inner() -> ClipboardContent {
 /// 读取 CF_HDROP 文件列表。
 unsafe fn read_hdrop(hdrop: *mut c_void) -> Option<Vec<String>> {
     let h = windows::Win32::UI::Shell::HDROP(hdrop);
-    let count = DragQueryFileW(h, 0xFFFFFFFF, None, 0);
+    let count = DragQueryFileW(h, 0xFFFFFFFF, None);
     if count == 0 {
         return Some(Vec::new());
     }
     let mut files = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let len = DragQueryFileW(h, i, None, 0);
+        let len = DragQueryFileW(h, i, None);
         if len == 0 {
             continue;
         }
         let mut buf = vec![0u16; (len + 1) as usize];
-        DragQueryFileW(h, i, Some(buf.as_mut_slice()), len + 1);
+        DragQueryFileW(h, i, Some(buf.as_mut_slice()));
         if let Some(nul) = buf.iter().position(|&c| c == 0) {
             buf.truncate(nul);
         }
@@ -787,8 +772,11 @@ unsafe fn read_hdrop(hdrop: *mut c_void) -> Option<Vec<String>> {
 
 /// 读取全局内存为字节 Vec。
 unsafe fn read_global_bytes(h: *mut c_void) -> Option<Vec<u8>> {
-    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
-    let ptr = GlobalLock(hgl).ok()?;
+    let hgl = HGLOBAL(h);
+    let ptr = GlobalLock(hgl);
+    if ptr.is_null() {
+        return None;
+    }
     let size = windows::Win32::System::Memory::GlobalSize(hgl);
     let slice = std::slice::from_raw_parts(ptr as *const u8, size);
     let data = slice.to_vec();
@@ -798,8 +786,11 @@ unsafe fn read_global_bytes(h: *mut c_void) -> Option<Vec<u8>> {
 
 /// 读取全局内存为 UTF-16 String。
 unsafe fn read_global_string(h: *mut c_void) -> Option<String> {
-    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
-    let ptr = GlobalLock(hgl).ok()?;
+    let hgl = HGLOBAL(h);
+    let ptr = GlobalLock(hgl);
+    if ptr.is_null() {
+        return None;
+    }
     let size = windows::Win32::System::Memory::GlobalSize(hgl);
     let u16_len = size / 2;
     let slice = std::slice::from_raw_parts(ptr as *const u16, u16_len);
@@ -811,8 +802,11 @@ unsafe fn read_global_string(h: *mut c_void) -> Option<String> {
 
 /// CF_DIB（BITMAPINFOHEADER + 像素）→ PNG 字节。
 unsafe fn dib_to_png(h: *mut c_void) -> Option<Vec<u8>> {
-    let hgl = windows::Win32::System::Memory::HGLOBAL(h);
-    let ptr = GlobalLock(hgl).ok()?;
+    let hgl = HGLOBAL(h);
+    let ptr = GlobalLock(hgl);
+    if ptr.is_null() {
+        return None;
+    }
     let size = windows::Win32::System::Memory::GlobalSize(hgl);
     let data = std::slice::from_raw_parts(ptr as *const u8, size);
     let png = dib_bytes_to_png(data);
@@ -889,7 +883,8 @@ pub fn clipboard_write_text(text: &str) {
         wide.push(0);
         let bytes = wide.align_to::<u8>().1; // u16 → bytes
         if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
-            if let Ok(ptr) = GlobalLock(hmem) {
+            let ptr = GlobalLock(hmem);
+            if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
                 let _ = GlobalUnlock(hmem);
                 let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
@@ -911,7 +906,8 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
         // 解码 PNG → RGBA → CF_DIB
         if let Some(dib) = png_to_dib(png_bytes) {
             if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, dib.len()) {
-                if let Ok(ptr) = GlobalLock(hmem) {
+                let ptr = GlobalLock(hmem);
+                if !ptr.is_null() {
                     std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr as *mut u8, dib.len());
                     let _ = GlobalUnlock(hmem);
                     let _ = SetClipboardData(CF_DIB.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
@@ -919,12 +915,14 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             }
         }
         // 同时写 CF_PNG（注册格式 "PNG"），方便对端直接取 PNG
-        if let Ok(fmt) = RegisterClipboardFormatW(w!("PNG")) {
+        let png_fmt = RegisterClipboardFormatW(w!("PNG"));
+        if png_fmt != 0 {
             if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, png_bytes.len()) {
-                if let Ok(ptr) = GlobalLock(hmem) {
+                let ptr = GlobalLock(hmem);
+                if !ptr.is_null() {
                     std::ptr::copy_nonoverlapping(png_bytes.as_ptr(), ptr as *mut u8, png_bytes.len());
                     let _ = GlobalUnlock(hmem);
-                    let _ = SetClipboardData(fmt.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                    let _ = SetClipboardData(png_fmt, windows::Win32::Foundation::HANDLE(hmem.0));
                 }
             }
         }
@@ -998,7 +996,8 @@ pub fn clipboard_write_files(paths: &[String]) {
         }
         let _ = EmptyClipboard();
         if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total) {
-            if let Ok(ptr) = GlobalLock(hmem) {
+            let ptr = GlobalLock(hmem);
+            if !ptr.is_null() {
                 let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total);
                 // DROPFILES: pFiles=20, pt=(0,0), fNC=0, fWide=1
                 buf[0..4].copy_from_slice(&20u32.to_le_bytes());
