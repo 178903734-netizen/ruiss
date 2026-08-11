@@ -474,30 +474,7 @@ async fn run_incoming_router(
                         }
                         p => p.clone(),
                     };
-                    let is_move = matches!(
-                        &mapped,
-                        Payload::MouseMove { .. } | Payload::MouseMoveRelative { .. }
-                    );
                     injector.inject(mapped);
-                    if is_move {
-                        let return_actions = {
-                            let pos = platform::last_injected_pos();
-                            let (w, h) = platform::screen_size();
-                            let mut r = match router.lock() {
-                                Ok(g) => g,
-                                Err(e) => e.into_inner(),
-                            };
-                            match (r.arbiter.as_mut(), pos) {
-                                (Some(a), Some((x, y))) => {
-                                    a.on_sink_cursor_event(x, y, w, h, Instant::now())
-                                }
-                                _ => Vec::new(),
-                            }
-                        };
-                        for action in return_actions {
-                            execute_action(&router, action);
-                        }
-                    }
                 } else {
                     log::debug!("忽略对端事件（本机 Source）: {:?}", msg.payload);
                 }

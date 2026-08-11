@@ -33,11 +33,18 @@ pub fn hit_edge(x: i32, y: i32, virtual_w: i32, virtual_h: i32, edge_margin: i32
 /// 从"对端屏幕边"进入时，对端注入的落点坐标。
 /// 例：本机从右边缘滑出 → 对端从 (0, y) 进入。
 pub fn enter_position(edge: Edge, cursor_y: i32, cursor_x: i32, virtual_w: i32, virtual_h: i32) -> (i32, i32) {
+    // macOS 的箭头热点位于左上角；落在最外侧像素时大部分图形会在屏幕外，
+    // 看起来像在边缘闪烁。入口放到屏内几像素，同时仍保留贴边的跨屏手感。
+    const ENTRY_INSET: i32 = 4;
+    let left = ENTRY_INSET.min((virtual_w - 1).max(0));
+    let right = (virtual_w - 1 - ENTRY_INSET).max(0);
+    let top = ENTRY_INSET.min((virtual_h - 1).max(0));
+    let bottom = (virtual_h - 1 - ENTRY_INSET).max(0);
     match edge {
-        Edge::Left => (virtual_w - 1, cursor_y),
-        Edge::Right => (0, cursor_y),
-        Edge::Top => (cursor_x, virtual_h - 1),
-        Edge::Bottom => (cursor_x, 0),
+        Edge::Left => (right, cursor_y),
+        Edge::Right => (left, cursor_y),
+        Edge::Top => (cursor_x, bottom),
+        Edge::Bottom => (cursor_x, top),
         Edge::None => (cursor_x, cursor_y),
     }
 }
@@ -66,7 +73,7 @@ mod tests {
 
     #[test]
     fn enter_from_right() {
-        assert_eq!(enter_position(Edge::Right, 300, 0, 1280, 800), (0, 300));
+        assert_eq!(enter_position(Edge::Right, 300, 0, 1280, 800), (4, 300));
     }
 
     #[test]

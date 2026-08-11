@@ -52,12 +52,16 @@ pub enum Action {
 
 /// 边界像素余量（与 geometry::hit_edge 默认一致）
 const EDGE_MARGIN: i32 = 2;
-/// 事件驱动返回只在精确边界附近触发，避免鼠标仅靠近边缘就误返回。
+/// 实际返回只在精确边界附近触发，避免鼠标仅靠近边缘就误返回。
 const RETURN_MARGIN: i32 = 3;
+/// 必须至少进入接收端屏幕 30px，才允许之后的边缘动作被判为返回。
+/// Windows 回绕后的绝对坐标会在入口附近抖动，不能把 3~4px 的变化当成
+/// “已经操作过对端”。
+const RETURN_ARM_MARGIN: i32 = 30;
 /// 位置抖动容差：坐标变化不超过 3px 视为"停住"
 /// （触控板停手后仍有惯性/微移，变化 1~2px 不应重置停留计时）
 const JITTER_TOLERANCE: i32 = 3;
-/// 首次跨出和轮询兜底的短停留时间。主要返回路径由移动事件立即触发。
+/// 首次跨出和返回确认的短停留时间。
 const DWELL: Duration = Duration::from_millis(60);
 /// 防止一次边缘动作产生 Take/Release 往返抖动，同时不再让快速切换卡住 1 秒。
 const TRIGGER_COOLDOWN: Duration = Duration::from_millis(250);
@@ -193,6 +197,8 @@ impl Arbiter {
             return Vec::new();
         };
         let at_entry = geometry::hit_edge(x, y, w, h, RETURN_MARGIN) == self.exit_edge;
+        let in_entry_zone =
+            geometry::hit_edge(x, y, w, h, RETURN_ARM_MARGIN) == self.exit_edge;
 
         // 注入位置变化超过抖动容差 → 移动
         // （触控板停手后仍有惯性/微移，坐标变化 ≤ JITTER_TOLERANCE 视为停住）
@@ -204,8 +210,8 @@ impl Arbiter {
         };
         if moved {
             self.last_injected = Some((x, y));
-            // 只要离开过入口带，之后停回入口边才允许判返回
-            if !at_entry {
+            // 至少进入屏幕 30px 后，之后停回入口边才允许判返回。
+            if !in_entry_zone {
                 self.sink_was_away = true;
             }
             self.sink_dwell = None;
@@ -238,44 +244,6 @@ impl Arbiter {
             self.sink_dwell = None;
         }
         Vec::new()
-    }
-
-    /// Sink 每成功注入一帧远程移动后立即调用。入口点本身不返回；光标先离开过
-    /// 入口边，再重新到达精确边界时，说明用户正在原路推回，立即归还控制权。
-    pub fn on_sink_cursor_event(
-        &mut self,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        now: Instant,
-    ) -> Vec<Action> {
-        if self.mode != Mode::Sink {
-            return Vec::new();
-        }
-        let at_entry = geometry::hit_edge(x, y, w, h, RETURN_MARGIN) == self.exit_edge;
-        self.last_injected = Some((x, y));
-        if !at_entry {
-            self.sink_was_away = true;
-            self.sink_dwell = None;
-            return Vec::new();
-        }
-        if !self.sink_was_away {
-            return Vec::new();
-        }
-        let cooled = self
-            .last_trigger
-            .map_or(true, |t| now.duration_since(t) > TRIGGER_COOLDOWN);
-        if !cooled {
-            return Vec::new();
-        }
-        self.last_trigger = Some(now);
-        self.sink_dwell = None;
-        self.last_injected = None;
-        self.sink_was_away = false;
-        self.mode = Mode::Source;
-        self.linked = false;
-        vec![Action::ReleaseControl]
     }
 
     /// 对端发来 TakeControl：接受，进入 Sink，返回对端给的入口位置（需注入）。
@@ -359,7 +327,7 @@ mod tests {
     const W: i32 = 1280;
     const H: i32 = 800;
     const EDGE_X: i32 = W - 1; // 右边缘（PeerRight 的出口边）
-    const ENTRY_X: i32 = 0; // 对端入口 x（PeerRight → 对端左边缘）
+    const ENTRY_X: i32 = 4; // 对端入口 x（PeerRight → 对端左边缘内侧）
 
     fn t(ms: u64) -> Instant {
         Instant::now() + Duration::from_millis(ms)
@@ -449,22 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn sink_side_event_return_is_immediate_after_leaving_entry_zone() {
+    fn sink_side_boundary_jitter_does_not_arm_return() {
         let mut a = Arbiter::new(Layout::PeerRight);
         a.on_peer_take(W - 1, 100);
-
-        // The initial entry-edge position must not return control.
-        assert!(a
-            .on_sink_cursor_event(W - 1, 100, W, H, t(0))
-            .is_empty());
-        // Once the remote pointer has moved into the screen, reaching the entry
-        // edge again is an explicit return gesture and does not need a poll delay.
-        assert!(a.on_sink_cursor_event(500, 100, W, H, t(100)).is_empty());
-        let acts = a.on_sink_cursor_event(W - 1, 100, W, H, t(400));
-
-        assert_eq!(acts, vec![Action::ReleaseControl]);
-        assert_eq!(a.mode, Mode::Source);
-        assert!(!a.linked);
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(0)).is_empty());
+        // 只离开边界 4px，仍属于入口保护区；即使又回到边界并停留也不能返回。
+        assert!(a.on_sink_tick(Some((W - 5, 100)), W, H, t(40)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(80)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(180)).is_empty());
+        assert_eq!(a.mode, Mode::Sink);
     }
 
     #[test]
@@ -536,12 +497,12 @@ mod tests {
         let mut a = Arbiter::new(Layout::PeerLeft);
         a.on_cursor(0, 100, W, H, t(0));
         let acts = a.on_cursor(0, 100, W, H, t(160));
-        // PeerLeft：对端入口在 (W-1, y)，回绕到本机右边缘内侧
+        // PeerLeft：对端入口在右边缘内侧，回绕到本机右边缘内侧
         assert_eq!(
             acts,
             vec![
                 Action::Warp { x: W - 2, y: 100 },
-                Action::TakeControl { x: W - 1, y: 100, src_w: W as u32, src_h: H as u32 },
+                Action::TakeControl { x: W - 5, y: 100, src_w: W as u32, src_h: H as u32 },
             ]
         );
     }
