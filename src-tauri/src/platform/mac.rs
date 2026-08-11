@@ -56,11 +56,11 @@ extern "C" {
 // 但 CGDisplayHideCursor 只对【前台应用】生效（Apple 官方文档原话：
 // "To use these functions, your application must be in the foreground"）。
 // 跨屏瞬间本进程必在后台（焦点在桌面/其他窗口）→ hide 静默无效
-// （mac→win 双鼠标根因之二）。解法照抄 Synergy/InputLeap 的
-// OSXScreen::hideCursor()：先经私有 CGS API 设 "SetsCursorInBackground"=true
-// 允许后台进程控制光标，再调 CGDisplayHideCursor，最后补一句
-// CGAssociateMouseAndMouseCursorPosition(true)（InputLeap 注释：修
-// "mouse randomly not hiding" 玄学 bug）。私有符号由 CoreGraphics 导出，
+// （mac→win 双鼠标根因之二）。这里沿用 Synergy/InputLeap 的后台控制方案：
+// 先经私有 CGS API 设 "SetsCursorInBackground"=true，再调
+// CGDisplayHideCursor。光标与物理设备的关联只由下方关联状态机管理，不能在
+// hide_cursor 中强制重连，否则程序仍记着“已断开”，实际光标却会继续移动。
+// 私有符号由 CoreGraphics 导出，
 // 自用工具不上 App Store，无审核风险。
 // CGDirectDisplayID = u32，CGError = i32，CGSConnectionID = i32，boolean_t = i32。
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -242,8 +242,6 @@ pub fn hide_cursor() {
         unsafe {
             let disp = CGMainDisplayID();
             let err = CGDisplayHideCursor(disp);
-            // InputLeap：补一句重新关联鼠标与光标位置，修 "randomly not hiding" 玄学 bug
-            let _ = CGAssociateMouseAndMouseCursorPosition(1);
             log::info!("[MAC-CURSOR] hide_cursor: CGDisplayHideCursor err={err}");
         }
     }
@@ -471,20 +469,12 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 // 移动已在上面两个分支分别处理（Source 冻结 / Sink 防双鼠标）。
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
                 let sink = SINK_ACTIVE.load(Ordering::Relaxed);
-                // 滚轮：防御深度——不靠 return None（Session 层未必能完全拦截
-                // momentum 惯性滚动），而是把 delta 清零后放行。对端已收到原始
-                // delta（上面 tx.send），本机应用收到零 delta → 不滚动。
+                // 滚轮必须完整吞掉。触控板连续/惯性滚动同时携带 point、fixed-point、
+                // line delta 以及 phase/momentum 信息；只清 point delta 再放行时，读取
+                // 其他字段的 App 仍会滚动，造成 Mac 和对端双滚。原始 delta 已在上面
+                // tx.send 转发给对端，这里直接从 Session 派发链移除本机事件。
                 if (blocked || sink) && matches!(p, Payload::MouseWheel { .. }) {
-                    // 清零行级增量（整数，绝大多数应用据此决定滚动量）
-                    event.set_integer_value_field(
-                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-                        0,
-                    );
-                    event.set_integer_value_field(
-                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-                        0,
-                    );
-                    return Some(event.clone());
+                    return None;
                 }
                 if (blocked || sink)
                     && matches!(p, Payload::Key { .. } | Payload::MouseButton { .. })
