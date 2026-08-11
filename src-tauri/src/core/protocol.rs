@@ -33,8 +33,8 @@ pub enum Payload {
     /// 鼠标移动到源端逻辑坐标 (x, y)；src_w/src_h 为源端屏幕尺寸
     /// （接收端按自己的屏幕等比映射，支持两端分辨率不同）
     MouseMove { x: i32, y: i32, src_w: u32, src_h: u32 },
-    /// 相对鼠标移动。Mac 跨屏后直接转发 HID delta，接收端使用系统原生
-    /// 相对移动注入，避免虚拟绝对坐标和逐帧 warp 破坏触控板连续性。
+    /// 相对鼠标移动。Mac 转发 HID delta，Windows 转发 Raw Input delta；接收端
+    /// 使用相对移动注入，避免虚拟绝对坐标、边缘钳制和逐帧 warp 破坏连续性。
     MouseMoveRelative { dx: i32, dy: i32 },
     /// UDP 线上的绝对移动帧。session 标识本次跨屏接管，seq 在该轮次内递增；
     /// 接收端据此拒绝旧轮次和乱序帧。

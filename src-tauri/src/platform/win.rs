@@ -1,7 +1,7 @@
 // Windows 平台实现（M1）：低层钩子捕获 + SendInput 注入。
 //
-// 捕获：WH_MOUSE_LL / WH_KEYBOARD_LL 低层钩子，回调跑在专用钩子线程的消息循环里
-//      （不注入 DLL，hMod 传 None）。
+// 捕获：未跨屏的绝对位置、按键/点击/滚轮走 WH_MOUSE_LL / WH_KEYBOARD_LL；
+//      Source 跨屏后的移动走 WM_INPUT 原始相对 delta。回调都在专用钩子线程。
 // 注入：SendInput，VK + 扫描码 + 扩展位原样回放，保证左右 Ctrl/方向键等"同码键"不走样。
 // 防回环：钩子结构体自带 INJECTED 标记（LLMHF_INJECTED / LLKHF_INJECTED），
 //       注入的事件直接丢弃 —— M1 本机回环靠它防死循环，M2 对端注入防再转发。
@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -23,6 +23,10 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -38,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    WM_INPUT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
     CreateCursor, SetSystemCursor,
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
     SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
@@ -74,6 +78,8 @@ fn suppress_injected() -> bool {
 
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+/// 每轮 Windows Source 跨屏只记录一次首个 Raw Input delta，便于区分握手与采集故障。
+static RAW_MOVE_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMove——光标只跟对端注入走，
 /// 否则本机鼠标一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
@@ -86,6 +92,9 @@ static SHIELD_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+    if blocked {
+        RAW_MOVE_SEEN.store(false, Ordering::Relaxed);
+    }
     // 罩子窗口开合与跨屏状态联动：显示罩子（不抢焦点）或收起
     if let Ok(g) = SHIELD_HWND.lock() {
         if let Some(raw) = *g {
@@ -102,7 +111,76 @@ pub fn set_sink_active(active: bool) {
     SINK_ACTIVE.store(active, Ordering::Relaxed);
 }
 
-/// 罩子窗口的窗口过程：什么都不做，默认处理即可（窗口只是"接住"鼠标消息）。
+/// 从 WM_INPUT 读取物理鼠标的原始相对位移。只在本机作为 Source 跨屏时发送；
+/// Sink 期间及正常本机使用时完全忽略，避免与低层钩子或远端注入重复。
+unsafe fn forward_raw_mouse(lparam: LPARAM) {
+    if !BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let header_size = size_of::<RAWINPUTHEADER>() as u32;
+    let mut required = 0u32;
+    let handle = HRAWINPUT(lparam.0 as *mut c_void);
+    if GetRawInputData(handle, RID_INPUT, None, &mut required, header_size) == u32::MAX
+        || required > size_of::<RAWINPUT>() as u32
+    {
+        return;
+    }
+
+    let mut raw = MaybeUninit::<RAWINPUT>::zeroed();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    let read = GetRawInputData(
+        handle,
+        RID_INPUT,
+        Some(raw.as_mut_ptr().cast()),
+        &mut size,
+        header_size,
+    );
+    if read == u32::MAX || read < header_size {
+        return;
+    }
+
+    let raw = raw.assume_init();
+    if raw.header.dwType != RIM_TYPEMOUSE.0 {
+        return;
+    }
+    let mouse = raw.data.mouse;
+    let Some((dx, dy)) = raw_relative_delta(mouse.usFlags.0, mouse.lLastX, mouse.lLastY) else {
+        return;
+    };
+    if !RAW_MOVE_SEEN.swap(true, Ordering::Relaxed) {
+        log::info!("Windows Source 已收到首个 Raw Input delta ({dx}, {dy})");
+    }
+
+    HOOK_SENDER.with(|s| {
+        if let Some(tx) = s.borrow().as_ref() {
+            let _ = tx.send(Payload::MouseMoveRelative { dx, dy });
+        }
+    });
+}
+
+fn raw_relative_delta(flags: u16, dx: i32, dy: i32) -> Option<(i32, i32)> {
+    // 绝大多数鼠标和精确式触控板通过 Raw Input 提供相对位移。绝对式数字化设备的
+    // lLastX/lLastY 是 0..65535 坐标，不能当成 delta，否则会让远端光标瞬移。
+    if flags & MOUSE_MOVE_ABSOLUTE.0 != 0 || (dx == 0 && dy == 0) {
+        None
+    } else {
+        Some((dx, dy))
+    }
+}
+
+fn register_raw_mouse(hwnd: HWND) -> Result<()> {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // Generic Desktop Controls
+        usUsage: 0x02,     // Mouse
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    unsafe { RegisterRawInputDevices(&[device], size_of::<RAWINPUTDEVICE>() as u32) }
+        .map_err(|e| anyhow!("Raw Input 鼠标注册失败: {e}"))
+}
+
+/// 罩子窗口的窗口过程：接收 Raw Input，并在跨屏期间接住桌面鼠标消息。
 /// WM_SETCURSOR 返回 TRUE：拦截系统自动设置光标——否则鼠标移到罩子上时
 /// Windows 可能显示忙碌转圈/箭头（SetSystemCursor 替换不覆盖的场景）。
 unsafe extern "system" fn shield_wnd_proc(
@@ -111,6 +189,11 @@ unsafe extern "system" fn shield_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_INPUT {
+        forward_raw_mouse(lparam);
+        // WM_INPUT 仍交给 DefWindowProcW 完成系统清理。
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     if msg == WM_SETCURSOR {
         return LRESULT(1); // TRUE：光标已处理，系统不要切换
     }
@@ -227,12 +310,26 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<u32>>) {
     // 窗口在钩子线程创建，消息循环泵它的消息；ShowWindow 由 set_local_input_blocked 从外部控制。
     match create_shield_window() {
         Some(hwnd) => {
+            if let Err(e) = register_raw_mouse(hwnd) {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                    let _ = UnhookWindowsHookEx(keyboard_hook);
+                    let _ = UnhookWindowsHookEx(mouse_hook);
+                }
+                return finish_hook_setup_failed(ready, e.to_string());
+            }
             if let Ok(mut g) = SHIELD_HWND.lock() {
                 *g = Some(hwnd.0 as isize);
             }
-            log::info!("罩子窗口已创建（透明全屏，默认隐藏）");
+            log::info!("罩子窗口和 Raw Input 相对鼠标已就绪");
         }
-        None => log::warn!("罩子窗口创建失败（桌面 hover 副作用可能回来）"),
+        None => {
+            unsafe {
+                let _ = UnhookWindowsHookEx(keyboard_hook);
+                let _ = UnhookWindowsHookEx(mouse_hook);
+            }
+            return finish_hook_setup_failed(ready, "Raw Input 目标窗口创建失败".into());
+        }
     }
     let _ = ready.send(Ok(tid));
 
@@ -293,11 +390,18 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let swallow = (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
                     && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. })
                     && !injected_wheel;
-                HOOK_SENDER.with(|s| {
-                    if let Some(tx) = s.borrow().as_ref() {
-                        let _ = tx.send(p);
-                    }
-                });
+                // Source 跨屏后的移动改由 WM_INPUT 发送相对 delta。这里继续处理
+                // 点击/滚轮；绝对 MouseMove 只在未跨屏或 Sink 本机夺回时进入仲裁器。
+                let source_raw_move = msg == WM_MOUSEMOVE
+                    && BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    && !SINK_ACTIVE.load(Ordering::Relaxed);
+                if !source_raw_move {
+                    HOOK_SENDER.with(|s| {
+                        if let Some(tx) = s.borrow().as_ref() {
+                            let _ = tx.send(p);
+                        }
+                    });
+                }
                 if swallow {
                     return LRESULT(1);
                 }
@@ -730,11 +834,9 @@ pub fn warp_cursor(x: i32, y: i32) {
     }
 }
 
-/// 跨屏触发时的光标回绕（Action::Warp 专用）。Windows 与 warp_cursor 等价：
-/// 光标是 SetSystemCursor 替换的透明图标，无 Dock/菜单栏热区重显问题，
-/// 本机移动也不吞（不冻结），无需虚拟位置种子。仅为平台接口对称保留。
-pub fn warp_cursor_cross(x: i32, y: i32) {
-    warp_cursor(x, y);
+/// 跨屏触发时 Windows 不再回绕本机光标。隐藏光标留在出口边，后续移动直接读取
+/// Raw Input 相对 delta；因此没有 SetCursorPos 产生的旧绝对帧，也不受屏幕边缘钳制。
+pub fn warp_cursor_cross(_x: i32, _y: i32) {
 }
 
 // ======================== M3：剪贴板 + 拖拽检测 ========================
@@ -1161,4 +1263,23 @@ unsafe extern "system" fn clip_wnd_proc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_relative_mouse_preserves_signed_delta() {
+        assert_eq!(raw_relative_delta(0, 7, -4), Some((7, -4)));
+    }
+
+    #[test]
+    fn raw_relative_mouse_drops_zero_and_absolute_packets() {
+        assert_eq!(raw_relative_delta(0, 0, 0), None);
+        assert_eq!(
+            raw_relative_delta(MOUSE_MOVE_ABSOLUTE.0, 32_768, 32_768),
+            None
+        );
+    }
 }

@@ -3,10 +3,11 @@
 // 跨屏模型（控制轮次 + 光标回绕）：
 //   1. 本机光标在"出口边"（对端所在的那条边）短暂停留 → 发起 TakeControl：
 //      - 对端收到后进入 Sink（注入模式），光标落到入口位置；
-//      - 本机光标回绕（warp）到对侧边缘 —— Windows 会把光标钳制在屏幕边缘，
-//        不回绕的话继续往外的移动在系统层面消失，钩子看不到意图。
+//      - Mac 把隐藏光标回绕到安全位置；Windows 将隐藏光标留在出口边，后续直接读取
+//        不受系统指针边缘钳制影响的 Raw Input delta。
 //   2. 跨屏期间（linked）：本机鼠标移动/按键/点击/滚轮全部转发，对端注入。
-//      Windows 源端发送绝对坐标；Mac 源端发送 HID 相对位移。
+//      Windows 源端发送 Raw Input delta；Mac 源端发送 HID delta。绝对坐标只用于
+//      未跨屏时的边缘判定和接收端入口定位，不进入跨屏移动流。
 //   3. 只有正在显示光标的 Sink 才能判断返回：光标先离开入口保护带，之后回到入口边
 //      短暂停留 → ReleaseControl。Source 的隐藏/回绕光标不参与返回判断。
 //
@@ -91,10 +92,6 @@ pub struct Arbiter {
     last_trigger: Option<Instant>,
     /// 最近一次跨屏出口位置（返回时 warp 回出口边用）
     exit_pos: Option<(i32, i32)>,
-    /// Source 跨屏后的绝对移动是否已经越过 warp 分界线。
-    /// Windows 低级钩子可能在 warp 后继续吐出排队中的旧出口边缘帧；这些帧必须先丢弃，
-    /// 否则会被误判为返回，或被转发到接收端导致光标在入口边缘闪烁。
-    source_move_armed: bool,
 }
 
 impl Arbiter {
@@ -115,7 +112,6 @@ impl Arbiter {
             sink_was_away: false,
             last_trigger: None,
             exit_pos: None,
-            source_move_armed: false,
         }
     }
 
@@ -123,27 +119,10 @@ impl Arbiter {
     pub fn on_cursor(&mut self, x: i32, y: i32, w: i32, h: i32, now: Instant) -> Vec<Action> {
         self.last = Some((x, y, w, h));
 
-        // 跨屏期间源端隐藏光标只负责提供移动坐标，返回只能由正在显示光标的 Sink 判断。
-        // 刚执行 warp 时，Windows 钩子队列中可能还有 warp 前的出口边缘帧。先等到一个
-        // 落在屏幕另一半（即 warp 目标侧）的新帧，再开始转发绝对坐标。
+        // Source 跨屏后的移动必须走平台原始相对 delta。低层钩子的绝对 MouseMove
+        // 可能是触发跨屏前已经排队的旧帧，全部忽略，既不转发也不参与返回判断。
         if self.mode == Mode::Source && self.linked {
-            if !self.source_move_armed {
-                let reached_warp_side = match self.exit_edge {
-                    Edge::Right => x < w / 2,
-                    Edge::Left => x >= w / 2,
-                    _ => true,
-                };
-                if !reached_warp_side {
-                    return Vec::new();
-                }
-                self.source_move_armed = true;
-            }
-            return vec![Action::Forward(Payload::MouseMove {
-                x,
-                y,
-                src_w: w as u32,
-                src_h: h as u32,
-            })];
+            return Vec::new();
         }
 
         let at_exit = geometry::hit_edge(x, y, w, h, EDGE_MARGIN) == self.exit_edge;
@@ -261,7 +240,6 @@ impl Arbiter {
     pub fn on_peer_take(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
         self.mode = Mode::Sink;
         self.linked = false;
-        self.source_move_armed = false;
         // 新一轮被控：入口带内暂不判返回（需先离开过入口带）
         self.sink_was_away = false;
         Some((x, y))
@@ -271,7 +249,6 @@ impl Arbiter {
     pub fn on_peer_release(&mut self) {
         self.mode = Mode::Source;
         self.linked = false;
-        self.source_move_armed = false;
         self.dwell = None;
         self.last = None;
         self.sink_dwell = None;
@@ -310,7 +287,6 @@ impl Arbiter {
         // 发起/夺回：成为 Source 并跨屏
         self.mode = Mode::Source;
         self.linked = true;
-        self.source_move_armed = false;
         self.last_trigger = Some(now);
         self.exit_pos = Some((x, y));
         let (peer_x, peer_y) = geometry::enter_position(self.exit_edge, y, x, w, h);
@@ -364,15 +340,15 @@ mod tests {
     }
 
     #[test]
-    fn forward_moves_while_linked() {
+    fn forward_relative_moves_while_linked() {
         let mut a = Arbiter::new(Layout::PeerRight);
         a.on_cursor(EDGE_X, 100, W, H, t(0));
         a.on_cursor(EDGE_X, 100, W, H, t(80)); // 触发跨屏
-        // 跨屏后普通移动 → 转发（带源端尺寸）
-        let acts = a.on_cursor(100, 200, W, H, t(200));
+        // 跨屏后的平台原始相对移动立即转发，不依赖本机隐藏光标位置。
+        let act = a.on_input(Payload::MouseMoveRelative { dx: 4, dy: -2 });
         assert_eq!(
-            acts,
-            vec![Action::Forward(Payload::MouseMove { x: 100, y: 200, src_w: W as u32, src_h: H as u32 })]
+            act,
+            Action::Forward(Payload::MouseMoveRelative { dx: 4, dy: -2 })
         );
         // 按键 → 转发
         let act = a.on_input(Payload::Key { key: Key::A, scan: 0x1E, extended: false, down: true });
@@ -389,33 +365,12 @@ mod tests {
         a.on_cursor(EDGE_X, 100, W, H, t(80));
         assert!(a.linked);
 
-        // warp 前已经进入钩子队列的右边缘帧不能触发归还，也不能转发到接收端。
+        // 跨屏前后排队的绝对帧都不能触发归还，也不能转发到接收端。
         assert!(a.on_cursor(EDGE_X, 300, W, H, t(400)).is_empty());
         assert!(a.on_cursor(EDGE_X, 300, W, H, t(480)).is_empty());
+        assert!(a.on_cursor(10, 300, W, H, t(600)).is_empty());
+        assert!(a.on_cursor(EDGE_X, 300, W, H, t(680)).is_empty());
         assert!(a.on_tick(t(560)).is_empty());
-        assert!(a.linked);
-
-        // 看到 warp 后的左半屏帧才开始转发。
-        assert_eq!(
-            a.on_cursor(10, 300, W, H, t(600)),
-            vec![Action::Forward(Payload::MouseMove {
-                x: 10,
-                y: 300,
-                src_w: W as u32,
-                src_h: H as u32,
-            })]
-        );
-
-        // 一旦武装，之后即使绝对坐标到达原出口边缘也只转发；返回由 Sink 决定。
-        assert_eq!(
-            a.on_cursor(EDGE_X, 300, W, H, t(680)),
-            vec![Action::Forward(Payload::MouseMove {
-                x: EDGE_X,
-                y: 300,
-                src_w: W as u32,
-                src_h: H as u32,
-            })]
-        );
         assert!(a.linked);
     }
 
@@ -427,14 +382,10 @@ mod tests {
         assert!(a.linked);
 
         assert!(a.on_cursor(0, 200, W, H, t(160)).is_empty());
+        assert!(a.on_cursor(W - 10, 200, W, H, t(200)).is_empty());
         assert_eq!(
-            a.on_cursor(W - 10, 200, W, H, t(200)),
-            vec![Action::Forward(Payload::MouseMove {
-                x: W - 10,
-                y: 200,
-                src_w: W as u32,
-                src_h: H as u32,
-            })]
+            a.on_input(Payload::MouseMoveRelative { dx: -3, dy: 5 }),
+            Action::Forward(Payload::MouseMoveRelative { dx: -3, dy: 5 })
         );
     }
 

@@ -558,14 +558,17 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             log::info!("返回本机 session={session} → ReleaseControl");
             platform::show_cursor();
             platform::set_local_input_blocked(false);
+            // 本机作为 Sink 主动返回后，仲裁器已切回 Source；平台输入所有权也必须
+            // 同步清零，否则本机点击/滚轮仍会被 Sink 钩子吞掉，直到下一次跨屏。
+            platform::set_sink_active(false);
             if session != 0 {
                 net.send_ctrl(Message::ctrl(&name, Payload::ReleaseControl { session }));
             }
         }
         Action::Warp { x, y } => {
             log::debug!("光标回绕 → ({x}, {y})");
-            // 跨屏专用回绕：Mac 端落点避开 Dock/菜单栏热区；
-            // Win 端与 warp_cursor 等价。
+            // Mac 端回绕到避开 Dock/菜单栏的安全点；Windows 端为 no-op，
+            // 隐藏光标留在出口边并改走 Raw Input 相对移动。
             platform::warp_cursor_cross(x, y);
         }
         Action::Forward(payload) => match payload {
