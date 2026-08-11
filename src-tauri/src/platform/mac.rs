@@ -658,6 +658,10 @@ fn post_mac_modifier(key: Key, down: bool, modifiers: ModifierState) {
     let Ok(event) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) else {
         return;
     };
+    // macOS represents modifier transitions as FlagsChanged, not ordinary KeyDown/KeyUp.
+    // Application shortcuts may work from flags alone, while system shortcuts such as
+    // Mission Control require the modifier state transition to have the correct type.
+    event.set_type(CGEventType::FlagsChanged);
     event.set_flags(mac_event_flags(modifiers));
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
     event.post(CGEventTapLocation::HID);
@@ -847,6 +851,21 @@ impl InputInjector {
                         return 1;
                     }
                     let stroke = keyboard.prepare_key(*key, *down);
+                    if *down {
+                        let generic = ShortcutStroke {
+                            key: *key,
+                            modifiers: map_modifiers(true, keyboard.source_modifiers),
+                        };
+                        if stroke != generic {
+                            log::info!(
+                                "[MAC-KEY] shortcut source={:?}+{:?} -> target={:?}+{:?}",
+                                keyboard.source_modifiers,
+                                key,
+                                stroke.modifiers,
+                                stroke.key,
+                            );
+                        }
+                    }
                     sync_mac_modifiers(&mut keyboard, stroke.modifiers);
                     if !*down
                         && translate_windows_shortcut_to_mac(
@@ -934,10 +953,7 @@ impl InputInjector {
             }
         }
 
-        for key in active_keys
-            .into_iter()
-            .chain([Key::Shift, Key::Ctrl, Key::Alt, Key::Super])
-        {
+        for key in active_keys {
             let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
                 continue;
             };
@@ -947,6 +963,9 @@ impl InputInjector {
             event.set_flags(CGEventFlags::empty());
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
             event.post(CGEventTapLocation::HID);
+        }
+        for key in [Key::Shift, Key::Ctrl, Key::Alt, Key::Super] {
+            post_mac_modifier(key, false, ModifierState::default());
         }
     }
 }

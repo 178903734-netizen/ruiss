@@ -172,9 +172,14 @@ pub fn translate_windows_shortcut_to_mac(
                 ..Default::default()
             };
         }
-        // Windows Ctrl+方向键/退格/删除 → macOS Option 语义（按词移动/删除）。
+        // Windows Ctrl+方向键 → macOS Control+方向键（空间切换/Mission Control/App Exposé）。
         Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
-        | Key::Backspace | Key::Delete
+            if source.ctrl && !source.alt && !source.super_key =>
+        {
+            mapped.modifiers = ModifierState { ctrl: true, shift, ..Default::default() };
+        }
+        // Windows Ctrl+退格/删除 → macOS Option 语义（按词删除）。
+        Key::Backspace | Key::Delete
             if source.ctrl && !source.alt && !source.super_key =>
         {
             mapped.modifiers = ModifierState { alt: true, shift, ..Default::default() };
@@ -410,7 +415,17 @@ mod tests {
             translate_windows_shortcut_to_mac(ctrl_shift, Key::ArrowLeft),
             ShortcutStroke {
                 key: Key::ArrowLeft,
-                modifiers: ModifierState { alt: true, shift: true, ..Default::default() },
+                modifiers: ModifierState { ctrl: true, shift: true, ..Default::default() },
+            }
+        );
+        assert_eq!(
+            translate_windows_shortcut_to_mac(
+                ModifierState { ctrl: true, ..Default::default() },
+                Key::ArrowUp,
+            ),
+            ShortcutStroke {
+                key: Key::ArrowUp,
+                modifiers: ModifierState { ctrl: true, ..Default::default() },
             }
         );
     }
