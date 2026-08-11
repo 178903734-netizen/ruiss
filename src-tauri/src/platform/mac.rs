@@ -273,6 +273,21 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         move |_proxy, event_type, event| {
             // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
+            // ===== 临时诊断（不改行为）：滚动事件全量打日志 =====
+            // 目的：验证触控板惯性滚动（momentum）段是否进入 tap、pid 是多少、
+            // 跨屏状态是否就位。甩一次触控板看日志即可定死修复方向。验证后删除。
+            if matches!(event_type, CGEventType::ScrollWheel) {
+                let dy = event
+                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+                let dx = event
+                    .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+                log::info!(
+                    "[SCROLL-DIAG] pid={pid} dx={dx} dy={dy} blocked={} sink={}",
+                    BLOCK_LOCAL_INPUT.load(Ordering::Relaxed),
+                    SINK_ACTIVE.load(Ordering::Relaxed),
+                );
+            }
+            // ===== 诊断结束 =====
             if pid != 0 {
                 // 本进程注入的事件（如 warp_cursor）。CGDisplayHideCursor 系统级、
                 // 鼠标移动不重显，注入移动不会再把光标拉回显示，无需补藏。
