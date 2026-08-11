@@ -292,6 +292,10 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             // 本机光标"离开"（隐藏），避免双光标；键盘/点击/滚轮被拦截，只转发对端
             platform::hide_cursor();
             platform::set_local_input_blocked(true);
+            // 若是从被控（Sink）状态夺回控制权：必须清除 Sink 标记——否则 blocked 与
+            // sink 同时为 true，tap 里两个吞移动分支叠加、Source 虚拟位置不生效
+            // （2026-08-11 日志实测出现 blocked=true sink=true 组合）。
+            platform::set_sink_active(false);
             net.send(Message::ctrl(&name, Payload::TakeControl { x, y, src_w, src_h }));
             // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
             if platform::is_left_button_down() {
