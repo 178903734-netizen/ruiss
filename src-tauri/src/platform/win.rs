@@ -606,7 +606,10 @@ const VK_MAP: &[(u32, Key)] = &[
     (0x34, Key::Digit4), (0x35, Key::Digit5), (0x36, Key::Digit6), (0x37, Key::Digit7),
     (0x38, Key::Digit8), (0x39, Key::Digit9),
     // 修饰键
-    (0x10, Key::Shift), (0x11, Key::Ctrl), (0x12, Key::Alt),
+    // WH_KEYBOARD_LL 的 vkCode 通常给出左右侧专用码，不能只认通用码。
+    (0x10, Key::Shift), (0xA0, Key::Shift), (0xA1, Key::Shift),
+    (0x11, Key::Ctrl), (0xA2, Key::Ctrl), (0xA3, Key::Ctrl),
+    (0x12, Key::Alt), (0xA4, Key::Alt), (0xA5, Key::Alt),
     (0x5B, Key::Super), (0x5C, Key::Super), // 左/右 Win 键
     // 功能键
     (0x0D, Key::Enter), (0x20, Key::Space), (0x08, Key::Backspace),
@@ -1411,5 +1414,15 @@ mod tests {
             raw_relative_delta(MOUSE_MOVE_ABSOLUTE.0, 32_768, 32_768),
             None
         );
+    }
+
+    #[test]
+    fn low_level_hook_side_specific_modifiers_are_normalized() {
+        assert_eq!(vk_to_key(0xA0), Key::Shift);
+        assert_eq!(vk_to_key(0xA1), Key::Shift);
+        assert_eq!(vk_to_key(0xA2), Key::Ctrl);
+        assert_eq!(vk_to_key(0xA3), Key::Ctrl);
+        assert_eq!(vk_to_key(0xA4), Key::Alt);
+        assert_eq!(vk_to_key(0xA5), Key::Alt);
     }
 }
