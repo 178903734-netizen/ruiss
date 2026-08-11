@@ -33,6 +33,9 @@ pub enum Payload {
     /// 鼠标移动到源端逻辑坐标 (x, y)；src_w/src_h 为源端屏幕尺寸
     /// （接收端按自己的屏幕等比映射，支持两端分辨率不同）
     MouseMove { x: i32, y: i32, src_w: u32, src_h: u32 },
+    /// 相对鼠标移动。Mac 跨屏后直接转发 HID delta，接收端使用系统原生
+    /// 相对移动注入，避免虚拟绝对坐标和逐帧 warp 破坏触控板连续性。
+    MouseMoveRelative { dx: i32, dy: i32 },
     /// 鼠标按键：0 左键 / 1 右键 / 2 中键，down=true 按下，false 抬起
     MouseButton { button: u8, down: bool },
     /// 滚轮：dy>0 向上滚，dx 为横向滚轮。单位统一为"格"：

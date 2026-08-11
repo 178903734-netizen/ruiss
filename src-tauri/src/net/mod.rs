@@ -80,7 +80,7 @@ struct NetStatusInner {
 #[derive(Clone)]
 pub struct NetHandle {
     out: mpsc::Sender<Message>,
-    moves: mpsc::Sender<(i32, i32, u32, u32)>,
+    moves: mpsc::Sender<Payload>,
     status: Arc<NetStatusInner>,
 }
 
@@ -93,7 +93,12 @@ impl NetHandle {
     /// 发送鼠标移动（UDP，fire-and-forget）。src_w/src_h 为发送端屏幕尺寸，
     /// 接收端据此做等比坐标映射。
     pub fn send_move(&self, x: i32, y: i32, src_w: u32, src_h: u32) {
-        let _ = self.moves.try_send((x, y, src_w, src_h));
+        let _ = self.moves.try_send(Payload::MouseMove { x, y, src_w, src_h });
+    }
+
+    /// 相对移动不能像绝对坐标一样只保留最后一帧；UDP 写循环会把积压 delta 累加。
+    pub fn send_move_relative(&self, dx: i32, dy: i32) {
+        let _ = self.moves.try_send(Payload::MouseMoveRelative { dx, dy });
     }
 
     pub fn connected(&self) -> bool {
@@ -130,7 +135,7 @@ impl NetEngine {
     pub async fn start(name: String, cfg: PeerConfig) -> Result<NetStart> {
         let (out_tx, out_rx) = mpsc::channel::<Message>(256);
         let (in_tx, incoming) = mpsc::channel::<Message>(256);
-        let (move_tx, move_rx) = mpsc::channel::<(i32, i32, u32, u32)>(256);
+        let (move_tx, move_rx) = mpsc::channel::<Payload>(256);
         let status = Arc::new(NetStatusInner {
             connected: AtomicBool::new(false),
             sent: Arc::new(AtomicU64::new(0)),

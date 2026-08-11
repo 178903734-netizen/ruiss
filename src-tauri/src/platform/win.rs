@@ -19,7 +19,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM, HGLOBAL};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM, HGLOBAL};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -32,7 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LWA_ALPHA, LLKHF_EXTENDED, LLKHF_INJECTED,
+    GetCursorPos, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LWA_ALPHA, LLKHF_EXTENDED, LLKHF_INJECTED,
     LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetCursorPos,
     SetLayeredWindowAttributes, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
@@ -373,6 +373,8 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 /// 使用 SetSystemCursor 替换系统光标资源为透明图标——内核级替换，
 /// 不受 per-thread ShowCursor 计数器或其他窗口 SetCursor 影响。
 static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
+/// 启动时无条件恢复一次系统光标；后续只有确实隐藏过才执行昂贵的 SPI_SETCURSORS。
+static CURSOR_STARTUP_RESTORED: AtomicBool = AtomicBool::new(false);
 
 /// 创建 1x1 全透明光标。
 /// AND 掩码全 1（不改变桌面像素），XOR 掩码全 0（不绘制任何像素）→ 完全透明。
@@ -421,7 +423,11 @@ pub fn hide_cursor() {
 /// 无条件执行（不检查 CURSOR_SUPPRESS）：即使上次运行崩溃/被强杀导致
 /// 系统光标停留在透明状态，本次启动调用也能恢复。
 pub fn show_cursor() {
-    CURSOR_SUPPRESS.store(false, Ordering::Relaxed);
+    let was_suppressed = CURSOR_SUPPRESS.swap(false, Ordering::Relaxed);
+    let first_restore = !CURSOR_STARTUP_RESTORED.swap(true, Ordering::Relaxed);
+    if !was_suppressed && !first_restore {
+        return;
+    }
 
     // SPI_SETCURSORS：通知系统从 HKCU\Control Panel\Cursors 重新加载所有光标
     unsafe {
@@ -550,6 +556,7 @@ impl InputInjector {
         }
         let inputs: Vec<INPUT> = match &event {
             Payload::MouseMove { x, y, .. } => mouse_move_inputs(*x, *y),
+            Payload::MouseMoveRelative { dx, dy } => mouse_move_relative_inputs(*dx, *dy),
             Payload::MouseButton { button, down } => mouse_button_inputs(*button, *down),
             Payload::MouseWheel { dx, dy } => mouse_wheel_inputs(*dx, *dy),
             Payload::Key { key, scan, extended, down } => {
@@ -564,9 +571,36 @@ impl InputInjector {
             return 0;
         }
         let n = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        if n > 0 && matches!(event, Payload::MouseMoveRelative { .. }) {
+            let mut point = POINT::default();
+            if unsafe { GetCursorPos(&mut point) }.is_ok() {
+                if let Ok(mut p) = LAST_INJECTED.lock() {
+                    *p = Some((point.x, point.y));
+                }
+            }
+        }
         log::debug!("注入: {event:?} → SendInput 返回 {n}");
         n
     }
+}
+
+fn mouse_move_relative_inputs(dx: i32, dy: i32) -> Vec<INPUT> {
+    if dx == 0 && dy == 0 {
+        return Vec::new();
+    }
+    vec![INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }]
 }
 
 fn mouse_move_inputs(x: i32, y: i32) -> Vec<INPUT> {

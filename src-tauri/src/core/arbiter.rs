@@ -52,19 +52,17 @@ pub enum Action {
 
 /// 边界像素余量（与 geometry::hit_edge 默认一致）
 const EDGE_MARGIN: i32 = 2;
-/// Sink 侧返回判定容差：注入光标进入出口边附近 30px 内即算"到边"
-/// （触控板/相对移动设备无法精确停在 2px 内，需要更宽的带）
-const RETURN_MARGIN: i32 = 30;
+/// 事件驱动返回只在精确边界附近触发，避免鼠标仅靠近边缘就误返回。
+const RETURN_MARGIN: i32 = 3;
 /// 位置抖动容差：坐标变化不超过 3px 视为"停住"
 /// （触控板停手后仍有惯性/微移，变化 1~2px 不应重置停留计时）
 const JITTER_TOLERANCE: i32 = 3;
-/// 边缘停留防误触时长（规划 100~200ms）
-const DWELL: Duration = Duration::from_millis(150);
-/// 跨屏触发防抖：一次 Take/Release 后 1s 内不重复触发
-/// （防止"刚返回又立刻跨屏"的抖动）
-const TRIGGER_COOLDOWN: Duration = Duration::from_millis(1000);
+/// 首次跨出和轮询兜底的短停留时间。主要返回路径由移动事件立即触发。
+const DWELL: Duration = Duration::from_millis(60);
+/// 防止一次边缘动作产生 Take/Release 往返抖动，同时不再让快速切换卡住 1 秒。
+const TRIGGER_COOLDOWN: Duration = Duration::from_millis(250);
 
-/// 仲裁器：每次光标事件调用 on_cursor，空闲时上层每 100ms 调 on_tick /
+/// 仲裁器：每次光标事件调用 on_cursor，空闲时上层每 25ms 调 on_tick /
 /// on_sink_tick。
 pub struct Arbiter {
     layout: Layout,
@@ -168,7 +166,7 @@ impl Arbiter {
         Action::Forward(payload)
     }
 
-    /// 空闲心跳（上层每 ~100ms 调用）：Source 侧光标停在边缘不动时也能触发发起。
+    /// 空闲心跳（上层每 ~25ms 调用）：Source 侧光标停在边缘不动时也能触发发起。
     pub fn on_tick(&mut self, now: Instant) -> Vec<Action> {
         match self.last {
             Some((_x, _y, w, h)) => self.check_dwell(now, w, h),
@@ -176,7 +174,7 @@ impl Arbiter {
         }
     }
 
-    /// Sink 侧空闲心跳（上层每 ~100ms 调用）：注入光标在自己屏幕的
+    /// Sink 侧空闲心跳（上层每 ~25ms 调用）：注入光标在自己屏幕的
     /// 入口边（= 自己的出口边）停留足够久 → 返回本机。
     /// `injected` 为最近一次注入到本机的光标位置。
     pub fn on_sink_tick(
@@ -242,6 +240,44 @@ impl Arbiter {
         Vec::new()
     }
 
+    /// Sink 每成功注入一帧远程移动后立即调用。入口点本身不返回；光标先离开过
+    /// 入口边，再重新到达精确边界时，说明用户正在原路推回，立即归还控制权。
+    pub fn on_sink_cursor_event(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        now: Instant,
+    ) -> Vec<Action> {
+        if self.mode != Mode::Sink {
+            return Vec::new();
+        }
+        let at_entry = geometry::hit_edge(x, y, w, h, RETURN_MARGIN) == self.exit_edge;
+        self.last_injected = Some((x, y));
+        if !at_entry {
+            self.sink_was_away = true;
+            self.sink_dwell = None;
+            return Vec::new();
+        }
+        if !self.sink_was_away {
+            return Vec::new();
+        }
+        let cooled = self
+            .last_trigger
+            .map_or(true, |t| now.duration_since(t) > TRIGGER_COOLDOWN);
+        if !cooled {
+            return Vec::new();
+        }
+        self.last_trigger = Some(now);
+        self.sink_dwell = None;
+        self.last_injected = None;
+        self.sink_was_away = false;
+        self.mode = Mode::Source;
+        self.linked = false;
+        vec![Action::ReleaseControl]
+    }
+
     /// 对端发来 TakeControl：接受，进入 Sink，返回对端给的入口位置（需注入）。
     /// 已知限制：双方同时抢控时都接受可能双双变 Sink，任一方出口边停留即可夺回。
     pub fn on_peer_take(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
@@ -305,10 +341,8 @@ impl Arbiter {
             Edge::Left => w - 2, // 回绕到右边缘内侧
             _ => x,
         };
-        // 顺序重要：先 Warp 后 TakeControl。Mac 端 Source 跨屏时 tap 要吞本机
-        // MouseMoved 并用 warp 落点做虚拟位置种子（mac.rs SOURCE_VIRTUAL_POS），
-        // warp 必须先于 TakeControl 的 blocked=true 执行，否则首个被吞的移动以
-        // 跨屏前位置为种子 → 对端光标镜像错位。Win 端无此依赖，顺序无影响。
+        // 先回绕本机光标，再进入 blocked 状态；对端入口由 TakeControl 绝对定位，
+        // 后续 Mac 触控板移动直接走 HID 相对 delta。
         vec![
             Action::Warp { x: warp_x, y },
             Action::TakeControl { x: peer_x, y: peer_y, src_w: w as u32, src_h: h as u32 },
@@ -336,10 +370,10 @@ mod tests {
         let mut a = Arbiter::new(Layout::PeerRight);
         // 刚到边缘：开始计时，无动作
         assert!(a.on_cursor(EDGE_X, 100, W, H, t(0)).is_empty());
-        // 100ms 未到
-        assert!(a.on_cursor(EDGE_X, 100, W, H, t(100)).is_empty());
-        // 160ms 到期：TakeControl + Warp
-        let acts = a.on_cursor(EDGE_X, 100, W, H, t(160));
+        // 40ms 未到
+        assert!(a.on_cursor(EDGE_X, 100, W, H, t(40)).is_empty());
+        // 80ms 到期：TakeControl + Warp
+        let acts = a.on_cursor(EDGE_X, 100, W, H, t(80));
         assert_eq!(
             acts,
             vec![
@@ -355,7 +389,7 @@ mod tests {
     fn forward_moves_while_linked() {
         let mut a = Arbiter::new(Layout::PeerRight);
         a.on_cursor(EDGE_X, 100, W, H, t(0));
-        a.on_cursor(EDGE_X, 100, W, H, t(160)); // 触发跨屏
+        a.on_cursor(EDGE_X, 100, W, H, t(80)); // 触发跨屏
         // 跨屏后普通移动 → 转发（带源端尺寸）
         let acts = a.on_cursor(100, 200, W, H, t(200));
         assert_eq!(
@@ -375,11 +409,11 @@ mod tests {
         // Source 侧兜底返回：跨屏中光标回到出口边停留 → ReleaseControl
         let mut a = Arbiter::new(Layout::PeerRight);
         a.on_cursor(EDGE_X, 100, W, H, t(0));
-        a.on_cursor(EDGE_X, 100, W, H, t(160)); // 跨屏
+        a.on_cursor(EDGE_X, 100, W, H, t(80)); // 跨屏
         assert!(a.linked);
         // 回到出口边停留 → 返回
-        assert!(a.on_cursor(EDGE_X, 300, W, H, t(200)).is_empty()); // 开始计时
-        let acts = a.on_cursor(EDGE_X, 300, W, H, t(360));
+        assert!(a.on_cursor(EDGE_X, 300, W, H, t(400)).is_empty()); // 开始计时
+        let acts = a.on_cursor(EDGE_X, 300, W, H, t(480));
         assert_eq!(acts, vec![Action::ReleaseControl]);
         assert!(!a.linked);
     }
@@ -409,6 +443,25 @@ mod tests {
         assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(500)).is_empty()); // 回到入口边
         assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(600)).is_empty()); // 开始计时
         let acts = a.on_sink_tick(Some((W - 1, 100)), W, H, t(760));
+        assert_eq!(acts, vec![Action::ReleaseControl]);
+        assert_eq!(a.mode, Mode::Source);
+        assert!(!a.linked);
+    }
+
+    #[test]
+    fn sink_side_event_return_is_immediate_after_leaving_entry_zone() {
+        let mut a = Arbiter::new(Layout::PeerRight);
+        a.on_peer_take(W - 1, 100);
+
+        // The initial entry-edge position must not return control.
+        assert!(a
+            .on_sink_cursor_event(W - 1, 100, W, H, t(0))
+            .is_empty());
+        // Once the remote pointer has moved into the screen, reaching the entry
+        // edge again is an explicit return gesture and does not need a poll delay.
+        assert!(a.on_sink_cursor_event(500, 100, W, H, t(100)).is_empty());
+        let acts = a.on_sink_cursor_event(W - 1, 100, W, H, t(400));
+
         assert_eq!(acts, vec![Action::ReleaseControl]);
         assert_eq!(a.mode, Mode::Source);
         assert!(!a.linked);
@@ -446,11 +499,12 @@ mod tests {
         assert_eq!(acts, vec![Action::ReleaseControl]);
         assert_eq!(a.mode, Mode::Source);
         // 返回后光标还在左边缘（=出口边）：Source 侧 dwell 重新计时 → 冷却挡住
-        assert!(a.on_cursor(0, 100, W, H, t(200)).is_empty());
-        assert!(a.on_cursor(0, 100, W, H, t(300)).is_empty());
+        assert!(a.on_cursor(0, 100, W, H, t(500)).is_empty());
+        assert!(a.on_cursor(0, 100, W, H, t(580)).is_empty());
         assert!(!a.linked);
-        // 冷却结束（>1s）后仍停在边缘 → 再次跨屏
-        let acts = a.on_cursor(0, 100, W, H, t(1300));
+        // 冷却结束后重新停留一次，再次跨屏
+        assert!(a.on_cursor(0, 100, W, H, t(800)).is_empty());
+        let acts = a.on_cursor(0, 100, W, H, t(880));
         assert_eq!(acts.len(), 2); // TakeControl + Warp
     }
 
@@ -471,8 +525,8 @@ mod tests {
         // 光标停在边缘，之后不再有移动事件
         a.on_cursor(EDGE_X, 100, W, H, t(0));
         // 只有 on_tick 驱动
-        assert!(a.on_tick(t(100)).is_empty());
-        let acts = a.on_tick(t(160));
+        assert!(a.on_tick(t(40)).is_empty());
+        let acts = a.on_tick(t(80));
         assert_eq!(acts.len(), 2); // TakeControl + Warp
         assert!(a.linked);
     }

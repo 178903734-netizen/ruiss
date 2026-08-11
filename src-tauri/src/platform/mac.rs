@@ -7,10 +7,9 @@
 // EVENT_SOURCE_USER_DATA 标记；tap 只按该标记放行自身注入。真实硬件事件和
 // WindowServer 合成的惯性滚动均不带标记，跨屏时会被转发并从本机派发链吞掉。
 //
-// 注意：本文件无法在 Windows 上编译验证；API 以 core-graphics 0.24 为准，
+// 注意：本文件无法在 Windows 上原生编译验证；API 以 core-graphics 0.25 为准，
 // 如编译报错请把错误信息发回迭代。
 
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -57,8 +56,8 @@ extern "C" {
 // 跨屏瞬间本进程必在后台（焦点在桌面/其他窗口）→ hide 静默无效
 // （mac→win 双鼠标根因之二）。这里沿用 Synergy/InputLeap 的后台控制方案：
 // 先经私有 CGS API 设 "SetsCursorInBackground"=true，再调
-// CGDisplayHideCursor。光标与物理设备的关联只由下方关联状态机管理，不能在
-// hide_cursor 中强制重连，否则程序仍记着“已断开”，实际光标却会继续移动。
+// CGDisplayHideCursor。新版不再在跨屏期间断开光标与物理设备的关联；HID tap
+// 会在 WindowServer 更新指针前直接吞掉本机移动。
 // 私有符号由 CoreGraphics 导出，
 // 自用工具不上 App Store，无审核风险。
 // CGDirectDisplayID = u32，CGError = i32，CGSConnectionID = i32，boolean_t = i32。
@@ -68,7 +67,6 @@ extern "C" {
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
-    fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
     fn CGEventTapEnable(tap: *const c_void, enable: bool);
     fn _CGSDefaultConnection() -> i32;
     fn CGSSetConnectionProperty(
@@ -110,7 +108,7 @@ static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 /// 两个事件 tap 的 Mach port。HID tap 在 WindowServer 处理前抢占物理点击；
 /// Session tap 保留现有移动/键盘和完整惯性滚动处理。tap 被系统禁用时，回调
 /// 通过对应指针立即重新启用。
-static HID_CLICK_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
+static HID_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
 static SESSION_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Ruiss 自己注入的 CGEvent 标记。不能只用 source pid 防回环：触控板惯性段由
@@ -128,33 +126,6 @@ const DOCK_HOT_ZONE: i32 = 20;
 /// 菜单栏高度（屏幕顶部，逻辑像素）：同上，隐藏光标不能停在里面。
 const MENUBAR_HOT_ZONE: i32 = 25;
 
-/// Source 跨屏（出本机）期间：本机鼠标移动的虚拟位置（由相对位移 delta 累积）。
-/// 跨屏时本机 MouseMoved/Dragged 被吞掉（光标冻结在安全位，不滑向 Dock/菜单栏
-/// 热区），转发用这个虚拟位置维持"1:1 镜像"——吞事件后系统光标不再推进，
-/// 触控板相对位移的 location 会停在冻结位，必须用 delta 累积补上转发坐标。
-/// 种子 = 跨屏 warp 落点的原始坐标（对端入口同 y，镜像不断）。
-static SOURCE_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-
-/// Source 跨屏期间本机系统光标的固定位置。Session tap 收到移动时 WindowServer
-/// 可能已经推进了系统光标；即使事件随后被吞，Dock/应用的 hit-test 仍会看到新位置。
-/// 因此每次物理移动都用无事件的 CGWarpMouseCursorPosition 拉回这个安全落点。
-static SOURCE_SAFE_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
-
-fn park_source_cursor() {
-    let safe = match SOURCE_SAFE_POS.lock() {
-        Ok(g) => *g,
-        Err(p) => *p.into_inner(),
-    };
-    if let Some((x, y)) = safe {
-        unsafe {
-            let err = CGWarpMouseCursorPosition(CGPoint::new(x, y));
-            if err != 0 {
-                log::debug!("[MAC-CURSOR] CGWarpMouseCursorPosition({x}, {y}) err={err}");
-            }
-        }
-    }
-}
-
 /// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMoved——光标只跟对端注入走，
 /// 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
 static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -163,64 +134,12 @@ static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// hide_cursor 在 false→true 时调一次 CGDisplayHideCursor；show_cursor 在 true→false
 /// 时调一次 CGDisplayShowCursor，严格配对一次，绝不叠加（CG 系列内部也有计数语义）。
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// 光标是否已从物理输入设备断开（幂等标志）。跨屏期间调用
-/// CGAssociateMouseAndMouseCursorPosition(false) 防止 WindowServer 根据触控板
-/// delta 更新光标位置 —— Session 层 tap 无法阻止光标移动（WindowServer 在 tap
-/// 之前已更新位置），物理断开是唯一可靠方案。断开后 CGEventPost 注入仍可移动
-/// 光标，不影响对端注入/本机 warp。
-static CURSOR_DISASSOCIATED: AtomicBool = AtomicBool::new(false);
-
-fn ensure_cursor_disassociated() {
-    if !CURSOR_DISASSOCIATED.swap(true, Ordering::SeqCst) {
-        allow_background_cursor_control();
-        unsafe {
-            let err = CGAssociateMouseAndMouseCursorPosition(0);
-            log::info!("[MAC-CURSOR] CGAssociateMouseAndMouseCursorPosition(false) err={err}");
-        }
-    }
-}
-
-fn ensure_cursor_reassociated() {
-    if CURSOR_DISASSOCIATED.swap(false, Ordering::SeqCst) {
-        allow_background_cursor_control();
-        unsafe {
-            let err = CGAssociateMouseAndMouseCursorPosition(1);
-            log::info!("[MAC-CURSOR] CGAssociateMouseAndMouseCursorPosition(true) err={err}");
-        }
-    }
-}
-
-/// 根据当前 blocked/sink 状态同步光标关联。任一为 true 即断开物理输入，
-/// 两者皆 false 则重新关联。
-fn update_cursor_association() {
-    let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
-    let sink = SINK_ACTIVE.load(Ordering::Relaxed);
-    if blocked || sink {
-        ensure_cursor_disassociated();
-    } else {
-        ensure_cursor_reassociated();
-    }
-}
+/// 仅在进程启动后的首次 show 中执行旧版本崩溃恢复，避免每次接管都调用
+/// CGAssociateMouseAndMouseCursorPosition 给跨屏入口增加同步停顿。
+static CURSOR_STARTUP_REASSOCIATED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
-    let was = BLOCK_LOCAL_INPUT.swap(blocked, Ordering::Relaxed);
-    // 先同步光标关联状态（物理断开/重连），再处理光标 warp
-    update_cursor_association();
-    if !blocked && was {
-        // 跨屏结束（Source 返回本机）：把冻结在安全位的光标送回最后转发的
-        // 虚拟位置（= 用户手所在处），否则释放后光标从冻结位重新出现。
-        let restore = match SOURCE_VIRTUAL_POS.lock() {
-            Ok(g) => *g,
-            Err(p) => *p.into_inner(),
-        };
-        if let Some((x, y)) = restore {
-            warp_cursor(x as i32, y as i32);
-        }
-        if let Ok(mut g) = SOURCE_SAFE_POS.lock() {
-            *g = None;
-        }
-    }
+    BLOCK_LOCAL_INPUT.store(blocked, Ordering::SeqCst);
 }
 
 /// 被控端（Sink）：本机鼠标的虚拟位置（由相对位移 delta 累积）。
@@ -228,23 +147,15 @@ pub fn set_local_input_blocked(blocked: bool) {
 /// delta 累积成虚拟位置——推到出口边即可反向夺回控制权（自由切换）。
 static LOCAL_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-/// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMoved（防双鼠标），
-/// 并物理断开触控板与光标关联（防 WindowServer 移动光标到 Dock 热区）。
+/// 设置本机是否为被控端（Sink）。HID tap 在 WindowServer 处理前吞掉本机移动。
 pub fn set_sink_active(active: bool) {
     let was = SINK_ACTIVE.swap(active, Ordering::Relaxed);
-    // 先同步光标关联状态（物理断开/重连）
-    update_cursor_association();
     if active && !was {
         // 新一輪被控：虚拟位置清空，等待首次移动用当前光标位置初始化
         if let Ok(mut g) = LOCAL_VIRTUAL_POS.lock() {
             *g = None;
         }
     }
-}
-
-/// tap 回调往消费线程送事件的通道（线程局部：捕获线程装填）。
-thread_local! {
-    static HOOK_SENDER: RefCell<Option<Sender<Payload>>> = const { RefCell::new(None) };
 }
 
 /// 注入侧当前按住的鼠标按钮（-1 = 未按住）。
@@ -281,12 +192,12 @@ pub fn hide_cursor() {
 
 /// 恢复显示本机光标（幂等：仅 true→false 时调一次 CGDisplayShowCursor，
 /// 与 hide_cursor 严格配对一次）。
-/// 同时强制重新关联光标与物理输入（兜底：上次崩溃可能残留 disassociated 状态）。
 pub fn show_cursor() {
-    // 启动兜底：无论 CURSOR_HIDDEN 是否变化，始终重新关联光标——
-    // 若上次运行崩溃在跨屏期间，CGAssociateMouseAndMouseCursorPosition 可能
-    // 残留在 disconnected 状态（WindowServer 进程级设置），导致鼠标无法移动。
-    ensure_cursor_reassociated();
+    // 兼容从旧版本升级：旧进程若在断开光标关联时异常退出，首次启动时恢复一次。
+    if !CURSOR_STARTUP_REASSOCIATED.swap(true, Ordering::SeqCst) {
+        allow_background_cursor_control();
+        let _ = unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+    }
     if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
         allow_background_cursor_control(); // show 同样要求前台，先开后台权限
         unsafe {
@@ -350,79 +261,137 @@ impl InputCapturer {
 
 /// 捕获线程主体：创建 tap → 加入 runloop → 泵事件。
 fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
-    let hid_click_tx = tx.clone();
+    let hid_tx = tx.clone();
     // SAFETY：两个 tap 及其回调都只安装在当前捕获线程的 runloop，且在
     // CFRunLoop::run_current 返回前始终存活。
-    let hid_click_tap = match unsafe {
+    let hid_tap = match unsafe {
         CGEventTap::new_unchecked(
-            // 点击必须在进入 WindowServer 前截获。只把按下/松开移到 HID 层，现有
-            // Session 移动、虚拟坐标和惯性滚动逻辑保持不变。
+            // 移动、点击和键盘在进入 WindowServer 前截获；滚动留给 Session tap，
+            // 以覆盖 WindowServer 合成的惯性段。
             CGEventTapLocation::HID,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::Default,
             vec![
+                CGEventType::MouseMoved,
+                CGEventType::LeftMouseDragged,
+                CGEventType::RightMouseDragged,
+                CGEventType::OtherMouseDragged,
                 CGEventType::LeftMouseDown,
                 CGEventType::LeftMouseUp,
                 CGEventType::RightMouseDown,
                 CGEventType::RightMouseUp,
                 CGEventType::OtherMouseDown,
                 CGEventType::OtherMouseUp,
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
             ],
             move |_proxy, event_type, event| {
-            if matches!(
-                event_type,
-                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-            ) {
-                let tap_ptr =
-                    HID_CLICK_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
-                if !tap_ptr.is_null() {
-                    unsafe { CGEventTapEnable(tap_ptr, true) };
+                if matches!(
+                    event_type,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ) {
+                    let tap_ptr = HID_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
+                    if !tap_ptr.is_null() {
+                        unsafe { CGEventTapEnable(tap_ptr, true) };
+                    }
+                    log::warn!(
+                        "[MAC-TAP] HID tap 被系统禁用，已自动重新启用: {event_type:?}"
+                    );
+                    return CallbackResult::Drop;
                 }
-                log::warn!(
-                    "[MAC-TAP] HID 点击 tap 被系统禁用，已自动重新启用: {event_type:?}"
+
+                let is_move = matches!(
+                    event_type,
+                    CGEventType::MouseMoved
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::RightMouseDragged
+                        | CGEventType::OtherMouseDragged
                 );
-                return CallbackResult::Drop;
-            }
+                let blocked = BLOCK_LOCAL_INPUT.load(Ordering::SeqCst);
+                let sink = SINK_ACTIVE.load(Ordering::SeqCst);
+                let marked = event
+                    .get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                    == RUISS_EVENT_MARKER;
 
-            // 对端注入到 Mac 的点击必须放行，且不能再次转发形成回环。
-            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                == RUISS_EVENT_MARKER
-            {
-                return CallbackResult::Keep;
-            }
-
-            let blocked = BLOCK_LOCAL_INPUT.load(Ordering::SeqCst);
-            let sink = SINK_ACTIVE.load(Ordering::SeqCst);
-            if blocked {
-                // Source：物理点击只转发到对端，并在进入 WindowServer 前移除。
-                if let Some(payload) = event_to_payload(event_type, event) {
-                    let _ = hid_click_tx.send(payload);
+                if marked {
+                    // Sink 必须放行对端注入；Source 只允许入口/返回 warp 的移动通过。
+                    return if blocked && !is_move {
+                        CallbackResult::Drop
+                    } else {
+                        CallbackResult::Keep
+                    };
                 }
-                return CallbackResult::Drop;
-            }
-            if sink {
-                // Sink：光标归对端控制，本机物理点击不能作用于任何一端。
-                return CallbackResult::Drop;
-            }
 
-            // 未跨屏时不在 HID 层发送；放到原 Session tap 统一捕获一次。
+                if sink && is_move {
+                    // Sink 本机鼠标不移动系统指针，但保留虚拟绝对位置用于本机夺回。
+                    let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                    let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                    let (vx, vy) = {
+                        let mut pos = match LOCAL_VIRTUAL_POS.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        let (x, y) = (*pos).unwrap_or_else(|| {
+                            let loc = event.location();
+                            (loc.x, loc.y)
+                        });
+                        let next = (x + dx, y + dy);
+                        *pos = Some(next);
+                        next
+                    };
+                    let (w, h) = screen_size();
+                    let _ = hid_tx.send(Payload::MouseMove {
+                        x: vx as i32,
+                        y: vy as i32,
+                        src_w: w as u32,
+                        src_h: h as u32,
+                    });
+                    return CallbackResult::Drop;
+                }
+
+                if blocked && is_move {
+                    // Source 直接转发 HID 相对 delta；不再虚构绝对坐标或逐帧 warp。
+                    let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as i32;
+                    let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as i32;
+                    if dx != 0 || dy != 0 {
+                        let _ = hid_tx.send(Payload::MouseMoveRelative { dx, dy });
+                    }
+                    return CallbackResult::Drop;
+                }
+
+                if blocked {
+                    // Source 的点击/键盘只发给对端。
+                    if let Some(payload) = event_to_payload(event_type, event) {
+                        let _ = hid_tx.send(payload);
+                    }
+                    return CallbackResult::Drop;
+                }
+                if sink {
+                    // Sink 的本机点击/键盘不作用于任何一端。
+                    return CallbackResult::Drop;
+                }
+
+                // 正常状态只有移动在 HID 层发送；点击/键盘交给 Session fallback，
+                // 防止同一个事件被发送两次。
+                if is_move {
+                    if let Some(payload) = event_to_payload(event_type, event) {
+                        let _ = hid_tx.send(payload);
+                    }
+                }
                 CallbackResult::Keep
             },
         )
     } {
         Ok(t) => t,
         Err(_) => {
-            log::error!("HID 点击 CGEventTap 创建失败");
-            let _ = ready.send(Err(anyhow!("HID 点击 CGEventTap 创建失败")));
+            log::error!("HID CGEventTap 创建失败");
+            let _ = ready.send(Err(anyhow!("HID CGEventTap 创建失败")));
             return;
         }
     };
 
     let event_types = vec![
-        CGEventType::MouseMoved,
-        CGEventType::LeftMouseDragged,
-        CGEventType::RightMouseDragged,
-        CGEventType::OtherMouseDragged,
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
         CGEventType::RightMouseDown,
@@ -464,100 +433,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
             let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
             if marker == RUISS_EVENT_MARKER {
-                return CallbackResult::Keep;
-            }
-            // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
-            // 但相对位移 delta 累积成虚拟位置发送给仲裁器——本机鼠标推到
-            // 出口边即可反向夺回控制权（自由切换）。
-            if SINK_ACTIVE.load(Ordering::Relaxed)
-                && matches!(event_type, CGEventType::MouseMoved)
-            {
-                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                let (vx, vy) = {
-                    let mut g = match LOCAL_VIRTUAL_POS.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    match *g {
-                        Some((x, y)) => {
-                            let nx = x + dx;
-                            let ny = y + dy;
-                            *g = Some((nx, ny));
-                            (nx, ny)
-                        }
-                        None => {
-                            // 首次移动：以当前光标位置（对端注入位置）为起点
-                            let loc = event.location();
-                            *g = Some((loc.x, loc.y));
-                            (loc.x, loc.y)
-                        }
-                    }
+                // Source 不应接收远程按键/滚动；即便合成事件意外继承 marker，也不能
+                // 绕过本机隔离。Sink 上的对端注入则必须放行。
+                return if BLOCK_LOCAL_INPUT.load(Ordering::SeqCst) {
+                    CallbackResult::Drop
+                } else {
+                    CallbackResult::Keep
                 };
-                let (w, h) = screen_size();
-                let _ = tx.send(Payload::MouseMove {
-                    x: vx as i32,
-                    y: vy as i32,
-                    src_w: w as u32,
-                    src_h: h as u32,
-                });
-                // 吞掉真实事件：光标不跟随本机鼠标（防双鼠标）
-                return CallbackResult::Drop;
-            }
-            // Source 跨屏（出本机）：本机 MouseMoved/Dragged 吞掉——光标冻结在
-            // 跨屏安全位（warp_cursor_cross 的落点），不跟物理鼠标滑向 Dock/菜单栏
-            // 热区（否则 win 光标到任务栏时 mac 隐藏光标也到 Dock 热区 → macOS 强制
-            // 重显光标 + Dock 悬停动画只看位置必触发）。转发用虚拟位置（delta 累积，
-            // 见 SOURCE_VIRTUAL_POS：吞事件后 location 停在冻结位，不累积会转发不动）。
-            if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
-                && matches!(
-                    event_type,
-                    CGEventType::MouseMoved
-                        | CGEventType::LeftMouseDragged
-                        | CGEventType::RightMouseDragged
-                        | CGEventType::OtherMouseDragged
-                )
-            {
-                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
-                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                let (vx, vy) = {
-                    let mut g = match SOURCE_VIRTUAL_POS.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    match *g {
-                        Some((x, y)) => {
-                            let nx = x + dx;
-                            let ny = y + dy;
-                            *g = Some((nx, ny));
-                            (nx, ny)
-                        }
-                        None => {
-                            // 兜底：正常路径先有跨屏 warp 播种（warp 先于 blocked=true
-                            // 执行），这里几乎不会走到；用事件位置兜底保证转发不断。
-                            let loc = event.location();
-                            *g = Some((loc.x, loc.y));
-                            (loc.x, loc.y)
-                        }
-                    }
-                };
-                let (w, h) = screen_size();
-                // Session tap 位于 WindowServer 更新光标之后；吞事件只能阻止应用接收，
-                // 不能保证撤销已经发生的系统光标位移。立即拉回跨屏安全点，避免物理
-                // 指针跟着 Windows 坐标进入 Mac 的 Dock/应用热区并触发 hover。
-                park_source_cursor();
-                log::debug!(
-                    "[MAC-MOVE] 跨屏吞本机移动 → 转发虚拟位置 ({}, {})",
-                    vx as i32,
-                    vy as i32
-                );
-                let _ = tx.send(Payload::MouseMove {
-                    x: vx as i32,
-                    y: vy as i32,
-                    src_w: w as u32,
-                    src_h: h as u32,
-                });
-                return CallbackResult::Drop;
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p);
@@ -600,42 +482,41 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
 
     // 两个 tap 通过 mach_port 创建 runloop source 并加入同一个捕获线程 runloop。
     let runloop = CFRunLoop::get_current();
-    let hid_click_loop_source = hid_click_tap
+    let hid_loop_source = hid_tap
         .mach_port()
         .create_runloop_source(0)
-        .expect("HID click create_runloop_source 失败");
+        .expect("HID create_runloop_source 失败");
     let loop_source = tap
         .mach_port()
         .create_runloop_source(0)
         .expect("create_runloop_source 失败");
     // kCFRunLoopCommonModes 是 extern static，读取需 unsafe
     unsafe {
-        runloop.add_source(&hid_click_loop_source, kCFRunLoopCommonModes);
+        runloop.add_source(&hid_loop_source, kCFRunLoopCommonModes);
         runloop.add_source(&loop_source, kCFRunLoopCommonModes);
     }
-    HID_CLICK_TAP_PORT_PTR.store(
-        hid_click_tap.mach_port().as_concrete_TypeRef() as usize,
+    HID_TAP_PORT_PTR.store(
+        hid_tap.mach_port().as_concrete_TypeRef() as usize,
         Ordering::SeqCst,
     );
     SESSION_TAP_PORT_PTR.store(
         tap.mach_port().as_concrete_TypeRef() as usize,
         Ordering::SeqCst,
     );
-    hid_click_tap.enable();
+    hid_tap.enable();
     tap.enable();
     RUNLOOP_PTR.store(runloop.as_concrete_TypeRef() as usize, Ordering::Relaxed);
 
     let _ = ready.send(Ok(()));
     log::info!(
-        "[MAC-TAP] CGEventTap 已启动 click=HID other=Session marker={RUISS_EVENT_MARKER:#x}"
+        "[MAC-TAP] CGEventTap 已启动 input=HID scroll/fallback=Session marker={RUISS_EVENT_MARKER:#x}"
     );
     CFRunLoop::run_current();
 
     // runloop 退出：清理
-    HID_CLICK_TAP_PORT_PTR.store(0, Ordering::SeqCst);
+    HID_TAP_PORT_PTR.store(0, Ordering::SeqCst);
     SESSION_TAP_PORT_PTR.store(0, Ordering::SeqCst);
     RUNLOOP_PTR.store(0, Ordering::Relaxed);
-    HOOK_SENDER.with(|s| *s.borrow_mut() = None);
     log::info!("事件 tap 线程已退出");
 }
 
@@ -768,6 +649,35 @@ impl InputInjector {
                 };
                 CGEvent::new_mouse_event(source, ty, CGPoint::new(*x as f64, *y as f64), btn)
             }
+            Payload::MouseMoveRelative { dx, dy } => {
+                let (w, h) = screen_size();
+                let (x, y) = {
+                    let mut pos = match LAST_POS.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let (x, y) = (*pos).unwrap_or((0.0, 0.0));
+                    let next = (
+                        (x + *dx as f64).clamp(0.0, (w - 1).max(0) as f64),
+                        (y + *dy as f64).clamp(0.0, (h - 1).max(0) as f64),
+                    );
+                    *pos = Some(next);
+                    next
+                };
+                let held = HELD_BUTTON.load(Ordering::Relaxed);
+                let ty = match held {
+                    0 => CGEventType::LeftMouseDragged,
+                    1 => CGEventType::RightMouseDragged,
+                    2 => CGEventType::OtherMouseDragged,
+                    _ => CGEventType::MouseMoved,
+                };
+                let btn = match held {
+                    1 => CGMouseButton::Right,
+                    2 => CGMouseButton::Center,
+                    _ => CGMouseButton::Left,
+                };
+                CGEvent::new_mouse_event(source, ty, CGPoint::new(x, y), btn)
+            }
             Payload::MouseButton { button, down } => {
                 // 记录当前按住的按钮：拖动期间的移动要注入为 *Dragged 类型
                 // （up 后清空；macOS 拖选依赖这个状态还原事件类型）
@@ -860,7 +770,7 @@ pub fn screen_size() -> (i32, i32) {
     }
 }
 
-/// 光标跳转（跨屏回绕用）：注入移动事件代替 CGWarpMouseCursorPosition。
+/// 光标跳转（跨屏入口/返回定位用）。
 pub fn warp_cursor(x: i32, y: i32) {
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
         if let Ok(ev) = CGEvent::new_mouse_event(
@@ -877,24 +787,15 @@ pub fn warp_cursor(x: i32, y: i32) {
 
 /// 跨屏触发时的光标回绕（Action::Warp 专用）：与 warp_cursor 相同，但落点
 /// y 避开屏幕底部 Dock / 顶部菜单栏热区——隐藏光标停进热区会被 macOS 强制重显
-/// 并触发悬停动画；同时把【原始坐标】（对端入口同 y，镜像不断）播种为 Source
-/// 虚拟位置种子（tap 吞掉本机移动后靠它累积转发）。
-/// 注意：必须先于 TakeControl（blocked=true）执行——execute_action 按 Action
-/// 顺序执行，仲裁器把 Warp 排在 TakeControl 前（见 arbiter.check_dwell）。
-/// 返回路径（ReleaseControl / Sink 侧）用普通 warp_cursor，不做热区限制。
+/// 并触发悬停动画。后续移动直接走 HID 相对 delta，不再维护 Source 虚拟坐标，
+/// 也不再逐帧把系统指针 warp 回来。
 pub fn warp_cursor_cross(x: i32, y: i32) {
-    if let Ok(mut g) = SOURCE_VIRTUAL_POS.lock() {
-        *g = Some((x as f64, y as f64));
-    }
     let (_, h) = screen_size();
     let ty = if h > MENUBAR_HOT_ZONE + DOCK_HOT_ZONE + 1 {
         y.clamp(MENUBAR_HOT_ZONE, h - 1 - DOCK_HOT_ZONE)
     } else {
         y
     };
-    if let Ok(mut g) = SOURCE_SAFE_POS.lock() {
-        *g = Some((x as f64, ty as f64));
-    }
     warp_cursor(x, ty);
 }
 

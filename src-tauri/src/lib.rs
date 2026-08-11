@@ -229,12 +229,12 @@ fn start_capturer(
     .map_err(|e| e.to_string())
 }
 
-/// 空闲心跳：每 100ms 推进仲裁器停留判定（光标停在边缘不动时也能触发）。
+/// 空闲心跳：每 25ms 推进仲裁器停留判定（光标停在边缘不动时也能触发）。
 /// Source 侧：发起跨屏；Sink 侧：注入光标停在入口边 → 返回；断线时复位。
 fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
             let actions = {
                 let mut r = match router.lock() {
                     Ok(g) => g,
@@ -244,7 +244,7 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                 let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
                 if let Some(a) = r.arbiter.as_mut() {
                     let (w, h) = platform::screen_size();
-                    // 主动补藏：Source 跨屏期间每 100ms 压一次光标隐藏。
+                    // 主动补藏：Source 跨屏期间每 25ms 确认一次光标隐藏。
                     // 对抗 tao ShowCursor(TRUE) / macOS 移动自动重显，
                     // 停手不动时也持续压制（不依赖移动事件）。
                     if a.linked {
@@ -346,8 +346,8 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
         }
         Action::Warp { x, y } => {
             log::debug!("光标回绕 → ({x}, {y})");
-            // 跨屏专用回绕：Mac 端落点避开 Dock/菜单栏热区并播种 Source 虚拟位置
-            // （详见 mac.rs warp_cursor_cross）；Win 端与 warp_cursor 等价。
+            // 跨屏专用回绕：Mac 端落点避开 Dock/菜单栏热区；
+            // Win 端与 warp_cursor 等价。
             platform::warp_cursor_cross(x, y);
         }
         Action::Forward(payload) => match payload {
@@ -355,6 +355,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 let (w, h) = platform::screen_size();
                 net.send_move(x, y, w as u32, h as u32)
             }
+            Payload::MouseMoveRelative { dx, dy } => net.send_move_relative(dx, dy),
             other => net.send(Message::event(&name, other)),
         },
         Action::None => {}
@@ -473,7 +474,30 @@ async fn run_incoming_router(
                         }
                         p => p.clone(),
                     };
+                    let is_move = matches!(
+                        &mapped,
+                        Payload::MouseMove { .. } | Payload::MouseMoveRelative { .. }
+                    );
                     injector.inject(mapped);
+                    if is_move {
+                        let return_actions = {
+                            let pos = platform::last_injected_pos();
+                            let (w, h) = platform::screen_size();
+                            let mut r = match router.lock() {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
+                            match (r.arbiter.as_mut(), pos) {
+                                (Some(a), Some((x, y))) => {
+                                    a.on_sink_cursor_event(x, y, w, h, Instant::now())
+                                }
+                                _ => Vec::new(),
+                            }
+                        };
+                        for action in return_actions {
+                            execute_action(&router, action);
+                        }
+                    }
                 } else {
                     log::debug!("忽略对端事件（本机 Source）: {:?}", msg.payload);
                 }
