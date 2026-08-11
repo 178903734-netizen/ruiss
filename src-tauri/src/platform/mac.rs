@@ -135,8 +135,49 @@ static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 时调一次 CGDisplayShowCursor，严格配对一次，绝不叠加（CG 系列内部也有计数语义）。
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+/// 光标是否已从物理输入设备断开（幂等标志）。跨屏期间调用
+/// CGAssociateMouseAndMouseCursorPosition(false) 防止 WindowServer 根据触控板
+/// delta 更新光标位置 —— Session 层 tap 无法阻止光标移动（WindowServer 在 tap
+/// 之前已更新位置），物理断开是唯一可靠方案。断开后 CGEventPost 注入仍可移动
+/// 光标，不影响对端注入/本机 warp。
+static CURSOR_DISASSOCIATED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_cursor_disassociated() {
+    if !CURSOR_DISASSOCIATED.swap(true, Ordering::SeqCst) {
+        allow_background_cursor_control();
+        unsafe {
+            let err = CGAssociateMouseAndMouseCursorPosition(0);
+            log::info!("[MAC-CURSOR] CGAssociateMouseAndMouseCursorPosition(false) err={err}");
+        }
+    }
+}
+
+fn ensure_cursor_reassociated() {
+    if CURSOR_DISASSOCIATED.swap(false, Ordering::SeqCst) {
+        allow_background_cursor_control();
+        unsafe {
+            let err = CGAssociateMouseAndMouseCursorPosition(1);
+            log::info!("[MAC-CURSOR] CGAssociateMouseAndMouseCursorPosition(true) err={err}");
+        }
+    }
+}
+
+/// 根据当前 blocked/sink 状态同步光标关联。任一为 true 即断开物理输入，
+/// 两者皆 false 则重新关联。
+fn update_cursor_association() {
+    let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
+    let sink = SINK_ACTIVE.load(Ordering::Relaxed);
+    if blocked || sink {
+        ensure_cursor_disassociated();
+    } else {
+        ensure_cursor_reassociated();
+    }
+}
+
 pub fn set_local_input_blocked(blocked: bool) {
     let was = BLOCK_LOCAL_INPUT.swap(blocked, Ordering::Relaxed);
+    // 先同步光标关联状态（物理断开/重连），再处理光标 warp
+    update_cursor_association();
     if !blocked && was {
         // 跨屏结束（Source 返回本机）：把冻结在安全位的光标送回最后转发的
         // 虚拟位置（= 用户手所在处），否则释放后光标从冻结位重新出现。
@@ -155,10 +196,13 @@ pub fn set_local_input_blocked(blocked: bool) {
 /// delta 累积成虚拟位置——推到出口边即可反向夺回控制权（自由切换）。
 static LOCAL_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
-/// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMoved（防双鼠标）。
+/// 设置本机是否为被控端（Sink）。被控期间吞掉本机 MouseMoved（防双鼠标），
+/// 并物理断开触控板与光标关联（防 WindowServer 移动光标到 Dock 热区）。
 pub fn set_sink_active(active: bool) {
-    SINK_ACTIVE.store(active, Ordering::Relaxed);
-    if active {
+    let was = SINK_ACTIVE.swap(active, Ordering::Relaxed);
+    // 先同步光标关联状态（物理断开/重连）
+    update_cursor_association();
+    if active && !was {
         // 新一輪被控：虚拟位置清空，等待首次移动用当前光标位置初始化
         if let Ok(mut g) = LOCAL_VIRTUAL_POS.lock() {
             *g = None;
@@ -207,13 +251,17 @@ pub fn hide_cursor() {
 
 /// 恢复显示本机光标（幂等：仅 true→false 时调一次 CGDisplayShowCursor，
 /// 与 hide_cursor 严格配对一次）。
+/// 同时强制重新关联光标与物理输入（兜底：上次崩溃可能残留 disassociated 状态）。
 pub fn show_cursor() {
+    // 启动兜底：无论 CURSOR_HIDDEN 是否变化，始终重新关联光标——
+    // 若上次运行崩溃在跨屏期间，CGAssociateMouseAndMouseCursorPosition 可能
+    // 残留在 disconnected 状态（WindowServer 进程级设置），导致鼠标无法移动。
+    ensure_cursor_reassociated();
     if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
         allow_background_cursor_control(); // show 同样要求前台，先开后台权限
         unsafe {
             let disp = CGMainDisplayID();
             let err = CGDisplayShowCursor(disp);
-            let _ = CGAssociateMouseAndMouseCursorPosition(1);
             log::info!("[MAC-CURSOR] show_cursor: CGDisplayShowCursor err={err}");
         }
     }
@@ -404,6 +452,11 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     }
                 };
                 let (w, h) = screen_size();
+                log::debug!(
+                    "[MAC-MOVE] 跨屏吞本机移动 → 转发虚拟位置 ({}, {})",
+                    vx as i32,
+                    vy as i32
+                );
                 let _ = tx.send(Payload::MouseMove {
                     x: vx as i32,
                     y: vy as i32,
@@ -414,18 +467,27 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
-                // CGDisplayHideCursor 系统级、鼠标移动不重显，无需"移动补藏"。
-                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）。
+                // 跨屏期间（主控或被控都算）：键盘/点击吞掉（只转发对端，本机不生效）。
                 // 移动已在上面两个分支分别处理（Source 冻结 / Sink 防双鼠标）。
-                // 注意：不用光标隐藏状态兜底——若 show_cursor 未配对执行会卡 true 导致
-                // 空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
                 let sink = SINK_ACTIVE.load(Ordering::Relaxed);
+                // 滚轮：防御深度——不靠 return None（Session 层未必能完全拦截
+                // momentum 惯性滚动），而是把 delta 清零后放行。对端已收到原始
+                // delta（上面 tx.send），本机应用收到零 delta → 不滚动。
+                if (blocked || sink) && matches!(p, Payload::MouseWheel { .. }) {
+                    // 清零行级增量（整数，绝大多数应用据此决定滚动量）
+                    event.set_integer_value_field(
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                        0,
+                    );
+                    event.set_integer_value_field(
+                        EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                        0,
+                    );
+                    return Some(event.clone());
+                }
                 if (blocked || sink)
-                    && matches!(
-                        p,
-                        Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
-                    )
+                    && matches!(p, Payload::Key { .. } | Payload::MouseButton { .. })
                 {
                     return None;
                 }

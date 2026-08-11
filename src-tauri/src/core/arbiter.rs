@@ -80,6 +80,11 @@ pub struct Arbiter {
     sink_dwell: Option<Instant>,
     /// Sink 侧：最近一次注入位置（位置变化即重置停留计时）
     last_injected: Option<(i32, i32)>,
+    /// Sink 侧：注入光标是否曾离开入口带。防止"刚被接管时注入光标就落在
+    /// 入口边（=自己的出口边）"被误判为想返回——mac→win 跨屏"发起即归还"
+    /// 根因（2026-08-11 实测：注入光标 150ms 未动就触发自动返回）。只有
+    /// 离开过入口带（=确实在对端操作过）之后再停回入口边，才算"想返回"。
+    sink_was_away: bool,
     /// 最近一次跨屏触发时间（Take/Release 防抖）
     last_trigger: Option<Instant>,
     /// 最近一次跨屏出口位置（返回时 warp 回出口边用）
@@ -101,6 +106,7 @@ impl Arbiter {
             last: None,
             sink_dwell: None,
             last_injected: None,
+            sink_was_away: false,
             last_trigger: None,
             exit_pos: None,
         }
@@ -190,7 +196,7 @@ impl Arbiter {
         };
         let at_entry = geometry::hit_edge(x, y, w, h, RETURN_MARGIN) == self.exit_edge;
 
-        // 注入位置变化超过抖动容差 → 重置停留计时
+        // 注入位置变化超过抖动容差 → 移动
         // （触控板停手后仍有惯性/微移，坐标变化 ≤ JITTER_TOLERANCE 视为停住）
         let moved = match self.last_injected {
             Some((px, py)) => {
@@ -200,11 +206,17 @@ impl Arbiter {
         };
         if moved {
             self.last_injected = Some((x, y));
-            self.sink_dwell = if at_entry { Some(now) } else { None };
+            // 只要离开过入口带，之后停回入口边才允许判返回
+            if !at_entry {
+                self.sink_was_away = true;
+            }
+            self.sink_dwell = None;
             return Vec::new();
         }
-        // 位置未变且停在入口边够久 → 返回（防抖窗口内不重复触发）
-        if at_entry {
+        // 位置未变：仅当【离开过入口带之后】停在入口边够久才返回。
+        // 刚被接管时注入光标就落在入口边（=自己的出口边），若停着不动就归还，
+        // mac→win 会"发起跨屏即被归还"（2026-08-11 实测）。
+        if at_entry && self.sink_was_away {
             if let Some(start) = self.sink_dwell {
                 if now.duration_since(start) >= DWELL {
                     let cooled = self
@@ -214,12 +226,18 @@ impl Arbiter {
                         self.last_trigger = Some(now);
                         self.sink_dwell = None;
                         self.last_injected = None;
+                        self.sink_was_away = false;
                         self.mode = Mode::Source;
                         self.linked = false;
                         return vec![Action::ReleaseControl];
                     }
                 }
+            } else {
+                // 离开过入口带后第一次停回入口边：开始停留计时
+                self.sink_dwell = Some(now);
             }
+        } else {
+            self.sink_dwell = None;
         }
         Vec::new()
     }
@@ -229,6 +247,8 @@ impl Arbiter {
     pub fn on_peer_take(&mut self, x: i32, y: i32) -> Option<(i32, i32)> {
         self.mode = Mode::Sink;
         self.linked = false;
+        // 新一轮被控：入口带内暂不判返回（需先离开过入口带）
+        self.sink_was_away = false;
         Some((x, y))
     }
 
@@ -365,15 +385,30 @@ mod tests {
     }
 
     #[test]
-    fn sink_side_return_at_entry_edge() {
-        // Sink 侧：注入光标停在入口边（= 自己的出口边）150ms → ReleaseControl 返回
+    fn sink_side_no_return_right_after_takeover() {
+        // 刚被接管：注入光标落在入口边（PeerRight 入口=右边缘=自己的出口边）。
+        // 不得触发返回——否则 mac→win 跨屏"发起即归还"（2026-08-11 实测）。
         let mut a = Arbiter::new(Layout::PeerRight);
-        a.on_peer_take(ENTRY_X, 100);
+        a.on_peer_take(W - 1, 100);
         assert_eq!(a.mode, Mode::Sink);
-        // 注入位置在入口边（PeerRight：入口=左边缘 x=0）
-        assert!(a.on_sink_tick(Some((0, 100)), W, H, t(0)).is_empty()); // 首次记录
-        assert!(a.on_sink_tick(Some((0, 100)), W, H, t(100)).is_empty()); // 未到 150ms
-        let acts = a.on_sink_tick(Some((0, 100)), W, H, t(160));
+        // 停 300ms 也不返回（没离开过入口带）
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(0)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(160)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(320)).is_empty());
+        assert_eq!(a.mode, Mode::Sink);
+    }
+
+    #[test]
+    fn sink_side_return_after_leaving_entry_zone() {
+        // 只有离开过入口带（=确实在对端操作过）之后再停回入口边 150ms 才返回
+        let mut a = Arbiter::new(Layout::PeerRight);
+        a.on_peer_take(W - 1, 100);
+        // 在对端操作：光标离开入口带
+        assert!(a.on_sink_tick(Some((500, 300)), W, H, t(400)).is_empty());
+        // 回到入口边停住 → 150ms 后返回
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(500)).is_empty()); // 回到入口边
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(600)).is_empty()); // 开始计时
+        let acts = a.on_sink_tick(Some((W - 1, 100)), W, H, t(760));
         assert_eq!(acts, vec![Action::ReleaseControl]);
         assert_eq!(a.mode, Mode::Source);
         assert!(!a.linked);
@@ -381,14 +416,18 @@ mod tests {
 
     #[test]
     fn sink_side_no_return_while_moving() {
-        // 注入位置在动（用户还在操作）→ 不返回
+        // 注入位置在动（用户还在操作）→ 不返回；离开入口带前停住也不返回
         let mut a = Arbiter::new(Layout::PeerRight);
-        a.on_peer_take(ENTRY_X, 100);
-        assert!(a.on_sink_tick(Some((0, 100)), W, H, t(0)).is_empty());
-        assert!(a.on_sink_tick(Some((0, 101)), W, H, t(100)).is_empty()); // 位置变 → 重置
-        assert!(a.on_sink_tick(Some((0, 102)), W, H, t(200)).is_empty());
-        assert!(a.on_sink_tick(Some((0, 102)), W, H, t(300)).is_empty()); // 又停住
-        let acts = a.on_sink_tick(Some((0, 102)), W, H, t(360));
+        a.on_peer_take(W - 1, 100);
+        assert!(a.on_sink_tick(Some((W - 1, 100)), W, H, t(0)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 105)), W, H, t(100)).is_empty()); // 位置变 → 重置
+        assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(200)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(300)).is_empty()); // 又停住但没离开入口带
+        assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(460)).is_empty()); // 不返回
+        // 离开入口带后回来 → 返回
+        assert!(a.on_sink_tick(Some((300, 200)), W, H, t(500)).is_empty());
+        assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(600)).is_empty());
+        let acts = a.on_sink_tick(Some((W - 1, 110)), W, H, t(760));
         assert_eq!(acts, vec![Action::ReleaseControl]);
     }
 
@@ -397,11 +436,13 @@ mod tests {
         // PeerLeft 侧（Mac 场景）：返回后光标还停在出口边（左边缘），
         // 冷却期内不重复跨屏
         let mut a = Arbiter::new(Layout::PeerLeft);
-        a.on_peer_take(W - 1, 100); // 对端从 Mac 右边缘入口接管
+        a.on_peer_take(W - 1, 100); // 对端从右边缘入口接管（PeerLeft 入口=右边缘）
         assert_eq!(a.mode, Mode::Sink);
-        // 注入光标滑到 Mac 左边缘（=Mac 出口边）停住 → 返回
-        a.on_sink_tick(Some((0, 100)), W, H, t(0));
-        let acts = a.on_sink_tick(Some((0, 100)), W, H, t(160));
+        // 注入光标先离开入口带，再停回左边缘（=出口边）→ 返回
+        assert!(a.on_sink_tick(Some((500, 100)), W, H, t(100)).is_empty());
+        assert!(a.on_sink_tick(Some((0, 100)), W, H, t(200)).is_empty()); // 回到出口边
+        assert!(a.on_sink_tick(Some((0, 100)), W, H, t(300)).is_empty()); // 未到 150ms
+        let acts = a.on_sink_tick(Some((0, 100)), W, H, t(460));
         assert_eq!(acts, vec![Action::ReleaseControl]);
         assert_eq!(a.mode, Mode::Source);
         // 返回后光标还在左边缘（=出口边）：Source 侧 dwell 重新计时 → 冷却挡住
