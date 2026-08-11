@@ -266,7 +266,11 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventType::FlagsChanged,
     ];
     let tap = match CGEventTap::new(
-        CGEventTapLocation::HID,
+        // 实验：HID → Session。HID 层拦不住 momentum 惯性滚动（实测：return None
+        // 后 Mac 应用照样收到惯性滚动，引擎在 WindowServer 内部独立派发）。
+        // Session 层是 WindowServer 对外派发层，momentum 派发给应用前必须经过，
+        // 这里 return None 理论上能真正拦住。若实测无效再回退 HID。
+        CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         event_types,
