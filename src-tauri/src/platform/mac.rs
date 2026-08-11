@@ -4,8 +4,9 @@
 //       未授权时 CGEventTap 收不到任何事件。权限检查用 AXIsProcessTrusted()。
 //
 // 防回环（与 Windows 的 LLKHF_INJECTED 对应）：注入事件的事件源进程 ID
-// 为本进程（非 0），真实硬件事件的进程 ID 为 0 —— 按 pid 过滤注入事件，
-// 本机回环不互相循环，对端（Windows）注入到本机的事件也不会再转发。
+// 为本进程 pid，真实硬件事件为 0，WindowServer 合成事件（惯性滚动）为
+// WindowServer/其他 —— 按 `pid == 本进程 pid` 只放行自有注入，本机回环
+// 不互相循环，对端（Windows）注入到本机的事件也不会再转发。
 //
 // 注意：本文件无法在 Windows 上编译验证；API 以 core-graphics 0.24 为准，
 // 如编译报错请把错误信息发回迭代。
@@ -14,7 +15,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -105,16 +106,29 @@ pub fn accessibility_trusted() -> bool {
 /// 捕获线程 runloop 指针（stop 时通知退出）。
 static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 
+/// 本进程 pid（tap 防回环判断用；OnceLock 避免每事件调 getpid）。
+static OWN_PID: OnceLock<i64> = OnceLock::new();
+
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
+
+/// Dock 热区高度（屏幕底部，逻辑像素）：隐藏光标不能停在里面——macOS 在
+/// Dock/菜单栏等系统 UI 区域不约束 CGDisplayHideCursor（光标会被强制重显），
+/// 且 Dock 悬停放大动画只看光标位置、不检查可见性，进热区必触发。
+const DOCK_HOT_ZONE: i32 = 20;
+/// 菜单栏高度（屏幕顶部，逻辑像素）：同上，隐藏光标不能停在里面。
+const MENUBAR_HOT_ZONE: i32 = 25;
+
+/// Source 跨屏（出本机）期间：本机鼠标移动的虚拟位置（由相对位移 delta 累积）。
+/// 跨屏时本机 MouseMoved/Dragged 被吞掉（光标冻结在安全位，不滑向 Dock/菜单栏
+/// 热区），转发用这个虚拟位置维持"1:1 镜像"——吞事件后系统光标不再推进，
+/// 触控板相对位移的 location 会停在冻结位，必须用 delta 累积补上转发坐标。
+/// 种子 = 跨屏 warp 落点的原始坐标（对端入口同 y，镜像不断）。
+static SOURCE_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMoved——光标只跟对端注入走，
 /// 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
 static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// 跨屏期间是否应保持光标隐藏（Source 跨屏时 true）。
-/// 仅作状态标记（tap 回调判断/日志用）；实际隐藏由 CURSOR_HIDDEN 幂等驱动。
-static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
 
 /// 光标是否已实际隐藏（幂等标志，防 CGDisplayHideCursor/ShowCursor 重复调用失衡）。
 /// hide_cursor 在 false→true 时调一次 CGDisplayHideCursor；show_cursor 在 true→false
@@ -122,7 +136,18 @@ static CURSOR_SUPPRESS: AtomicBool = AtomicBool::new(false);
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
-    BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
+    let was = BLOCK_LOCAL_INPUT.swap(blocked, Ordering::Relaxed);
+    if !blocked && was {
+        // 跨屏结束（Source 返回本机）：把冻结在安全位的光标送回最后转发的
+        // 虚拟位置（= 用户手所在处），否则释放后光标从冻结位重新出现。
+        let restore = match SOURCE_VIRTUAL_POS.lock() {
+            Ok(g) => *g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some((x, y)) = restore {
+            warp_cursor(x as i32, y as i32);
+        }
+    }
 }
 
 /// 被控端（Sink）：本机鼠标的虚拟位置（由相对位移 delta 累积）。
@@ -167,7 +192,6 @@ pub fn last_injected_pos() -> Option<(i32, i32)> {
 /// 不会自动重显（无需"移动补藏"，与 Windows 的 SetSystemCursor 对称）。
 /// 幂等：仅在 false→true 时调一次 CGDisplayHideCursor，重复调用不叠加。
 pub fn hide_cursor() {
-    CURSOR_SUPPRESS.store(true, Ordering::SeqCst);
     // swap 返回旧值；原本未隐藏才真正调一次，避免计数叠加
     if !CURSOR_HIDDEN.swap(true, Ordering::SeqCst) {
         allow_background_cursor_control(); // 后台进程也能控光标（关键！不设则 hide 静默无效）
@@ -184,7 +208,6 @@ pub fn hide_cursor() {
 /// 恢复显示本机光标（幂等：仅 true→false 时调一次 CGDisplayShowCursor，
 /// 与 hide_cursor 严格配对一次）。
 pub fn show_cursor() {
-    CURSOR_SUPPRESS.store(false, Ordering::SeqCst);
     if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
         allow_background_cursor_control(); // show 同样要求前台，先开后台权限
         unsafe {
@@ -266,16 +289,43 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventType::FlagsChanged,
     ];
     let tap = match CGEventTap::new(
-        CGEventTapLocation::HID,
+        // 捕获层：Session（WindowServer 对外派发层），不用 HID。关键：触控板惯性
+        // 滚动（momentum 段）由 WindowServer 内部合成派发，HID 层 tap return None
+        // 拦不住（实测 Mac 应用照样滚，见 2026-08-11 实验 6618b71），只有 Session
+        // 层才能拦截——跨屏双滚根因就在这。
+        CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event| {
-            // 防回环：注入事件的来源进程 ID 非 0（真实硬件事件为 0）
+            // 防回环：仅【本进程自己注入】的事件直通放行（不转发、不吞）。
+            // 原判断 `pid != 0` 会把所有软件合成事件放行——WindowServer 合成的
+            // 惯性滚动（momentum）pid 非 0 也走直通 → 跨屏期间 mac 本地照滚。
+            // 改 `pid == 本进程 pid`（Synergy/InputLeap 同款：Session tap + 按
+            // source pid 识别自身注入），WindowServer 惯性滚动落回正常吞+转发。
+            let own_pid = *OWN_PID.get_or_init(|| std::process::id() as i64);
             let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
-            if pid != 0 {
-                // 本进程注入的事件（如 warp_cursor）。CGDisplayHideCursor 系统级、
-                // 鼠标移动不重显，注入移动不会再把光标拉回显示，无需补藏。
+            // ===== 滚动诊断（双机验证后可删）=====
+            // 跨屏期间（blocked 或 sink）滚动全量打日志：验证惯性滚动 momentum 段
+            // 是否进 Session tap、pid 是多少、是否被吞。预期：主动段 pid=0、惯性段
+            // pid=WindowServer（非 0 非本进程），都被吞掉只转发对端。
+            if matches!(event_type, CGEventType::ScrollWheel) {
+                let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
+                let sink = SINK_ACTIVE.load(Ordering::Relaxed);
+                if blocked || sink {
+                    let dx = event
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+                    let dy = event
+                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+                    log::info!(
+                        "[MAC-SCROLL-DIAG] pid={pid} dx={dx} dy={dy} blocked={blocked} sink={sink} tap=Session own_pid={own_pid}"
+                    );
+                }
+            }
+            if pid == own_pid {
+                // 本进程注入的事件（如 warp_cursor、对端注入转发）：放行，不转发、
+                // 不吞（防回环）。CGDisplayHideCursor 系统级、鼠标移动不重显，
+                // 注入移动不会再把光标拉回显示，无需补藏。
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -316,34 +366,68 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 // 吞掉真实事件：光标不跟随本机鼠标（防双鼠标）
                 return None;
             }
+            // Source 跨屏（出本机）：本机 MouseMoved/Dragged 吞掉——光标冻结在
+            // 跨屏安全位（warp_cursor_cross 的落点），不跟物理鼠标滑向 Dock/菜单栏
+            // 热区（否则 win 光标到任务栏时 mac 隐藏光标也到 Dock 热区 → macOS 强制
+            // 重显光标 + Dock 悬停动画只看位置必触发）。转发用虚拟位置（delta 累积，
+            // 见 SOURCE_VIRTUAL_POS：吞事件后 location 停在冻结位，不累积会转发不动）。
+            if BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                && matches!(
+                    event_type,
+                    CGEventType::MouseMoved
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::RightMouseDragged
+                        | CGEventType::OtherMouseDragged
+                )
+            {
+                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                let (vx, vy) = {
+                    let mut g = match SOURCE_VIRTUAL_POS.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    match *g {
+                        Some((x, y)) => {
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            *g = Some((nx, ny));
+                            (nx, ny)
+                        }
+                        None => {
+                            // 兜底：正常路径先有跨屏 warp 播种（warp 先于 blocked=true
+                            // 执行），这里几乎不会走到；用事件位置兜底保证转发不断。
+                            let loc = event.location();
+                            *g = Some((loc.x, loc.y));
+                            (loc.x, loc.y)
+                        }
+                    }
+                };
+                let (w, h) = screen_size();
+                let _ = tx.send(Payload::MouseMove {
+                    x: vx as i32,
+                    y: vy as i32,
+                    src_w: w as u32,
+                    src_h: h as u32,
+                });
+                return None;
+            }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p.clone());
                 // CGDisplayHideCursor 系统级、鼠标移动不重显，无需"移动补藏"。
-                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）；移动放行
-                // 注意：不用 CURSOR_SUPPRESS 兜底——它表示"光标隐藏中"，若 show_cursor 未配对执行
-                // 会卡 true 导致空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
+                // 跨屏期间（主控或被控都算）：键盘/点击/滚轮吞掉（只转发对端，本机不生效）。
+                // 移动已在上面两个分支分别处理（Source 冻结 / Sink 防双鼠标）。
+                // 注意：不用光标隐藏状态兜底——若 show_cursor 未配对执行会卡 true 导致
+                // 空闲状态也吞输入（右击/滚动全废）；BLOCK||SINK 已完整覆盖跨屏链路。
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
                 let sink = SINK_ACTIVE.load(Ordering::Relaxed);
-                let is_scroll = matches!(p, Payload::MouseWheel { .. });
-                if is_scroll {
-                    log::info!(
-                        "[MAC-SCROLL-DIAG] delta={p:?} blocked={blocked} sink={sink} suppress={}",
-                        CURSOR_SUPPRESS.load(Ordering::SeqCst),
-                    );
-                }
                 if (blocked || sink)
                     && matches!(
                         p,
                         Payload::Key { .. } | Payload::MouseButton { .. } | Payload::MouseWheel { .. }
                     )
                 {
-                    if is_scroll {
-                        log::info!("[MAC-SCROLL-DIAG] 滚轮被吞掉（blocked={blocked} sink={sink}）");
-                    }
                     return None;
-                }
-                if is_scroll {
-                    log::info!("[MAC-SCROLL-DIAG] 滚轮放行（本地生效）");
                 }
             }
             // 监听模式：原样放行，绝不吞事件
@@ -372,7 +456,8 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
     RUNLOOP_PTR.store(runloop.as_concrete_TypeRef() as usize, Ordering::Relaxed);
 
     let _ = ready.send(Ok(()));
-    log::info!("CGEventTap 已启动");
+    let own_pid = *OWN_PID.get_or_init(|| std::process::id() as i64);
+    log::info!("[MAC-TAP] CGEventTap 已启动 location=Session own_pid={own_pid}");
     CFRunLoop::run_current();
 
     // runloop 退出：清理
@@ -613,6 +698,26 @@ pub fn warp_cursor(x: i32, y: i32) {
             ev.post(CGEventTapLocation::HID);
         }
     }
+}
+
+/// 跨屏触发时的光标回绕（Action::Warp 专用）：与 warp_cursor 相同，但落点
+/// y 避开屏幕底部 Dock / 顶部菜单栏热区——隐藏光标停进热区会被 macOS 强制重显
+/// 并触发悬停动画；同时把【原始坐标】（对端入口同 y，镜像不断）播种为 Source
+/// 虚拟位置种子（tap 吞掉本机移动后靠它累积转发）。
+/// 注意：必须先于 TakeControl（blocked=true）执行——execute_action 按 Action
+/// 顺序执行，仲裁器把 Warp 排在 TakeControl 前（见 arbiter.check_dwell）。
+/// 返回路径（ReleaseControl / Sink 侧）用普通 warp_cursor，不做热区限制。
+pub fn warp_cursor_cross(x: i32, y: i32) {
+    if let Ok(mut g) = SOURCE_VIRTUAL_POS.lock() {
+        *g = Some((x as f64, y as f64));
+    }
+    let (_, h) = screen_size();
+    let ty = if h > MENUBAR_HOT_ZONE + DOCK_HOT_ZONE + 1 {
+        y.clamp(MENUBAR_HOT_ZONE, h - 1 - DOCK_HOT_ZONE)
+    } else {
+        y
+    };
+    warp_cursor(x, ty);
 }
 
 // ---- Mac CGKeyCode ↔ 抽象键码（keys::Key）映射（标准 ANSI 键位）----

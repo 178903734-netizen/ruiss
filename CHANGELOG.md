@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## 2026-08-11 — 根治 Mac 跨屏双滚 + Dock 隔空触发（Session tap + 吞移动 + 热区回避）
+
+背景：此前 4e4ffc5（8/8）与 55e86cc（8/10）两次修复都被回退，两个老问题仍在
+（Mac 跨屏到 Win 后滑触控板两边都滚 / Win 光标到任务栏时 Mac 隐藏光标出现在
+Dock 位置并触发应用悬停动画）。本次基于 6618b71 实测结论重做。
+
+- **为什么之前修不好（关键）**：
+  - 4e4ffc5：warp 到屏幕中心切断坐标镜像（对端光标首动跳屏中央，"好像改了东西"）；
+    吞移动无 delta 累积 → 对端光标卡住；释放时不恢复光标。
+  - 55e86cc：补了虚拟位置/热区回避/释放恢复，方向正确，但 tap 仍在 HID 层——
+    8/11 实验 6618b71 实测：触控板惯性滚动（momentum）由 WindowServer 内部合成
+    派发，**HID 层 tap return None 拦不住**（Mac 应用照样滚），双滚根因没动到，
+    所以 23 分钟后被回退。
+- **问题 1 根因（双滚）**：momentum 由 WindowServer 合成、pid 非 0 → 旧的
+  `pid != 0` 防回环早退把它当"自有注入"直通 → 跨屏期间 Mac 本地照滚。
+  - tap 捕获层 HID → **Session**（WindowServer 对外派发层，momentum 派发给应用前
+    必经此层，实测可拦）；
+  - 早退 `pid != 0` → `pid == 本进程 pid`（OWN_PID OnceLock；Synergy/InputLeap
+    同款：Session tap + 按 source pid 识别自身注入）→ momentum 落回正常"吞+转发"。
+- **问题 2 根因（Dock 隔空触发）**：Source 跨屏期间本机 MouseMoved 只转发不吞 →
+  隐藏光标与物理鼠标 1:1 滑向底部 Dock/顶部菜单栏热区 → macOS 在系统 UI 区域不
+  约束 CGDisplayHideCursor（强制重显）+ 悬停动画只看位置必触发。
+  - Source 跨屏（BLOCK_LOCAL_INPUT）期间吞 MouseMoved/Dragged，转发改用
+    SOURCE_VIRTUAL_POS（delta 累积，与 Sink 侧 LOCAL_VIRTUAL_POS 同款机制）——
+    光标冻结在安全位，本地零 hover，对端镜像不断；
+  - 新增 warp_cursor_cross：落点 y 避开 Dock(20)/菜单栏(25) 热区 + 播种虚拟位置
+    （x 仍在对侧边缘，不改屏幕中心——规避 4e4ffc5 的镜像断裂）；
+  - 释放（blocked true→false）时把冻结光标 warp 回最后虚拟位置（补缺失的恢复）；
+  - 仲裁器 Warp 排 TakeControl 前（warp 先于 blocked=true，种子确定），两个测试
+    断言同步更新；win.rs 加同名桩（Windows 无热区问题，行为等同 warp_cursor）。
+- 验证：Windows cargo check 通过（mac.rs 不参与 Windows 编译）；cargo test 本机
+  已知 0xc0000139 不可用，仲裁器测试已人工核对断言。
+- **需 Mac 实机验证**：①跨屏甩触控板，应只有对端滚（看日志 [MAC-SCROLL-DIAG]
+  pid / blocked / sink，预期惯性段 pid≠本进程、被吞）；②Win 光标到任务栏，Mac
+  无光标出现、无 hover 动画；③返回后光标落在手所在处；④win→mac（Mac 为 Sink）
+  注入仍正常（验证 Session tap 下自有注入 pid 识别正确，无回环/无吞注入）。
+
+
 ## 2026-08-10 — 修复 M3 剪贴板/文件功能 Windows 编译错误（15 处）+ 清理 warning
 
 - 背景：M3 跨屏剪贴板（文字/图片/文件）+ 文件传输 + 跨屏拖拽功能代码未提交且 Windows 侧编译失败（15 个 error，全部在 win.rs 新增剪贴板实现段）。
