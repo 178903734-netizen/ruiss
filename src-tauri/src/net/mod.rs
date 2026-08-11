@@ -79,8 +79,9 @@ struct NetStatusInner {
 /// 轻量发送句柄：无锁、可克隆。
 #[derive(Clone)]
 pub struct NetHandle {
+    ctrl: mpsc::UnboundedSender<Message>,
     out: mpsc::Sender<Message>,
-    moves: mpsc::Sender<Payload>,
+    moves: mpsc::UnboundedSender<Payload>,
     status: Arc<NetStatusInner>,
 }
 
@@ -90,15 +91,20 @@ impl NetHandle {
         let _ = self.out.try_send(msg);
     }
 
-    /// 发送鼠标移动（UDP，fire-and-forget）。src_w/src_h 为发送端屏幕尺寸，
-    /// 接收端据此做等比坐标映射。
-    pub fn send_move(&self, x: i32, y: i32, src_w: u32, src_h: u32) {
-        let _ = self.moves.try_send(Payload::MouseMove { x, y, src_w, src_h });
+    /// 控制权消息走独立高优先级队列，不会被剪贴板/文件消息挤满或插队。
+    pub fn send_ctrl(&self, msg: Message) {
+        if let Err(e) = self.ctrl.send(msg) {
+            log::error!("控制消息入队失败: {e}");
+        }
     }
 
-    /// 相对移动不能像绝对坐标一样只保留最后一帧；UDP 写循环会把积压 delta 累加。
-    pub fn send_move_relative(&self, dx: i32, dy: i32) {
-        let _ = self.moves.try_send(Payload::MouseMoveRelative { dx, dy });
+    /// 发送已经带跨屏轮次和序号的 UDP 指针帧。
+    pub fn send_pointer(&self, payload: Payload) {
+        debug_assert!(matches!(
+            &payload,
+            Payload::PointerMove { .. } | Payload::PointerMoveRelative { .. }
+        ));
+        let _ = self.moves.send(payload);
     }
 
     pub fn connected(&self) -> bool {
@@ -133,9 +139,12 @@ pub struct NetStart {
 impl NetEngine {
     /// 启动：绑 UDP（拿路由 IP）→ 起 TCP 重连循环 + UDP 收发循环。
     pub async fn start(name: String, cfg: PeerConfig) -> Result<NetStart> {
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Message>();
         let (out_tx, out_rx) = mpsc::channel::<Message>(256);
         let (in_tx, incoming) = mpsc::channel::<Message>(256);
-        let (move_tx, move_rx) = mpsc::channel::<Payload>(256);
+        // 指针帧不能因有界队列满而丢掉握手后的第一帧；写循环会主动合并积压，
+        // 因此这里使用无界通道，既不阻塞系统输入回调，也不会积累大量 UDP 包。
+        let (move_tx, move_rx) = mpsc::unbounded_channel::<Payload>();
         let status = Arc::new(NetStatusInner {
             connected: AtomicBool::new(false),
             sent: Arc::new(AtomicU64::new(0)),
@@ -170,6 +179,7 @@ impl NetEngine {
                 name,
                 cfg: cfg.clone(),
                 my_ip,
+                ctrl_rx,
                 out_rx,
                 incoming: in_tx,
                 status: status.clone(),
@@ -178,7 +188,12 @@ impl NetEngine {
             .run(),
         ));
 
-        let handle = NetHandle { out: out_tx, moves: move_tx, status: status.clone() };
+        let handle = NetHandle {
+            ctrl: ctrl_tx,
+            out: out_tx,
+            moves: move_tx,
+            status: status.clone(),
+        };
         let engine = NetEngine { handle: handle.clone(), shutdown, tasks };
         Ok(NetStart { engine, handle, incoming })
     }
@@ -210,6 +225,7 @@ struct Connector {
     name: String,
     cfg: PeerConfig,
     my_ip: IpAddr,
+    ctrl_rx: mpsc::UnboundedReceiver<Message>,
     out_rx: mpsc::Receiver<Message>,
     incoming: mpsc::Sender<Message>,
     status: Arc<NetStatusInner>,
@@ -280,7 +296,14 @@ impl Connector {
         let mut seq: u64 = 0;
         loop {
             tokio::select! {
+                biased;
                 _ = &mut dead_rx => break, // 读端断了
+                msg = self.ctrl_rx.recv() => match msg {
+                    Some(m) => {
+                        if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
+                    }
+                    None => break,
+                },
                 msg = self.out_rx.recv() => match msg {
                     Some(m) => {
                         if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
@@ -295,6 +318,9 @@ impl Connector {
             }
         }
         reader.abort();
+        // 连接代际结束后，旧控制/输入不能留到下次重连继续执行。
+        while self.ctrl_rx.try_recv().is_ok() {}
+        while self.out_rx.try_recv().is_ok() {}
     }
 }
 
@@ -363,16 +389,23 @@ mod tests {
         assert!(matches!(m.payload, Payload::MouseButton { button: 0, down: true }));
 
         // A → B（UDP 移动）
-        handle_a.send_move(10, 20, 1280, 800);
-        let m = recv_until(&mut in_b, |m| matches!(m.payload, Payload::MouseMove { .. })).await;
-        assert!(matches!(m.payload, Payload::MouseMove { x: 10, y: 20, src_w: 1280, src_h: 800 }));
+        handle_a.send_pointer(Payload::PointerMove {
+            session: 7,
+            seq: 1,
+            x: 10,
+            y: 20,
+            src_w: 1280,
+            src_h: 800,
+        });
+        let m = recv_until(&mut in_b, |m| matches!(m.payload, Payload::PointerMove { .. })).await;
+        assert!(matches!(m.payload, Payload::PointerMove { session: 7, seq: 1, x: 10, y: 20, src_w: 1280, src_h: 800 }));
 
         // 控制消息（Ctrl）
-        handle_a.send(Message::ctrl(
+        handle_a.send_ctrl(Message::ctrl(
             "A",
-            Payload::TakeControl { x: 0, y: 100, src_w: 1280, src_h: 800 },
+            Payload::TakeControl { session: 7, x: 0, y: 100, src_w: 1280, src_h: 800 },
         ));
         let m = recv_until(&mut in_b, |m| m.kind == MsgKind::Ctrl).await;
-        assert!(matches!(m.payload, Payload::TakeControl { x: 0, y: 100, .. }));
+        assert!(matches!(m.payload, Payload::TakeControl { session: 7, x: 0, y: 100, .. }));
     }
 }

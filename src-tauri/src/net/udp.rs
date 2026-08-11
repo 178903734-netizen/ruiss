@@ -36,7 +36,7 @@ pub async fn read_loop(udp: Arc<UdpSocket>, incoming: mpsc::Sender<Message>, rec
 /// UDP 写循环：把本机鼠标移动发往对端（合并积压，只发最新）。
 pub async fn write_loop(
     udp: Arc<UdpSocket>,
-    mut moves: mpsc::Receiver<Payload>,
+    mut moves: mpsc::UnboundedReceiver<Payload>,
     name: String,
     sent: Arc<AtomicU64>,
 ) {
@@ -62,11 +62,17 @@ pub async fn write_loop(
 fn merge_move(current: &mut Payload, next: Payload) {
     match (current, next) {
         (
-            Payload::MouseMoveRelative { dx, dy },
-            Payload::MouseMoveRelative { dx: next_dx, dy: next_dy },
-        ) => {
+            Payload::PointerMoveRelative { session, seq, dx, dy },
+            Payload::PointerMoveRelative {
+                session: next_session,
+                seq: next_seq,
+                dx: next_dx,
+                dy: next_dy,
+            },
+        ) if *session == next_session => {
             *dx = dx.saturating_add(next_dx);
             *dy = dy.saturating_add(next_dy);
+            *seq = next_seq;
         }
         (slot, next) => *slot = next,
     }
@@ -78,21 +84,76 @@ mod tests {
 
     #[test]
     fn relative_moves_are_accumulated() {
-        let mut current = Payload::MouseMoveRelative { dx: 4, dy: -2 };
-        merge_move(&mut current, Payload::MouseMoveRelative { dx: 3, dy: 5 });
-        assert_eq!(current, Payload::MouseMoveRelative { dx: 7, dy: 3 });
+        let mut current = Payload::PointerMoveRelative { session: 9, seq: 1, dx: 4, dy: -2 };
+        merge_move(
+            &mut current,
+            Payload::PointerMoveRelative { session: 9, seq: 2, dx: 3, dy: 5 },
+        );
+        assert_eq!(
+            current,
+            Payload::PointerMoveRelative { session: 9, seq: 2, dx: 7, dy: 3 }
+        );
+    }
+
+    #[test]
+    fn relative_moves_from_different_sessions_are_not_merged() {
+        let mut current = Payload::PointerMoveRelative {
+            session: 9,
+            seq: 4,
+            dx: 20,
+            dy: 10,
+        };
+        merge_move(
+            &mut current,
+            Payload::PointerMoveRelative {
+                session: 10,
+                seq: 1,
+                dx: 2,
+                dy: 3,
+            },
+        );
+        assert_eq!(
+            current,
+            Payload::PointerMoveRelative {
+                session: 10,
+                seq: 1,
+                dx: 2,
+                dy: 3,
+            }
+        );
     }
 
     #[test]
     fn absolute_moves_keep_latest_position() {
-        let mut current = Payload::MouseMove { x: 10, y: 20, src_w: 100, src_h: 100 };
+        let mut current = Payload::PointerMove {
+            session: 9,
+            seq: 1,
+            x: 10,
+            y: 20,
+            src_w: 100,
+            src_h: 100,
+        };
         merge_move(
             &mut current,
-            Payload::MouseMove { x: 80, y: 90, src_w: 100, src_h: 100 },
+            Payload::PointerMove {
+                session: 9,
+                seq: 2,
+                x: 80,
+                y: 90,
+                src_w: 100,
+                src_h: 100,
+            },
         );
         assert_eq!(
             current,
-            Payload::MouseMove { x: 80, y: 90, src_w: 100, src_h: 100 }
+            Payload::PointerMove {
+                session: 9,
+                seq: 2,
+                x: 80,
+                y: 90,
+                src_w: 100,
+                src_h: 100,
+            }
         );
     }
 }

@@ -260,6 +260,11 @@ impl Arbiter {
     pub fn on_peer_release(&mut self) {
         self.mode = Mode::Source;
         self.linked = false;
+        self.dwell = None;
+        self.last = None;
+        self.sink_dwell = None;
+        self.last_injected = None;
+        self.sink_was_away = false;
     }
 
     /// 本机出口边（返回时 warp 回出口边用）。

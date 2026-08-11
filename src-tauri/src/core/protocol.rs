@@ -36,6 +36,11 @@ pub enum Payload {
     /// 相对鼠标移动。Mac 跨屏后直接转发 HID delta，接收端使用系统原生
     /// 相对移动注入，避免虚拟绝对坐标和逐帧 warp 破坏触控板连续性。
     MouseMoveRelative { dx: i32, dy: i32 },
+    /// UDP 线上的绝对移动帧。session 标识本次跨屏接管，seq 在该轮次内递增；
+    /// 接收端据此拒绝旧轮次和乱序帧。
+    PointerMove { session: u64, seq: u64, x: i32, y: i32, src_w: u32, src_h: u32 },
+    /// UDP 线上的相对移动帧，同一轮次内可在发送队列中累加 delta。
+    PointerMoveRelative { session: u64, seq: u64, dx: i32, dy: i32 },
     /// 鼠标按键：0 左键 / 1 右键 / 2 中键，down=true 按下，false 抬起
     MouseButton { button: u8, down: bool },
     /// 滚轮：dy>0 向上滚，dx 为横向滚轮。单位统一为"格"：
@@ -56,9 +61,12 @@ pub enum Payload {
     Heartbeat { seq: u64 },
     /// 令牌：成为主控（对端进入 Sink），携带对端坐标系入口位置 (x, y)
     /// 及源端屏幕尺寸（对端注入入口时按比例映射）
-    TakeControl { x: i32, y: i32, src_w: u32, src_h: u32 },
+    TakeControl { session: u64, x: i32, y: i32, src_w: u32, src_h: u32 },
+    /// 接收端已经完成本轮接管。Source 收到前只缓存移动，不发 UDP，保证
+    /// TakeControl 一定先于本轮所有移动生效。
+    ControlReady { session: u64 },
     /// 释放令牌（本机鼠标回到出口边，对端恢复自主）
-    ReleaseControl,
+    ReleaseControl { session: u64 },
 
     // ===== M3：文件传输（分块流，支持任意大小文件）=====
     /// 文件传输开始：声明一个新文件流。id 为本次传输唯一标识（uuid），

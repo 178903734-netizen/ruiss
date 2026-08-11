@@ -18,8 +18,8 @@ mod platform;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -165,6 +165,14 @@ struct RouterState {
     file_sender: Option<file_transfer::FileSender>,
     /// 文件接收器（处理对端 FileStart/Chunk/End）
     file_receiver: Option<Arc<file_transfer::FileReceiver>>,
+    /// 本机作为 Source 时的跨屏轮次。收到同轮次 ControlReady 前只缓存移动。
+    tx_pointer_session: u64,
+    tx_pointer_ready: bool,
+    tx_pointer_seq: u64,
+    pending_pointer_move: Option<Payload>,
+    /// 本机作为 Sink 时当前接受的跨屏轮次及最后 UDP 序号。
+    rx_pointer_session: u64,
+    rx_pointer_seq: u64,
 }
 
 impl RouterState {
@@ -181,7 +189,160 @@ impl RouterState {
             clipboard: None,
             file_sender: None,
             file_receiver: None,
+            tx_pointer_session: 0,
+            tx_pointer_ready: false,
+            tx_pointer_seq: 0,
+            pending_pointer_move: None,
+            rx_pointer_session: 0,
+            rx_pointer_seq: 0,
         }
+    }
+}
+
+fn next_pointer_session() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seed = *SEED.get_or_init(|| {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        time ^ ((std::process::id() as u64) << 32)
+    });
+    let session = seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed));
+    if session == 0 { u64::MAX } else { session }
+}
+
+fn merge_pending_pointer(slot: &mut Option<Payload>, next: Payload) {
+    if let (
+        Some(Payload::MouseMoveRelative { dx, dy }),
+        Payload::MouseMoveRelative {
+            dx: next_dx,
+            dy: next_dy,
+        },
+    ) = (slot.as_mut(), &next)
+    {
+        *dx = dx.saturating_add(*next_dx);
+        *dy = dy.saturating_add(*next_dy);
+        return;
+    }
+    *slot = Some(next);
+}
+
+fn accept_pointer_sequence(
+    active_session: u64,
+    last_seq: &mut u64,
+    session: u64,
+    seq: u64,
+) -> bool {
+    if active_session == 0 || session != active_session || seq <= *last_seq {
+        return false;
+    }
+    *last_seq = seq;
+    true
+}
+
+fn make_pointer_frame(session: u64, seq: u64, payload: Payload) -> Option<Payload> {
+    match payload {
+        Payload::MouseMove {
+            x,
+            y,
+            src_w,
+            src_h,
+        } => Some(Payload::PointerMove {
+            session,
+            seq,
+            x,
+            y,
+            src_w,
+            src_h,
+        }),
+        Payload::MouseMoveRelative { dx, dy } => Some(Payload::PointerMoveRelative {
+            session,
+            seq,
+            dx,
+            dy,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pointer_session_tests {
+    use super::*;
+
+    #[test]
+    fn pending_relative_moves_accumulate_before_ready() {
+        let mut pending = Some(Payload::MouseMoveRelative { dx: 4, dy: -2 });
+        merge_pending_pointer(&mut pending, Payload::MouseMoveRelative { dx: 3, dy: 5 });
+        assert_eq!(pending, Some(Payload::MouseMoveRelative { dx: 7, dy: 3 }));
+    }
+
+    #[test]
+    fn pending_absolute_move_keeps_latest_position() {
+        let mut pending = Some(Payload::MouseMove {
+            x: 10,
+            y: 20,
+            src_w: 100,
+            src_h: 100,
+        });
+        merge_pending_pointer(
+            &mut pending,
+            Payload::MouseMove {
+                x: 80,
+                y: 90,
+                src_w: 100,
+                src_h: 100,
+            },
+        );
+        assert_eq!(
+            pending,
+            Some(Payload::MouseMove {
+                x: 80,
+                y: 90,
+                src_w: 100,
+                src_h: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn receiver_accepts_only_current_increasing_sequence() {
+        let mut last = 0;
+        assert!(accept_pointer_sequence(42, &mut last, 42, 1));
+        assert!(!accept_pointer_sequence(42, &mut last, 42, 1));
+        assert!(!accept_pointer_sequence(42, &mut last, 42, 0));
+        assert!(!accept_pointer_sequence(42, &mut last, 41, 2));
+        assert!(accept_pointer_sequence(42, &mut last, 42, 3));
+        assert_eq!(last, 3);
+    }
+}
+
+/// 只在对端确认 TakeControl 后发送 UDP；确认前保留最新绝对位置或累计相对 delta。
+fn forward_pointer_move(router: &Mutex<RouterState>, move_payload: Payload) {
+    let outgoing = {
+        let mut r = match router.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if r.tx_pointer_session == 0 {
+            return;
+        }
+        if !r.tx_pointer_ready {
+            merge_pending_pointer(&mut r.pending_pointer_move, move_payload);
+            return;
+        }
+        r.tx_pointer_seq = r.tx_pointer_seq.saturating_add(1);
+        let session = r.tx_pointer_session;
+        let seq = r.tx_pointer_seq;
+        let net = r.net.clone();
+        let Some(wire) = make_pointer_frame(session, seq, move_payload) else {
+            return;
+        };
+        (net, wire)
+    };
+    if let (Some(net), payload) = outgoing {
+        net.send_pointer(payload);
     }
 }
 
@@ -203,6 +364,10 @@ fn start_capturer(
             if r.selftest {
                 // M1 自测回环（延迟回声），不参与链接逻辑
                 selftest_loopback(&injector_cb, &r.stats, &pending, payload);
+                return;
+            }
+            let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
+            if !connected {
                 return;
             }
             match &payload {
@@ -244,6 +409,24 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                 let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
                 if let Some(a) = r.arbiter.as_mut() {
                     let (w, h) = platform::screen_size();
+                    if !connected {
+                        let was_active = a.linked || a.mode == Mode::Sink;
+                        a.on_peer_release();
+                        acts.clear();
+                        if was_active {
+                            log::warn!("网络断开，复位跨屏状态");
+                            platform::show_cursor();
+                            platform::set_local_input_blocked(false);
+                            platform::set_sink_active(false);
+                        }
+                        r.tx_pointer_session = 0;
+                        r.tx_pointer_ready = false;
+                        r.tx_pointer_seq = 0;
+                        r.pending_pointer_move = None;
+                        r.rx_pointer_session = 0;
+                        r.rx_pointer_seq = 0;
+                        continue;
+                    }
                     // 主动补藏：Source 跨屏期间每 25ms 确认一次光标隐藏。
                     // 对抗 tao ShowCursor(TRUE) / macOS 移动自动重显，
                     // 停手不动时也持续压制（不依赖移动事件）。
@@ -255,14 +438,6 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                         acts.extend(a.on_sink_tick(platform::last_injected_pos(), w, h, Instant::now()));
                     } else {
                         acts.extend(a.on_tick(Instant::now()));
-                    }
-                    // 断线复位：连接断了还挂着跨屏/被控状态 → 复位并恢复光标/本机输入
-                    if !connected && (a.linked || a.mode == Mode::Sink) {
-                        log::warn!("网络断开，复位跨屏状态");
-                        a.on_peer_release();
-                        platform::show_cursor();
-                        platform::set_local_input_blocked(false);
-                        platform::set_sink_active(false);
                     }
                 }
                 acts
@@ -288,7 +463,21 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
     };
     match action {
         Action::TakeControl { x, y, src_w, src_h } => {
-            log::info!("发起跨屏 → TakeControl({x}, {y})");
+            let session = next_pointer_session();
+            {
+                let mut r = match router.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                r.tx_pointer_session = session;
+                r.tx_pointer_ready = false;
+                r.tx_pointer_seq = 0;
+                r.pending_pointer_move = None;
+                // 从 Sink 反向夺回时，旧接收轮次立即作废。
+                r.rx_pointer_session = 0;
+                r.rx_pointer_seq = 0;
+            }
+            log::info!("发起跨屏 session={session} → TakeControl({x}, {y})");
             // 本机光标"离开"（隐藏），避免双光标；键盘/点击/滚轮被拦截，只转发对端
             platform::hide_cursor();
             platform::set_local_input_blocked(true);
@@ -296,7 +485,16 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             // sink 同时为 true，tap 里两个吞移动分支叠加、Source 虚拟位置不生效
             // （2026-08-11 日志实测出现 blocked=true sink=true 组合）。
             platform::set_sink_active(false);
-            net.send(Message::ctrl(&name, Payload::TakeControl { x, y, src_w, src_h }));
+            net.send_ctrl(Message::ctrl(
+                &name,
+                Payload::TakeControl {
+                    session,
+                    x,
+                    y,
+                    src_w,
+                    src_h,
+                },
+            ));
             // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
             if platform::is_left_button_down() {
                 let content = platform::clipboard_read();
@@ -339,10 +537,30 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             }
         }
         Action::ReleaseControl => {
-            log::info!("返回本机 → ReleaseControl");
+            let session = {
+                let mut r = match router.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                let session = if r.tx_pointer_session != 0 {
+                    r.tx_pointer_session
+                } else {
+                    r.rx_pointer_session
+                };
+                r.tx_pointer_session = 0;
+                r.tx_pointer_ready = false;
+                r.tx_pointer_seq = 0;
+                r.pending_pointer_move = None;
+                r.rx_pointer_session = 0;
+                r.rx_pointer_seq = 0;
+                session
+            };
+            log::info!("返回本机 session={session} → ReleaseControl");
             platform::show_cursor();
             platform::set_local_input_blocked(false);
-            net.send(Message::ctrl(&name, Payload::ReleaseControl));
+            if session != 0 {
+                net.send_ctrl(Message::ctrl(&name, Payload::ReleaseControl { session }));
+            }
         }
         Action::Warp { x, y } => {
             log::debug!("光标回绕 → ({x}, {y})");
@@ -353,9 +571,19 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
         Action::Forward(payload) => match payload {
             Payload::MouseMove { x, y, .. } => {
                 let (w, h) = platform::screen_size();
-                net.send_move(x, y, w as u32, h as u32)
+                forward_pointer_move(
+                    router,
+                    Payload::MouseMove {
+                        x,
+                        y,
+                        src_w: w as u32,
+                        src_h: h as u32,
+                    },
+                );
             }
-            Payload::MouseMoveRelative { dx, dy } => net.send_move_relative(dx, dy),
+            Payload::MouseMoveRelative { dx, dy } => {
+                forward_pointer_move(router, Payload::MouseMoveRelative { dx, dy });
+            }
             other => net.send(Message::event(&name, other)),
         },
         Action::None => {}
@@ -371,22 +599,36 @@ async fn run_incoming_router(
     while let Some(msg) = incoming.recv().await {
         match &msg.payload {
             Payload::Heartbeat { .. } => {} // 保活，无需处理
-            Payload::TakeControl { x, y, src_w, src_h } => {
+            Payload::TakeControl {
+                session,
+                x,
+                y,
+                src_w,
+                src_h,
+            } => {
                 // 被接管：本机系统光标保持可见——对端注入的事件移动的就是
                 // 这个系统光标，隐藏它会导致"被控但找不到鼠标"；本机输入恢复原样
                 platform::show_cursor();
                 platform::set_local_input_blocked(false);
                 // 标记本机为被控端（Sink）：吞掉本机 MouseMove，光标只跟对端注入走（防双鼠标）
                 platform::set_sink_active(true);
-                let entry = {
+                let (entry, ack_name, ack_net) = {
                     let mut r = match router.lock() {
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
                     };
-                    r.arbiter.as_mut().and_then(|a| a.on_peer_take(*x, *y))
+                    // 新轮次生效时，任何旧 Source/UDP 状态立即作废。
+                    r.tx_pointer_session = 0;
+                    r.tx_pointer_ready = false;
+                    r.tx_pointer_seq = 0;
+                    r.pending_pointer_move = None;
+                    r.rx_pointer_session = *session;
+                    r.rx_pointer_seq = 0;
+                    let entry = r.arbiter.as_mut().and_then(|a| a.on_peer_take(*x, *y));
+                    (entry, r.settings.name.clone(), r.net.clone())
                 };
                 if let Some((ix, iy)) = entry {
-                    log::info!("对端接管 → 注入入口 ({ix}, {iy})");
+                    log::info!("对端接管 session={session} → 注入入口 ({ix}, {iy})");
                     let (tw, th) = platform::screen_size();
                     let (mx, my) = crate::core::geometry::map_coords(
                         ix, iy, *src_w, *src_h, tw as u32, th as u32,
@@ -397,10 +639,65 @@ async fn run_incoming_router(
                         src_w: tw as u32,
                         src_h: th as u32,
                     });
+                    // 入口注入和 Sink 状态已经完成，之后才允许 Source 发本轮 UDP。
+                    if let Some(net) = ack_net {
+                        net.send_ctrl(Message::ctrl(
+                            &ack_name,
+                            Payload::ControlReady { session: *session },
+                        ));
+                    }
                 }
             }
-            Payload::ReleaseControl => {
-                log::info!("对端归还控制");
+            Payload::ControlReady { session } => {
+                {
+                    let mut r = match router.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    if r.tx_pointer_session == *session {
+                        log::info!("对端已准备好 session={session}，开始发送 UDP 指针帧");
+                        // 必须先把确认前缓存的帧排进 UDP 队列，再开放新帧；否则
+                        // 捕获线程可能抢先发送 seq=1，随后旧缓存以 seq=2 覆盖新位置。
+                        if let Some(pending) = r.pending_pointer_move.take() {
+                            r.tx_pointer_seq = r.tx_pointer_seq.saturating_add(1);
+                            if let (Some(net), Some(frame)) = (
+                                r.net.clone(),
+                                make_pointer_frame(
+                                    r.tx_pointer_session,
+                                    r.tx_pointer_seq,
+                                    pending,
+                                ),
+                            ) {
+                                net.send_pointer(frame);
+                            }
+                        }
+                        r.tx_pointer_ready = true;
+                    }
+                }
+            }
+            Payload::ReleaseControl { session } => {
+                let accepted = {
+                    let mut r = match router.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let accepted = r.tx_pointer_session == *session
+                        || r.rx_pointer_session == *session;
+                    if accepted {
+                        r.tx_pointer_session = 0;
+                        r.tx_pointer_ready = false;
+                        r.tx_pointer_seq = 0;
+                        r.pending_pointer_move = None;
+                        r.rx_pointer_session = 0;
+                        r.rx_pointer_seq = 0;
+                    }
+                    accepted
+                };
+                if !accepted {
+                    log::debug!("忽略旧轮次 ReleaseControl session={session}");
+                    continue;
+                }
+                log::info!("对端归还控制 session={session}");
                 platform::show_cursor();
                 platform::set_local_input_blocked(false);
                 platform::set_sink_active(false);
@@ -421,6 +718,86 @@ async fn run_incoming_router(
                         };
                         platform::warp_cursor(wx, wy.clamp(0, h - 1));
                     }
+                }
+            }
+            Payload::PointerMove {
+                session,
+                seq,
+                x,
+                y,
+                src_w,
+                src_h,
+            } => {
+                let accepted = {
+                    let mut r = match router.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let sink = r
+                        .arbiter
+                        .as_ref()
+                        .map(|a| a.mode == Mode::Sink)
+                        .unwrap_or(false);
+                    let active_session = r.rx_pointer_session;
+                    sink && accept_pointer_sequence(
+                        active_session,
+                        &mut r.rx_pointer_seq,
+                        *session,
+                        *seq,
+                    )
+                };
+                if accepted {
+                    let (tw, th) = platform::screen_size();
+                    let (mx, my) = crate::core::geometry::map_coords(
+                        *x,
+                        *y,
+                        *src_w,
+                        *src_h,
+                        tw as u32,
+                        th as u32,
+                    );
+                    injector.inject(Payload::MouseMove {
+                        x: mx,
+                        y: my,
+                        src_w: tw as u32,
+                        src_h: th as u32,
+                    });
+                } else {
+                    log::debug!(
+                        "丢弃非当前/乱序绝对指针帧 session={session} seq={seq}"
+                    );
+                }
+            }
+            Payload::PointerMoveRelative {
+                session,
+                seq,
+                dx,
+                dy,
+            } => {
+                let accepted = {
+                    let mut r = match router.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    let sink = r
+                        .arbiter
+                        .as_ref()
+                        .map(|a| a.mode == Mode::Sink)
+                        .unwrap_or(false);
+                    let active_session = r.rx_pointer_session;
+                    sink && accept_pointer_sequence(
+                        active_session,
+                        &mut r.rx_pointer_seq,
+                        *session,
+                        *seq,
+                    )
+                };
+                if accepted {
+                    injector.inject(Payload::MouseMoveRelative { dx: *dx, dy: *dy });
+                } else {
+                    log::debug!(
+                        "丢弃非当前/乱序相对指针帧 session={session} seq={seq}"
+                    );
                 }
             }
             Payload::ClipboardText { .. } | Payload::ClipboardImage { .. } | Payload::ClipboardFiles { .. } => {
@@ -449,6 +826,11 @@ async fn run_incoming_router(
                     });
                 }
             }
+            Payload::MouseMove { .. } | Payload::MouseMoveRelative { .. } => {
+                // 网络移动必须带 session/seq；拒绝无轮次帧，避免旧版本或残留包
+                // 绕过握手参与当前接管。
+                log::debug!("丢弃无跨屏轮次的指针帧: {:?}", msg.payload);
+            }
             _ => {
                 let sink = {
                     let r = match router.lock() {
@@ -458,23 +840,7 @@ async fn run_incoming_router(
                     r.arbiter.as_ref().map(|a| a.mode == Mode::Sink).unwrap_or(false)
                 };
                 if sink {
-                    // 鼠标移动：按源端屏幕尺寸等比映射到本机（分辨率不一致也能覆盖全屏）
-                    let mapped = match &msg.payload {
-                        Payload::MouseMove { x, y, src_w, src_h } => {
-                            let (tw, th) = platform::screen_size();
-                            let (mx, my) = crate::core::geometry::map_coords(
-                                *x, *y, *src_w, *src_h, tw as u32, th as u32,
-                            );
-                            Payload::MouseMove {
-                                x: mx,
-                                y: my,
-                                src_w: tw as u32,
-                                src_h: th as u32,
-                            }
-                        }
-                        p => p.clone(),
-                    };
-                    injector.inject(mapped);
+                    injector.inject(msg.payload.clone());
                 } else {
                     log::debug!("忽略对端事件（本机 Source）: {:?}", msg.payload);
                 }
@@ -520,6 +886,12 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
         r.arbiter = None;
         r.clipboard = None; // Drop → 停止剪贴板监听
         r.file_sender = None;
+        r.tx_pointer_session = 0;
+        r.tx_pointer_ready = false;
+        r.tx_pointer_seq = 0;
+        r.pending_pointer_move = None;
+        r.rx_pointer_session = 0;
+        r.rx_pointer_seq = 0;
     }
     if peer_ip.is_empty() {
         log::info!("未配置对端 IP，网络关闭");
