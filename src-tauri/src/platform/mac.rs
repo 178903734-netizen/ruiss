@@ -678,6 +678,20 @@ fn mac_event_flags(modifiers: ModifierState) -> CGEventFlags {
     flags
 }
 
+/// Physical arrow keys carry these two device flags on macOS.  Without them a
+/// Quartz-injected Control+Arrow reaches the focused application, but the
+/// system hotkey layer (Spaces/Mission Control) may not recognize it.
+fn mac_keyboard_event_flags(key: Key, modifiers: ModifierState) -> CGEventFlags {
+    let mut flags = mac_event_flags(modifiers);
+    if matches!(
+        key,
+        Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+    ) {
+        flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
+    }
+    flags
+}
+
 fn post_mac_modifier(
     source: &CGEventSource,
     key: Key,
@@ -943,7 +957,7 @@ impl InputInjector {
                     }
                     (stroke, key_source)
                 };
-                event_flags = Some(mac_event_flags(stroke.modifiers));
+                event_flags = Some(mac_keyboard_event_flags(stroke.key, stroke.modifiers));
                 CGEvent::new_keyboard_event(key_source, key_to_cg(stroke.key), *down)
             }
             other => {
@@ -1036,7 +1050,10 @@ impl InputInjector {
                 ) else {
                     continue;
                 };
-                event.set_flags(CGEventFlags::empty());
+                event.set_flags(mac_keyboard_event_flags(
+                    key,
+                    ModifierState::default(),
+                ));
                 event.set_integer_value_field(
                     EventField::EVENT_SOURCE_USER_DATA,
                     RUISS_EVENT_MARKER,
