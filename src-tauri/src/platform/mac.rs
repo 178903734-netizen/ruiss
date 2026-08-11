@@ -610,7 +610,14 @@ impl ClickState {
     }
 }
 
-#[derive(Default)]
+/// CGEventSource does not declare Send in core-graphics, although Quartz event sources have
+/// no thread affinity. Access is serialized by InputInjector.keyboard, and every event gets a
+/// retained clone while this owner remains alive.
+struct PersistentKeyboardSource(CGEventSource);
+
+// SAFETY: the wrapped CF object is only accessed while KeyboardState is locked.
+unsafe impl Send for PersistentKeyboardSource {}
+
 struct KeyboardState {
     /// 收到的 Windows 源端修饰键状态。
     source_modifiers: ModifierState,
@@ -618,9 +625,29 @@ struct KeyboardState {
     applied_modifiers: ModifierState,
     /// key-up 沿用 key-down 时的翻译，防止修饰键提前释放导致按键卡住。
     active: HashMap<Key, ShortcutStroke>,
+    /// Keep one HID source alive for the whole injector lifetime so modifier/key state shares
+    /// the same hardware-state table instead of resetting between individual payloads.
+    event_source: Option<PersistentKeyboardSource>,
+}
+
+impl Default for KeyboardState {
+    fn default() -> Self {
+        Self {
+            source_modifiers: ModifierState::default(),
+            applied_modifiers: ModifierState::default(),
+            active: HashMap::new(),
+            event_source: CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                .ok()
+                .map(PersistentKeyboardSource),
+        }
+    }
 }
 
 impl KeyboardState {
+    fn event_source(&self) -> Option<CGEventSource> {
+        self.event_source.as_ref().map(|source| source.0.clone())
+    }
+
     fn prepare_key(&mut self, key: Key, down: bool) -> ShortcutStroke {
         if down {
             let stroke = translate_windows_shortcut_to_mac(self.source_modifiers, key);
@@ -651,12 +678,14 @@ fn mac_event_flags(modifiers: ModifierState) -> CGEventFlags {
     flags
 }
 
-fn post_mac_modifier(key: Key, down: bool, modifiers: ModifierState) {
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
-        return;
-    };
-    let Ok(event) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) else {
-        return;
+fn post_mac_modifier(
+    source: &CGEventSource,
+    key: Key,
+    down: bool,
+    modifiers: ModifierState,
+) -> bool {
+    let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_to_cg(key), down) else {
+        return false;
     };
     // macOS represents modifier transitions as FlagsChanged, not ordinary KeyDown/KeyUp.
     // Application shortcuts may work from flags alone, while system shortcuts such as
@@ -665,9 +694,14 @@ fn post_mac_modifier(key: Key, down: bool, modifiers: ModifierState) {
     event.set_flags(mac_event_flags(modifiers));
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
     event.post(CGEventTapLocation::HID);
+    true
 }
 
-fn sync_mac_modifiers(keyboard: &mut KeyboardState, desired: ModifierState) {
+fn sync_mac_modifiers(
+    keyboard: &mut KeyboardState,
+    source: &CGEventSource,
+    desired: ModifierState,
+) -> bool {
     let current = keyboard.applied_modifiers;
     let mut next = current;
     for (key, was_down, should_down) in [
@@ -678,7 +712,9 @@ fn sync_mac_modifiers(keyboard: &mut KeyboardState, desired: ModifierState) {
     ] {
         if was_down && !should_down {
             next.set(key, false);
-            post_mac_modifier(key, false, next);
+            if !post_mac_modifier(source, key, false, next) {
+                return false;
+            }
         }
     }
     for (key, was_down, should_down) in [
@@ -689,10 +725,13 @@ fn sync_mac_modifiers(keyboard: &mut KeyboardState, desired: ModifierState) {
     ] {
         if !was_down && should_down {
             next.set(key, true);
-            post_mac_modifier(key, true, next);
+            if !post_mac_modifier(source, key, true, next) {
+                return false;
+            }
         }
     }
     keyboard.applied_modifiers = desired;
+    true
 }
 
 /// 注入器：CGEventPost 回放事件。
@@ -704,9 +743,14 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn new() -> Self {
+        let keyboard = KeyboardState::default();
+        log::info!(
+            "[MAC-KEY] persistent HID keyboard source ready={}",
+            keyboard.event_source.is_some()
+        );
         Self {
             click: Mutex::new(ClickState::new()),
-            keyboard: Mutex::new(KeyboardState::default()),
+            keyboard: Mutex::new(keyboard),
         }
     }
 
@@ -728,7 +772,9 @@ impl InputInjector {
                 Err(p) => p.into_inner(),
             };
             let desired = map_modifiers(true, keyboard.source_modifiers);
-            sync_mac_modifiers(&mut keyboard, desired);
+            if let Some(key_source) = keyboard.event_source() {
+                let _ = sync_mac_modifiers(&mut keyboard, &key_source, desired);
+            }
         }
         let mut event_flags = None;
         let mut restore_modifiers = None;
@@ -840,15 +886,26 @@ impl InputInjector {
                 )
             }
             Payload::Key { key, down, .. } => {
-                let stroke = {
+                let (stroke, key_source) = {
                     let mut keyboard = match self.keyboard.lock() {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
+                    let Some(key_source) = keyboard.event_source() else {
+                        log::error!("[MAC-KEY] persistent HID event source unavailable");
+                        return 0;
+                    };
                     if keyboard.source_modifiers.set(*key, *down) {
                         let desired = map_modifiers(true, keyboard.source_modifiers);
-                        sync_mac_modifiers(&mut keyboard, desired);
-                        return 1;
+                        return if sync_mac_modifiers(
+                            &mut keyboard,
+                            &key_source,
+                            desired,
+                        ) {
+                            1
+                        } else {
+                            0
+                        };
                     }
                     let stroke = keyboard.prepare_key(*key, *down);
                     if *down {
@@ -866,7 +923,13 @@ impl InputInjector {
                             );
                         }
                     }
-                    sync_mac_modifiers(&mut keyboard, stroke.modifiers);
+                    if !sync_mac_modifiers(
+                        &mut keyboard,
+                        &key_source,
+                        stroke.modifiers,
+                    ) {
+                        return 0;
+                    }
                     if !*down
                         && translate_windows_shortcut_to_mac(
                             keyboard.source_modifiers,
@@ -878,10 +941,10 @@ impl InputInjector {
                             keyboard.source_modifiers,
                         ));
                     }
-                    stroke
+                    (stroke, key_source)
                 };
                 event_flags = Some(mac_event_flags(stroke.modifiers));
-                CGEvent::new_keyboard_event(source, key_to_cg(stroke.key), *down)
+                CGEvent::new_keyboard_event(key_source, key_to_cg(stroke.key), *down)
             }
             other => {
                 log::debug!("注入跳过（非输入事件）: {other:?}");
@@ -904,26 +967,37 @@ impl InputInjector {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            sync_mac_modifiers(&mut keyboard, desired);
+            if let Some(key_source) = keyboard.event_source() {
+                let _ = sync_mac_modifiers(&mut keyboard, &key_source, desired);
+            }
         }
         1
     }
 
     /// Release remote keys/buttons that might still be down after a handoff or disconnect.
     pub fn reset_keyboard_state(&self) {
-        let active_keys = {
+        let (active_keys, key_source) = {
             let mut keyboard = match self.keyboard.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
+            let key_source = keyboard.event_source();
             let keys = keyboard
                 .active
                 .values()
                 .map(|stroke| stroke.key)
                 .collect::<Vec<_>>();
-            sync_mac_modifiers(&mut keyboard, ModifierState::default());
-            *keyboard = KeyboardState::default();
-            keys
+            if let Some(source) = &key_source {
+                let _ = sync_mac_modifiers(
+                    &mut keyboard,
+                    source,
+                    ModifierState::default(),
+                );
+            }
+            keyboard.source_modifiers = ModifierState::default();
+            keyboard.applied_modifiers = ModifierState::default();
+            keyboard.active.clear();
+            (keys, key_source)
         };
         let held_button = HELD_BUTTON.swap(-1, Ordering::Relaxed);
         if (0..=2).contains(&held_button) {
@@ -953,19 +1027,30 @@ impl InputInjector {
             }
         }
 
-        for key in active_keys {
-            let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
-                continue;
-            };
-            let Ok(event) = CGEvent::new_keyboard_event(source, key_to_cg(key), false) else {
-                continue;
-            };
-            event.set_flags(CGEventFlags::empty());
-            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
-            event.post(CGEventTapLocation::HID);
-        }
-        for key in [Key::Shift, Key::Ctrl, Key::Alt, Key::Super] {
-            post_mac_modifier(key, false, ModifierState::default());
+        if let Some(source) = key_source {
+            for key in active_keys {
+                let Ok(event) = CGEvent::new_keyboard_event(
+                    source.clone(),
+                    key_to_cg(key),
+                    false,
+                ) else {
+                    continue;
+                };
+                event.set_flags(CGEventFlags::empty());
+                event.set_integer_value_field(
+                    EventField::EVENT_SOURCE_USER_DATA,
+                    RUISS_EVENT_MARKER,
+                );
+                event.post(CGEventTapLocation::HID);
+            }
+            for key in [Key::Shift, Key::Ctrl, Key::Alt, Key::Super] {
+                let _ = post_mac_modifier(
+                    &source,
+                    key,
+                    false,
+                    ModifierState::default(),
+                );
+            }
         }
     }
 }
