@@ -3,10 +3,9 @@
 // 前提：需要"辅助功能"权限（系统设置 → 隐私与安全性 → 辅助功能），
 //       未授权时 CGEventTap 收不到任何事件。权限检查用 AXIsProcessTrusted()。
 //
-// 防回环（与 Windows 的 LLKHF_INJECTED 对应）：注入事件的事件源进程 ID
-// 为本进程 pid，真实硬件事件为 0，WindowServer 合成事件（惯性滚动）为
-// WindowServer/其他 —— 按 `pid == 本进程 pid` 只放行自有注入，本机回环
-// 不互相循环，对端（Windows）注入到本机的事件也不会再转发。
+// 防回环（与 Windows 的 LLKHF_INJECTED 对应）：所有 Ruiss 注入事件都写入专用
+// EVENT_SOURCE_USER_DATA 标记；tap 只按该标记放行自身注入。真实硬件事件和
+// WindowServer 合成的惯性滚动均不带标记，跨屏时会被转发并从本机派发链吞掉。
 //
 // 注意：本文件无法在 Windows 上编译验证；API 以 core-graphics 0.24 为准，
 // 如编译报错请把错误信息发回迭代。
@@ -15,7 +14,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -70,6 +69,7 @@ extern "C" {
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+    fn CGEventTapEnable(tap: *const c_void, enable: bool);
     fn _CGSDefaultConnection() -> i32;
     fn CGSSetConnectionProperty(
         cid: i32,
@@ -107,8 +107,13 @@ pub fn accessibility_trusted() -> bool {
 /// 捕获线程 runloop 指针（stop 时通知退出）。
 static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 
-/// 本进程 pid（tap 防回环判断用；OnceLock 避免每事件调 getpid）。
-static OWN_PID: OnceLock<i64> = OnceLock::new();
+/// 当前事件 tap 的 Mach port。tap 被系统因超时/用户输入禁用时，回调通过它立即
+/// 重新启用；否则 tap 一旦失效，所有本机输入都会绕过 Ruiss 的所有权过滤。
+static TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Ruiss 自己注入的 CGEvent 标记。不能只用 source pid 防回环：触控板惯性段由
+/// WindowServer 合成，source pid 语义并不等价于“是不是 Ruiss 注入”。
+const RUISS_EVENT_MARKER: i64 = 0x5255_4953_535F_4556;
 
 /// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
@@ -368,34 +373,24 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventTapOptions::Default,
         event_types,
         move |_proxy, event_type, event| {
-            // 防回环：仅【本进程自己注入】的事件直通放行（不转发、不吞）。
-            // 原判断 `pid != 0` 会把所有软件合成事件放行——WindowServer 合成的
-            // 惯性滚动（momentum）pid 非 0 也走直通 → 跨屏期间 mac 本地照滚。
-            // 改 `pid == 本进程 pid`（Synergy/InputLeap 同款：Session tap + 按
-            // source pid 识别自身注入），WindowServer 惯性滚动落回正常吞+转发。
-            let own_pid = *OWN_PID.get_or_init(|| std::process::id() as i64);
-            let pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
-            // ===== 滚动诊断（双机验证后可删）=====
-            // 跨屏期间（blocked 或 sink）滚动全量打日志：验证惯性滚动 momentum 段
-            // 是否进 Session tap、pid 是多少、是否被吞。预期：主动段 pid=0、惯性段
-            // pid=WindowServer（非 0 非本进程），都被吞掉只转发对端。
-            if matches!(event_type, CGEventType::ScrollWheel) {
-                let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
-                let sink = SINK_ACTIVE.load(Ordering::Relaxed);
-                if blocked || sink {
-                    let dx = event
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-                    let dy = event
-                        .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-                    log::info!(
-                        "[MAC-SCROLL-DIAG] pid={pid} dx={dx} dy={dy} blocked={blocked} sink={sink} tap=Session own_pid={own_pid}"
-                    );
+            // macOS 会在 tap 超时或用户请求后禁用它；不重新启用时，本机输入将完全
+            // 绕过 Ruiss。特殊通知不属于用户输入，恢复 tap 后直接丢弃通知本身。
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                let tap_ptr = TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
+                if !tap_ptr.is_null() {
+                    unsafe { CGEventTapEnable(tap_ptr, true) };
                 }
+                log::warn!("[MAC-TAP] 事件 tap 被系统禁用，已自动重新启用: {event_type:?}");
+                return None;
             }
-            if pid == own_pid {
-                // 本进程注入的事件（如 warp_cursor、对端注入转发）：放行，不转发、
-                // 不吞（防回环）。CGDisplayHideCursor 系统级、鼠标移动不重显，
-                // 注入移动不会再把光标拉回显示，无需补藏。
+
+            // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
+            // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
+            let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+            if marker == RUISS_EVENT_MARKER {
                 return Some(event.clone());
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
@@ -492,23 +487,30 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 return None;
             }
             if let Some(p) = event_to_payload(event_type, event) {
-                let _ = tx.send(p.clone());
-                // 跨屏期间（主控或被控都算）：键盘/点击吞掉（只转发对端，本机不生效）。
-                // 移动已在上面两个分支分别处理（Source 冻结 / Sink 防双鼠标）。
-                let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
-                let sink = SINK_ACTIVE.load(Ordering::Relaxed);
-                // 滚轮必须完整吞掉。触控板连续/惯性滚动同时携带 point、fixed-point、
-                // line delta 以及 phase/momentum 信息；只清 point delta 再放行时，读取
-                // 其他字段的 App 仍会滚动，造成 Mac 和对端双滚。原始 delta 已在上面
-                // tx.send 转发给对端，这里直接从 Session 派发链移除本机事件。
-                if (blocked || sink) && matches!(p, Payload::MouseWheel { .. }) {
-                    return None;
-                }
-                if (blocked || sink)
-                    && matches!(p, Payload::Key { .. } | Payload::MouseButton { .. })
-                {
-                    return None;
-                }
+                let _ = tx.send(p);
+            }
+
+            // 输入所有权判断必须基于原始 CGEventType，不能依赖 event_to_payload 是否
+            // 认识/成功转换该事件。跨屏期间所有真实键盘、按键和滚动都只允许发往
+            // 对端，本机一律吞掉；移动已在上面的 Source/Sink 分支单独处理。
+            let owns_remote = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                || SINK_ACTIVE.load(Ordering::Relaxed);
+            if owns_remote
+                && matches!(
+                    event_type,
+                    CGEventType::ScrollWheel
+                        | CGEventType::KeyDown
+                        | CGEventType::KeyUp
+                        | CGEventType::FlagsChanged
+                        | CGEventType::LeftMouseDown
+                        | CGEventType::LeftMouseUp
+                        | CGEventType::RightMouseDown
+                        | CGEventType::RightMouseUp
+                        | CGEventType::OtherMouseDown
+                        | CGEventType::OtherMouseUp
+                )
+            {
+                return None;
             }
             // 监听模式：原样放行，绝不吞事件
             Some(event.clone())
@@ -532,15 +534,16 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
     unsafe {
         runloop.add_source(&loop_source, kCFRunLoopCommonModes);
     }
+    TAP_PORT_PTR.store(tap.mach_port.as_concrete_TypeRef() as usize, Ordering::SeqCst);
     tap.enable();
     RUNLOOP_PTR.store(runloop.as_concrete_TypeRef() as usize, Ordering::Relaxed);
 
     let _ = ready.send(Ok(()));
-    let own_pid = *OWN_PID.get_or_init(|| std::process::id() as i64);
-    log::info!("[MAC-TAP] CGEventTap 已启动 location=Session own_pid={own_pid}");
+    log::info!("[MAC-TAP] CGEventTap 已启动 location=Session marker={RUISS_EVENT_MARKER:#x}");
     CFRunLoop::run_current();
 
     // runloop 退出：清理
+    TAP_PORT_PTR.store(0, Ordering::SeqCst);
     RUNLOOP_PTR.store(0, Ordering::Relaxed);
     HOOK_SENDER.with(|s| *s.borrow_mut() = None);
     log::info!("事件 tap 线程已退出");
@@ -745,6 +748,7 @@ impl InputInjector {
             }
         };
         let Ok(cg) = cg else { return 0 };
+        cg.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
         cg.post(CGEventTapLocation::HID);
         1
     }
@@ -775,6 +779,7 @@ pub fn warp_cursor(x: i32, y: i32) {
             CGPoint::new(x as f64, y as f64),
             CGMouseButton::Left,
         ) {
+            ev.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
             ev.post(CGEventTapLocation::HID);
         }
     }
