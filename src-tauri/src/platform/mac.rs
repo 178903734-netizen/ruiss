@@ -69,6 +69,7 @@ extern "C" {
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
     fn _CGSDefaultConnection() -> i32;
     fn CGSSetConnectionProperty(
         cid: i32,
@@ -125,6 +126,26 @@ const MENUBAR_HOT_ZONE: i32 = 25;
 /// 触控板相对位移的 location 会停在冻结位，必须用 delta 累积补上转发坐标。
 /// 种子 = 跨屏 warp 落点的原始坐标（对端入口同 y，镜像不断）。
 static SOURCE_VIRTUAL_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+/// Source 跨屏期间本机系统光标的固定位置。Session tap 收到移动时 WindowServer
+/// 可能已经推进了系统光标；即使事件随后被吞，Dock/应用的 hit-test 仍会看到新位置。
+/// 因此每次物理移动都用无事件的 CGWarpMouseCursorPosition 拉回这个安全落点。
+static SOURCE_SAFE_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+fn park_source_cursor() {
+    let safe = match SOURCE_SAFE_POS.lock() {
+        Ok(g) => *g,
+        Err(p) => *p.into_inner(),
+    };
+    if let Some((x, y)) = safe {
+        unsafe {
+            let err = CGWarpMouseCursorPosition(CGPoint::new(x, y));
+            if err != 0 {
+                log::debug!("[MAC-CURSOR] CGWarpMouseCursorPosition({x}, {y}) err={err}");
+            }
+        }
+    }
+}
 
 /// 本机是否处于"被控端"（Sink）：此时吞掉本机 MouseMoved——光标只跟对端注入走，
 /// 否则本机触控板一动光标就被抢走，与对端注入"打架" → 双鼠标/乱跳。
@@ -183,10 +204,13 @@ pub fn set_local_input_blocked(blocked: bool) {
         // 虚拟位置（= 用户手所在处），否则释放后光标从冻结位重新出现。
         let restore = match SOURCE_VIRTUAL_POS.lock() {
             Ok(g) => *g,
-            Err(p) => p.into_inner(),
+            Err(p) => *p.into_inner(),
         };
         if let Some((x, y)) = restore {
             warp_cursor(x as i32, y as i32);
+        }
+        if let Ok(mut g) = SOURCE_SAFE_POS.lock() {
+            *g = None;
         }
     }
 }
@@ -450,6 +474,10 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     }
                 };
                 let (w, h) = screen_size();
+                // Session tap 位于 WindowServer 更新光标之后；吞事件只能阻止应用接收，
+                // 不能保证撤销已经发生的系统光标位移。立即拉回跨屏安全点，避免物理
+                // 指针跟着 Windows 坐标进入 Mac 的 Dock/应用热区并触发 hover。
+                park_source_cursor();
                 log::debug!(
                     "[MAC-MOVE] 跨屏吞本机移动 → 转发虚拟位置 ({}, {})",
                     vx as i32,
@@ -769,6 +797,9 @@ pub fn warp_cursor_cross(x: i32, y: i32) {
     } else {
         y
     };
+    if let Ok(mut g) = SOURCE_SAFE_POS.lock() {
+        *g = Some((x as f64, ty as f64));
+    }
     warp_cursor(x, ty);
 }
 
