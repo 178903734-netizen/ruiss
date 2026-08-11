@@ -10,6 +10,7 @@
 // TODO(M2)：多显示器坐标（虚拟屏幕归一化）、X 键鼠标按键、键位映射接入 keys.rs。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -58,7 +59,9 @@ use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::DragQueryFileW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
-use crate::core::keys::Key;
+use crate::core::keys::{
+    map_modifiers, translate_macos_shortcut_to_windows, Key, ModifierState, ShortcutStroke,
+};
 use crate::core::protocol::Payload;
 
 /// 平台标记：来源端是否 Mac（用于键位映射方向）。
@@ -641,12 +644,25 @@ pub fn key_to_vk(key: Key) -> u32 {
     }
 }
 
+#[derive(Default)]
+struct KeyboardState {
+    source_modifiers: ModifierState,
+    applied_modifiers: ModifierState,
+    active: HashMap<Key, ShortcutStroke>,
+}
+
 /// 注入器：把协议事件用 SendInput 回放到本机。
-pub struct InputInjector;
+pub struct InputInjector {
+    keyboard: Mutex<KeyboardState>,
+    held_button: AtomicI32,
+}
 
 impl InputInjector {
     pub fn new() -> Self {
-        Self
+        Self {
+            keyboard: Mutex::new(KeyboardState::default()),
+            held_button: AtomicI32::new(-1),
+        }
     }
 
     /// 注入一条事件，返回 SendInput 实际注入的条数（0 = 失败/跳过）。
@@ -661,10 +677,68 @@ impl InputInjector {
         let inputs: Vec<INPUT> = match &event {
             Payload::MouseMove { x, y, .. } => mouse_move_inputs(*x, *y),
             Payload::MouseMoveRelative { dx, dy } => mouse_move_relative_inputs(*dx, *dy),
-            Payload::MouseButton { button, down } => mouse_button_inputs(*button, *down),
-            Payload::MouseWheel { dx, dy } => mouse_wheel_inputs(*dx, *dy),
+            Payload::MouseButton { button, down } => {
+                self.held_button.store(if *down { *button as i32 } else { -1 }, Ordering::Relaxed);
+                let mut keyboard = match self.keyboard.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let desired = map_modifiers(false, keyboard.source_modifiers);
+                let mut inputs = sync_windows_modifiers(&mut keyboard, desired);
+                inputs.extend(mouse_button_inputs(*button, *down));
+                inputs
+            }
+            Payload::MouseWheel { dx, dy } => {
+                let mut keyboard = match self.keyboard.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let desired = map_modifiers(false, keyboard.source_modifiers);
+                let mut inputs = sync_windows_modifiers(&mut keyboard, desired);
+                inputs.extend(mouse_wheel_inputs(*dx, *dy));
+                inputs
+            }
             Payload::Key { key, scan, extended, down } => {
-                key_inputs(*key, *scan, *extended, *down)
+                let mut keyboard = match self.keyboard.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if keyboard.source_modifiers.set(*key, *down) {
+                    let desired = map_modifiers(false, keyboard.source_modifiers);
+                    sync_windows_modifiers(&mut keyboard, desired)
+                } else {
+                    let stroke = if *down {
+                        let stroke = translate_macos_shortcut_to_windows(
+                            keyboard.source_modifiers,
+                            *key,
+                        );
+                        keyboard.active.insert(*key, stroke);
+                        stroke
+                    } else {
+                        keyboard.active.remove(key).unwrap_or_else(|| {
+                            translate_macos_shortcut_to_windows(keyboard.source_modifiers, *key)
+                        })
+                    };
+                    let restore_after_key_up = !*down
+                        && translate_macos_shortcut_to_windows(
+                            keyboard.source_modifiers,
+                            *key,
+                        ) != stroke;
+                    let mut inputs = sync_windows_modifiers(&mut keyboard, stroke.modifiers);
+                    // A translated key must use its target VK, not the source scan code.
+                    let translated = stroke.key != *key;
+                    inputs.extend(key_inputs(
+                        stroke.key,
+                        if translated { 0 } else { *scan },
+                        if translated { false } else { *extended },
+                        *down,
+                    ));
+                    if restore_after_key_up {
+                        let desired = map_modifiers(false, keyboard.source_modifiers);
+                        inputs.extend(sync_windows_modifiers(&mut keyboard, desired));
+                    }
+                    inputs
+                }
             }
             other => {
                 log::debug!("注入跳过（非输入事件）: {other:?}");
@@ -686,6 +760,62 @@ impl InputInjector {
         log::debug!("注入: {event:?} → SendInput 返回 {n}");
         n
     }
+
+    /// Release remote keys/buttons defensively when ownership changes unexpectedly.
+    pub fn reset_keyboard_state(&self) {
+        let mut keyboard = match self.keyboard.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut inputs = keyboard
+            .active
+            .values()
+            .flat_map(|stroke| key_inputs(stroke.key, 0, false, false))
+            .collect::<Vec<_>>();
+        *keyboard = KeyboardState::default();
+        let held_button = self.held_button.swap(-1, Ordering::Relaxed);
+        if (0..=2).contains(&held_button) {
+            inputs.extend(mouse_button_inputs(held_button as u8, false));
+        }
+        for key in [Key::Ctrl, Key::Alt, Key::Shift, Key::Super] {
+            inputs.extend(key_inputs(key, 0, false, false));
+        }
+        if !inputs.is_empty() {
+            unsafe {
+                SendInput(&inputs, size_of::<INPUT>() as i32);
+            }
+        }
+    }
+}
+
+fn sync_windows_modifiers(
+    keyboard: &mut KeyboardState,
+    desired: ModifierState,
+) -> Vec<INPUT> {
+    let current = keyboard.applied_modifiers;
+    let mut inputs = Vec::new();
+    for (key, was_down, should_down) in [
+        (Key::Super, current.super_key, desired.super_key),
+        (Key::Alt, current.alt, desired.alt),
+        (Key::Ctrl, current.ctrl, desired.ctrl),
+        (Key::Shift, current.shift, desired.shift),
+    ] {
+        if was_down && !should_down {
+            inputs.extend(key_inputs(key, 0, false, false));
+        }
+    }
+    for (key, was_down, should_down) in [
+        (Key::Ctrl, current.ctrl, desired.ctrl),
+        (Key::Alt, current.alt, desired.alt),
+        (Key::Shift, current.shift, desired.shift),
+        (Key::Super, current.super_key, desired.super_key),
+    ] {
+        if !was_down && should_down {
+            inputs.extend(key_inputs(key, 0, false, true));
+        }
+    }
+    keyboard.applied_modifiers = desired;
+    inputs
 }
 
 fn mouse_move_relative_inputs(dx: i32, dy: i32) -> Vec<INPUT> {

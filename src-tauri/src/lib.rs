@@ -415,6 +415,7 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                         acts.clear();
                         if was_active {
                             log::warn!("网络断开，复位跨屏状态");
+                            r.injector.reset_keyboard_state();
                             platform::show_cursor();
                             platform::set_local_input_blocked(false);
                             platform::set_sink_active(false);
@@ -451,12 +452,12 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
 
 /// 执行仲裁器动作：发令牌 / 回绕光标 / 转发事件。
 fn execute_action(router: &Mutex<RouterState>, action: Action) {
-    let (name, net) = {
+    let (name, net, injector) = {
         let r = match router.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        (r.settings.name.clone(), r.net.clone())
+        (r.settings.name.clone(), r.net.clone(), r.injector.clone())
     };
     let Some(net) = net else {
         return;
@@ -464,11 +465,12 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
     match action {
         Action::TakeControl { x, y, src_w, src_h } => {
             let session = next_pointer_session();
-            {
+            let was_sink = {
                 let mut r = match router.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
                 };
+                let was_sink = r.rx_pointer_session != 0;
                 r.tx_pointer_session = session;
                 r.tx_pointer_ready = false;
                 r.tx_pointer_seq = 0;
@@ -476,6 +478,12 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 // 从 Sink 反向夺回时，旧接收轮次立即作废。
                 r.rx_pointer_session = 0;
                 r.rx_pointer_seq = 0;
+                was_sink
+            };
+            // Normal Source crossover has no local injected keyboard state. Only a
+            // reverse takeover from Sink needs local target keys released here.
+            if was_sink {
+                injector.reset_keyboard_state();
             }
             log::info!("发起跨屏 session={session} → TakeControl({x}, {y})");
             // 本机光标"离开"（隐藏），避免双光标；键盘/点击/滚轮被拦截，只转发对端
@@ -537,6 +545,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             }
         }
         Action::ReleaseControl => {
+            injector.reset_keyboard_state();
             let session = {
                 let mut r = match router.lock() {
                     Ok(g) => g,
@@ -587,6 +596,11 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             Payload::MouseMoveRelative { dx, dy } => {
                 forward_pointer_move(router, Payload::MouseMoveRelative { dx, dy });
             }
+            // Key/button up must never be silently dropped, otherwise the target can be
+            // left with a stuck modifier or mouse button. Use the reliable control lane.
+            event @ (Payload::Key { .. } | Payload::MouseButton { .. }) => {
+                net.send_ctrl(Message::event(&name, event));
+            }
             other => net.send(Message::event(&name, other)),
         },
         Action::None => {}
@@ -609,6 +623,7 @@ async fn run_incoming_router(
                 src_w,
                 src_h,
             } => {
+                injector.reset_keyboard_state();
                 // 被接管：本机系统光标保持可见——对端注入的事件移动的就是
                 // 这个系统光标，隐藏它会导致"被控但找不到鼠标"；本机输入恢复原样
                 platform::show_cursor();
@@ -701,6 +716,7 @@ async fn run_incoming_router(
                     continue;
                 }
                 log::info!("对端归还控制 session={session}");
+                injector.reset_keyboard_state();
                 platform::show_cursor();
                 platform::set_local_input_blocked(false);
                 platform::set_sink_active(false);
@@ -856,7 +872,9 @@ async fn run_incoming_router(
 /// 注入"粘贴"组合键：本机是 Mac 用 Command+V，Windows 用 Ctrl+V。
 /// 跨屏拖拽文字/图片到对端后，对端在光标处自动粘贴。
 fn inject_paste(injector: &platform::InputInjector) {
-    let mod_key = if platform::TARGET_IS_MAC { Key::Super } else { Key::Ctrl };
+    // InputInjector consumes the peer/source-side semantic key and performs the
+    // Ctrl↔Command mapping. Feed the opposite key to obtain the native target modifier.
+    let mod_key = if platform::TARGET_IS_MAC { Key::Ctrl } else { Key::Super };
     injector.inject(Payload::Key { key: mod_key, scan: 0, extended: false, down: true });
     injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: true });
     injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: false });
@@ -878,6 +896,17 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
             r.settings.clipboard_enabled,
         )
     };
+    let injector = {
+        let r = match router.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        r.injector.clone()
+    };
+    injector.reset_keyboard_state();
+    platform::show_cursor();
+    platform::set_local_input_blocked(false);
+    platform::set_sink_active(false);
     // 停旧引擎
     {
         let mut r = match router.lock() {

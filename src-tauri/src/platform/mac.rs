@@ -10,6 +10,7 @@
 // 注意：本文件无法在 Windows 上原生编译验证；API 以 core-graphics 0.25 为准，
 // 如编译报错请把错误信息发回迭代。
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -30,7 +31,9 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use objc::{sel, sel_impl};
 
-use crate::core::keys::{map_key, Key};
+use crate::core::keys::{
+    map_modifiers, translate_windows_shortcut_to_mac, Key, ModifierState, ShortcutStroke,
+};
 use crate::core::protocol::Payload;
 
 /// 平台标记：来源端是否 Mac（用于键位映射方向）。
@@ -577,6 +580,7 @@ fn modifier_down(key: &Key, event: &CGEvent) -> bool {
         Key::Ctrl => f.contains(CGEventFlags::CGEventFlagControl),
         Key::Alt => f.contains(CGEventFlags::CGEventFlagAlternate),
         Key::Super => f.contains(CGEventFlags::CGEventFlagCommand),
+        Key::CapsLock => f.contains(CGEventFlags::CGEventFlagAlphaShift),
         _ => true,
     }
 }
@@ -606,16 +610,99 @@ impl ClickState {
     }
 }
 
+#[derive(Default)]
+struct KeyboardState {
+    /// 收到的 Windows 源端修饰键状态。
+    source_modifiers: ModifierState,
+    /// 已经在 macOS 目标端同步的修饰键状态。
+    applied_modifiers: ModifierState,
+    /// key-up 沿用 key-down 时的翻译，防止修饰键提前释放导致按键卡住。
+    active: HashMap<Key, ShortcutStroke>,
+}
+
+impl KeyboardState {
+    fn prepare_key(&mut self, key: Key, down: bool) -> ShortcutStroke {
+        if down {
+            let stroke = translate_windows_shortcut_to_mac(self.source_modifiers, key);
+            self.active.insert(key, stroke);
+            stroke
+        } else {
+            self.active
+                .remove(&key)
+                .unwrap_or_else(|| translate_windows_shortcut_to_mac(self.source_modifiers, key))
+        }
+    }
+}
+
+fn mac_event_flags(modifiers: ModifierState) -> CGEventFlags {
+    let mut flags = CGEventFlags::empty();
+    if modifiers.ctrl {
+        flags |= CGEventFlags::CGEventFlagControl;
+    }
+    if modifiers.alt {
+        flags |= CGEventFlags::CGEventFlagAlternate;
+    }
+    if modifiers.shift {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    if modifiers.super_key {
+        flags |= CGEventFlags::CGEventFlagCommand;
+    }
+    flags
+}
+
+fn post_mac_modifier(key: Key, down: bool, modifiers: ModifierState) {
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        return;
+    };
+    let Ok(event) = CGEvent::new_keyboard_event(source, key_to_cg(key), down) else {
+        return;
+    };
+    event.set_flags(mac_event_flags(modifiers));
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
+    event.post(CGEventTapLocation::HID);
+}
+
+fn sync_mac_modifiers(keyboard: &mut KeyboardState, desired: ModifierState) {
+    let current = keyboard.applied_modifiers;
+    let mut next = current;
+    for (key, was_down, should_down) in [
+        (Key::Super, current.super_key, desired.super_key),
+        (Key::Alt, current.alt, desired.alt),
+        (Key::Ctrl, current.ctrl, desired.ctrl),
+        (Key::Shift, current.shift, desired.shift),
+    ] {
+        if was_down && !should_down {
+            next.set(key, false);
+            post_mac_modifier(key, false, next);
+        }
+    }
+    for (key, was_down, should_down) in [
+        (Key::Ctrl, current.ctrl, desired.ctrl),
+        (Key::Alt, current.alt, desired.alt),
+        (Key::Shift, current.shift, desired.shift),
+        (Key::Super, current.super_key, desired.super_key),
+    ] {
+        if !was_down && should_down {
+            next.set(key, true);
+            post_mac_modifier(key, true, next);
+        }
+    }
+    keyboard.applied_modifiers = desired;
+}
+
 /// 注入器：CGEventPost 回放事件。
 pub struct InputInjector {
     /// 点击计数状态（跨线程：注入可能在消费线程/主线程被调用）。
     click: Mutex<ClickState>,
+    keyboard: Mutex<KeyboardState>,
 }
 
 impl InputInjector {
     pub fn new() -> Self {
         Self {
             click: Mutex::new(ClickState::new()),
+            keyboard: Mutex::new(KeyboardState::default()),
         }
     }
 
@@ -631,6 +718,16 @@ impl InputInjector {
             Ok(s) => s,
             Err(_) => return 0,
         };
+        if matches!(event, Payload::MouseButton { .. } | Payload::MouseWheel { .. }) {
+            let mut keyboard = match self.keyboard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let desired = map_modifiers(true, keyboard.source_modifiers);
+            sync_mac_modifiers(&mut keyboard, desired);
+        }
+        let mut event_flags = None;
+        let mut restore_modifiers = None;
         let cg = match &event {
             Payload::MouseMove { x, y, .. } => {
                 // 按住左键拖动期间必须注入 LeftMouseDragged（MouseMoved 不会更新选区
@@ -739,8 +836,33 @@ impl InputInjector {
                 )
             }
             Payload::Key { key, down, .. } => {
-                let key = map_key(true, *key); // 目标为 Mac：Ctrl ↔ Command 映射
-                CGEvent::new_keyboard_event(source, key_to_cg(key), *down)
+                let stroke = {
+                    let mut keyboard = match self.keyboard.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    if keyboard.source_modifiers.set(*key, *down) {
+                        let desired = map_modifiers(true, keyboard.source_modifiers);
+                        sync_mac_modifiers(&mut keyboard, desired);
+                        return 1;
+                    }
+                    let stroke = keyboard.prepare_key(*key, *down);
+                    sync_mac_modifiers(&mut keyboard, stroke.modifiers);
+                    if !*down
+                        && translate_windows_shortcut_to_mac(
+                            keyboard.source_modifiers,
+                            *key,
+                        ) != stroke
+                    {
+                        restore_modifiers = Some(map_modifiers(
+                            true,
+                            keyboard.source_modifiers,
+                        ));
+                    }
+                    stroke
+                };
+                event_flags = Some(mac_event_flags(stroke.modifiers));
+                CGEvent::new_keyboard_event(source, key_to_cg(stroke.key), *down)
             }
             other => {
                 log::debug!("注入跳过（非输入事件）: {other:?}");
@@ -748,9 +870,84 @@ impl InputInjector {
             }
         };
         let Ok(cg) = cg else { return 0 };
+        let flags = event_flags.unwrap_or_else(|| {
+            let keyboard = match self.keyboard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            mac_event_flags(keyboard.applied_modifiers)
+        });
+        cg.set_flags(flags);
         cg.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
         cg.post(CGEventTapLocation::HID);
+        if let Some(desired) = restore_modifiers {
+            let mut keyboard = match self.keyboard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            sync_mac_modifiers(&mut keyboard, desired);
+        }
         1
+    }
+
+    /// Release remote keys/buttons that might still be down after a handoff or disconnect.
+    pub fn reset_keyboard_state(&self) {
+        let active_keys = {
+            let mut keyboard = match self.keyboard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let keys = keyboard
+                .active
+                .values()
+                .map(|stroke| stroke.key)
+                .collect::<Vec<_>>();
+            sync_mac_modifiers(&mut keyboard, ModifierState::default());
+            *keyboard = KeyboardState::default();
+            keys
+        };
+        let held_button = HELD_BUTTON.swap(-1, Ordering::Relaxed);
+        if (0..=2).contains(&held_button) {
+            let (event_type, button) = match held_button {
+                0 => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+                1 => (CGEventType::RightMouseUp, CGMouseButton::Right),
+                _ => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+            };
+            let (x, y) = LAST_POS
+                .lock()
+                .map(|pos| pos.unwrap_or((0.0, 0.0)))
+                .unwrap_or((0.0, 0.0));
+            if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+                if let Ok(event) = CGEvent::new_mouse_event(
+                    source,
+                    event_type,
+                    CGPoint::new(x, y),
+                    button,
+                ) {
+                    event.set_flags(CGEventFlags::empty());
+                    event.set_integer_value_field(
+                        EventField::EVENT_SOURCE_USER_DATA,
+                        RUISS_EVENT_MARKER,
+                    );
+                    event.post(CGEventTapLocation::HID);
+                }
+            }
+        }
+
+        for key in active_keys
+            .into_iter()
+            .chain([Key::Shift, Key::Ctrl, Key::Alt, Key::Super])
+        {
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                continue;
+            };
+            let Ok(event) = CGEvent::new_keyboard_event(source, key_to_cg(key), false) else {
+                continue;
+            };
+            event.set_flags(CGEventFlags::empty());
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
+            event.post(CGEventTapLocation::HID);
+        }
     }
 }
 
