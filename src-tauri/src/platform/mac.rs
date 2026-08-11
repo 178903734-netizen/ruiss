@@ -24,8 +24,8 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, CGMouseButton, EventField, ScrollEventUnit,
+    CallbackResult, CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
+    CGEventTapPlacement, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -107,15 +107,18 @@ pub fn accessibility_trusted() -> bool {
 /// 捕获线程 runloop 指针（stop 时通知退出）。
 static RUNLOOP_PTR: AtomicUsize = AtomicUsize::new(0);
 
-/// 当前事件 tap 的 Mach port。tap 被系统因超时/用户输入禁用时，回调通过它立即
-/// 重新启用；否则 tap 一旦失效，所有本机输入都会绕过 Ruiss 的所有权过滤。
-static TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
+/// 两个事件 tap 的 Mach port。HID tap 在 WindowServer 处理前抢占物理点击；
+/// Session tap 保留现有移动/键盘和完整惯性滚动处理。tap 被系统禁用时，回调
+/// 通过对应指针立即重新启用。
+static HID_CLICK_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
+static SESSION_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Ruiss 自己注入的 CGEvent 标记。不能只用 source pid 防回环：触控板惯性段由
 /// WindowServer 合成，source pid 语义并不等价于“是不是 Ruiss 注入”。
 const RUISS_EVENT_MARKER: i64 = 0x5255_4953_535F_4556;
 
-/// 跨屏期间是否拦截本机键盘/点击/滚轮（只转发对端，本机不生效；移动放行）。
+/// Source 跨屏期间是否独占本机输入：点击由 HID tap 提前截获，其余输入由
+/// Session tap 转发后删除，Mac 本机不再接收。
 static BLOCK_LOCAL_INPUT: AtomicBool = AtomicBool::new(false);
 
 /// Dock 热区高度（屏幕底部，逻辑像素）：隐藏光标不能停在里面——macOS 在
@@ -347,6 +350,74 @@ impl InputCapturer {
 
 /// 捕获线程主体：创建 tap → 加入 runloop → 泵事件。
 fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
+    let hid_click_tx = tx.clone();
+    // SAFETY：两个 tap 及其回调都只安装在当前捕获线程的 runloop，且在
+    // CFRunLoop::run_current 返回前始终存活。
+    let hid_click_tap = match unsafe {
+        CGEventTap::new_unchecked(
+            // 点击必须在进入 WindowServer 前截获。只把按下/松开移到 HID 层，现有
+            // Session 移动、虚拟坐标和惯性滚动逻辑保持不变。
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            vec![
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+            ],
+            move |_proxy, event_type, event| {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                let tap_ptr =
+                    HID_CLICK_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
+                if !tap_ptr.is_null() {
+                    unsafe { CGEventTapEnable(tap_ptr, true) };
+                }
+                log::warn!(
+                    "[MAC-TAP] HID 点击 tap 被系统禁用，已自动重新启用: {event_type:?}"
+                );
+                return CallbackResult::Drop;
+            }
+
+            // 对端注入到 Mac 的点击必须放行，且不能再次转发形成回环。
+            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                == RUISS_EVENT_MARKER
+            {
+                return CallbackResult::Keep;
+            }
+
+            let blocked = BLOCK_LOCAL_INPUT.load(Ordering::SeqCst);
+            let sink = SINK_ACTIVE.load(Ordering::SeqCst);
+            if blocked {
+                // Source：物理点击只转发到对端，并在进入 WindowServer 前移除。
+                if let Some(payload) = event_to_payload(event_type, event) {
+                    let _ = hid_click_tx.send(payload);
+                }
+                return CallbackResult::Drop;
+            }
+            if sink {
+                // Sink：光标归对端控制，本机物理点击不能作用于任何一端。
+                return CallbackResult::Drop;
+            }
+
+            // 未跨屏时不在 HID 层发送；放到原 Session tap 统一捕获一次。
+                CallbackResult::Keep
+            },
+        )
+    } {
+        Ok(t) => t,
+        Err(_) => {
+            log::error!("HID 点击 CGEventTap 创建失败");
+            let _ = ready.send(Err(anyhow!("HID 点击 CGEventTap 创建失败")));
+            return;
+        }
+    };
+
     let event_types = vec![
         CGEventType::MouseMoved,
         CGEventType::LeftMouseDragged,
@@ -363,35 +434,37 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         CGEventType::KeyUp,
         CGEventType::FlagsChanged,
     ];
-    let tap = match CGEventTap::new(
-        // 捕获层：Session（WindowServer 对外派发层），不用 HID。关键：触控板惯性
-        // 滚动（momentum 段）由 WindowServer 内部合成派发，HID 层 tap return None
-        // 拦不住（实测 Mac 应用照样滚，见 2026-08-11 实验 6618b71），只有 Session
-        // 层才能拦截——跨屏双滚根因就在这。
-        CGEventTapLocation::Session,
-        CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Default,
-        event_types,
-        move |_proxy, event_type, event| {
+    // SAFETY：同上，Session tap 只由当前线程的 runloop 调用，生命周期覆盖 runloop。
+    let tap = match unsafe {
+        CGEventTap::new_unchecked(
+            // 捕获层：Session（WindowServer 对外派发层），不用 HID。关键：触控板惯性
+            // 滚动（momentum 段）由 WindowServer 内部合成派发，HID 层 Drop
+            // 拦不住（实测 Mac 应用照样滚，见 2026-08-11 实验 6618b71），只有 Session
+            // 层才能拦截——跨屏双滚根因就在这。
+            CGEventTapLocation::Session,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            event_types,
+            move |_proxy, event_type, event| {
             // macOS 会在 tap 超时或用户请求后禁用它；不重新启用时，本机输入将完全
             // 绕过 Ruiss。特殊通知不属于用户输入，恢复 tap 后直接丢弃通知本身。
             if matches!(
                 event_type,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                let tap_ptr = TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
+                let tap_ptr = SESSION_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
                 if !tap_ptr.is_null() {
                     unsafe { CGEventTapEnable(tap_ptr, true) };
                 }
                 log::warn!("[MAC-TAP] 事件 tap 被系统禁用，已自动重新启用: {event_type:?}");
-                return None;
+                return CallbackResult::Drop;
             }
 
             // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
             // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
             let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
             if marker == RUISS_EVENT_MARKER {
-                return Some(event.clone());
+                return CallbackResult::Keep;
             }
             // 被控端（Sink）：本机 MouseMoved 吞掉（光标不跟随本机，防双鼠标），
             // 但相对位移 delta 累积成虚拟位置发送给仲裁器——本机鼠标推到
@@ -429,7 +502,7 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     src_h: h as u32,
                 });
                 // 吞掉真实事件：光标不跟随本机鼠标（防双鼠标）
-                return None;
+                return CallbackResult::Drop;
             }
             // Source 跨屏（出本机）：本机 MouseMoved/Dragged 吞掉——光标冻结在
             // 跨屏安全位（warp_cursor_cross 的落点），不跟物理鼠标滑向 Dock/菜单栏
@@ -484,7 +557,7 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     src_w: w as u32,
                     src_h: h as u32,
                 });
-                return None;
+                return CallbackResult::Drop;
             }
             if let Some(p) = event_to_payload(event_type, event) {
                 let _ = tx.send(p);
@@ -510,12 +583,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                         | CGEventType::OtherMouseUp
                 )
             {
-                return None;
+                return CallbackResult::Drop;
             }
             // 监听模式：原样放行，绝不吞事件
-            Some(event.clone())
-        },
-    ) {
+                CallbackResult::Keep
+            },
+        )
+    } {
         Ok(t) => t,
         Err(_) => {
             log::error!("CGEventTap 创建失败");
@@ -524,26 +598,42 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
         }
     };
 
-    // tap 通过 mach_port 创建 runloop source 并加入当前 runloop
+    // 两个 tap 通过 mach_port 创建 runloop source 并加入同一个捕获线程 runloop。
     let runloop = CFRunLoop::get_current();
+    let hid_click_loop_source = hid_click_tap
+        .mach_port()
+        .create_runloop_source(0)
+        .expect("HID click create_runloop_source 失败");
     let loop_source = tap
-        .mach_port
+        .mach_port()
         .create_runloop_source(0)
         .expect("create_runloop_source 失败");
     // kCFRunLoopCommonModes 是 extern static，读取需 unsafe
     unsafe {
+        runloop.add_source(&hid_click_loop_source, kCFRunLoopCommonModes);
         runloop.add_source(&loop_source, kCFRunLoopCommonModes);
     }
-    TAP_PORT_PTR.store(tap.mach_port.as_concrete_TypeRef() as usize, Ordering::SeqCst);
+    HID_CLICK_TAP_PORT_PTR.store(
+        hid_click_tap.mach_port().as_concrete_TypeRef() as usize,
+        Ordering::SeqCst,
+    );
+    SESSION_TAP_PORT_PTR.store(
+        tap.mach_port().as_concrete_TypeRef() as usize,
+        Ordering::SeqCst,
+    );
+    hid_click_tap.enable();
     tap.enable();
     RUNLOOP_PTR.store(runloop.as_concrete_TypeRef() as usize, Ordering::Relaxed);
 
     let _ = ready.send(Ok(()));
-    log::info!("[MAC-TAP] CGEventTap 已启动 location=Session marker={RUISS_EVENT_MARKER:#x}");
+    log::info!(
+        "[MAC-TAP] CGEventTap 已启动 click=HID other=Session marker={RUISS_EVENT_MARKER:#x}"
+    );
     CFRunLoop::run_current();
 
     // runloop 退出：清理
-    TAP_PORT_PTR.store(0, Ordering::SeqCst);
+    HID_CLICK_TAP_PORT_PTR.store(0, Ordering::SeqCst);
+    SESSION_TAP_PORT_PTR.store(0, Ordering::SeqCst);
     RUNLOOP_PTR.store(0, Ordering::Relaxed);
     HOOK_SENDER.with(|s| *s.borrow_mut() = None);
     log::info!("事件 tap 线程已退出");
