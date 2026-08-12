@@ -148,10 +148,10 @@
   function displayShortcut(shortcut) {
     if (!shortcut) return '已清除';
     const parts = [];
-    if (shortcut.modifiers.ctrl) parts.push('Control');
-    if (shortcut.modifiers.alt) parts.push('Option');
+    if (shortcut.modifiers.ctrl) parts.push('Ctrl');
+    if (shortcut.modifiers.alt) parts.push('Alt');
     if (shortcut.modifiers.shift) parts.push('Shift');
-    if (shortcut.modifiers.superKey) parts.push('Command');
+    if (shortcut.modifiers.superKey) parts.push('Win');
     parts.push(displayKey(shortcut.key));
     return parts.join(' + ');
   }

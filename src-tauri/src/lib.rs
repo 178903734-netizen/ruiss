@@ -23,7 +23,9 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
-use crate::core::keys::{Key, ModifierState, NativeShortcut};
+use crate::core::keys::{
+    translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut,
+};
 use crate::core::protocol::{Message, Payload};
 
 /// Tauri 入口。
@@ -391,6 +393,8 @@ fn route_captured_payload(r: &mut RouterState, payload: Payload) -> Vec<Action> 
 }
 
 /// Some(Vec) means the physical mouse button is handled (an empty Vec disables it).
+/// Bindings are recorded with Windows keyboard semantics so clicking a mouse
+/// button behaves exactly like pressing the same shortcut on the source keyboard.
 fn mouse_binding_actions(settings: &Settings, payload: &Payload) -> Option<Vec<Action>> {
     let Payload::MouseButton { button, down } = payload else {
         return None;
@@ -404,11 +408,18 @@ fn mouse_binding_actions(settings: &Settings, payload: &Payload) -> Option<Vec<A
     if !down {
         return Some(Vec::new());
     }
-    Some(
-        binding
-            .map(|shortcut| vec![Action::Forward(Payload::Shortcut { shortcut })])
-            .unwrap_or_default(),
-    )
+    Some(match binding {
+        Some(source) => {
+            let target = translate_windows_shortcut_to_mac(source.modifiers, source.key);
+            vec![Action::Forward(Payload::Shortcut {
+                shortcut: NativeShortcut {
+                    key: target.key,
+                    modifiers: target.modifiers,
+                },
+            })]
+        }
+        None => Vec::new(),
+    })
 }
 
 /// 空闲心跳：每 25ms 推进仲裁器停留判定（光标停在边缘不动时也能触发）。
@@ -1018,7 +1029,8 @@ struct Settings {
     clipboard_enabled: bool,
     /// 开机自启
     autostart: bool,
-    /// Windows 鼠标按键跨到 Mac 后触发的目标端原生快捷键；None 表示禁用。
+    /// Windows 鼠标按键绑定，按 Windows 源键盘语义记录；发送前使用与普通键盘
+    /// 相同的规则翻译到 Mac。None 表示禁用。
     #[serde(default = "default_mouse_back_shortcut")]
     mouse_back_shortcut: Option<NativeShortcut>,
     #[serde(default = "default_mouse_forward_shortcut")]
@@ -1202,7 +1214,7 @@ mod mouse_binding_tests {
     use super::*;
 
     #[test]
-    fn default_mouse_buttons_are_native_mac_control_shortcuts() {
+    fn default_mouse_buttons_match_windows_ctrl_keyboard_translation() {
         let settings = Settings::default();
         for (button, key) in [(3, Key::Digit1), (4, Key::Digit2), (2, Key::Digit3)] {
             let actions = mouse_binding_actions(
@@ -1216,7 +1228,7 @@ mod mouse_binding_tests {
                     shortcut: NativeShortcut {
                         key,
                         modifiers: ModifierState {
-                            ctrl: true,
+                            super_key: true,
                             ..Default::default()
                         },
                     },
