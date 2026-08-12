@@ -312,6 +312,11 @@ impl Connector {
                                 | Payload::FileBatchCancel { .. }
                                 | Payload::FileResult { .. }
                                 | Payload::FileBatchResult { .. }
+                                // 跨屏拖拽会话消息同样由 run_file_router 处理，
+                                // 必须进入文件队列，否则在普通路由中被丢弃。
+                                | Payload::DragStart { .. }
+                                | Payload::DragCommit { .. }
+                                | Payload::DragCancel { .. }
                         );
                         let closed = if is_file {
                             file_incoming.send(msg).await.is_err()

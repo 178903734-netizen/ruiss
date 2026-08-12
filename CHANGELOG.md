@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-08-12 — 修复跨屏拖拽消息被分流丢弃（拖文件过去对端无文件）
+
+现象：跨屏拖拽文件，对端完全没有文件。链路在"对端启动原生拖拽会话"处断开。
+
+- **根因**：net/mod.rs 的读循环按 payload 类型分流——FileBatch*/File* 系列进
+  file_incoming（由 run_file_router 处理），其余进普通 incoming（run_incoming_router）。
+  但 DragStart / DragCommit / DragCancel 三类跨屏拖拽会话消息漏加了 is_file 名单，
+  落入普通队列后被 run_incoming_router 的 _ 分支直接丢弃：
+  对端永远收不到 DragStart → 不启动 DoDragDrop/NSDraggingSession → 松开鼠标无 Drop；
+  源端也收不到 DragCommit → 永远不 commit_drag → 文件永不发送。
+- **修复（net/mod.rs，两端通用，无需分平台）**：把 DragStart / DragCommit / DragCancel
+  加入 is_file 匹配列表，让它们进 file_incoming 由 run_file_router 处理。
+
 ## 2026-08-11（追加）— 修复 mac→win 跨屏"发起即归还"（Sink 自动返回误触发）
 
 现象：mac→win 刚发起跨屏 ~1s 就被归还（win→mac 正常）。日志：发起 TakeControl 后

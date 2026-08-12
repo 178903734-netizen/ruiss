@@ -67,6 +67,9 @@ ruiss/
     tap 回调移动补藏（macOS 移动自动重显）对抗。lib.rs tick 每 100ms 调
     enforce_cursor_hidden()（Windows 已无需补藏，空实现）。
 - net/ — TCP（按键、剪贴板，可靠）+ UDP（鼠标高频移动）。二进制协议，粘包处理。
+  读循环按 payload 分流：FileBatch*/File*/DragStart/DragCommit/DragCancel 进 file_incoming
+  （run_file_router 处理），其余进普通 incoming（run_incoming_router）。新增协议消息时
+  必须检查这里的分流名单，漏加会导致消息被普通路由丢弃。
 - clipboard/ — 监听系统剪贴板变化（Win: AddClipboardFormatListener；Mac: NSPasteboard changeCount 轮询），变化后经 TCP 发给对端；带标记位防回环（收到自己发的不再转发）。对端消息写本机剪贴板（文字/图片/文件路径）。
 - file_transfer/ — M3 文件分块传输：FileSender 把文件按 256KB 分块发 FileStart→Chunk*→FileEnd；FileReceiver 状态机写盘到下载目录（重名自动 (1)(2)），完成后路径写本机剪贴板 + emit file-received 通知前端。触发：本机剪贴板出现文件路径 / GUI 选文件 / 跨屏拖拽。
 
