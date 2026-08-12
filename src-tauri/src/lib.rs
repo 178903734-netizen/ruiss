@@ -64,6 +64,7 @@ pub fn run() {
 
             // 空闲心跳：光标停在边缘不动也能触发跨屏判定
             spawn_tick_task(router.clone());
+            platform::start_drag_path_probe();
 
             // 文件接收器（监听对端 FileStart/Chunk/End，写下载目录 + 写剪贴板 + 通知前端）
             let receive_dir = router.lock().unwrap().settings.receive_dir.clone();
@@ -508,6 +509,19 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
     match action {
         Action::TakeControl { x, y, src_w, src_h } => {
             let session = next_pointer_session();
+            // 只采样一次。捕获到原生文件拖拽后会发送 Esc 结束 Explorer/Finder
+            // 的本机拖拽会话，不能在这之后重新查询左键状态决定是否发送。
+            let left_button_down = platform::is_left_button_down();
+            let drag_paths = if left_button_down {
+                platform::take_drag_paths()
+            } else {
+                Vec::new()
+            };
+            if !drag_paths.is_empty() {
+                // 结束 Explorer/Finder 本机拖拽会话；文件内容已由探针保存，随后走
+                // Ruiss 传输。否则本机原始拖拽会一直等待 MouseUp，留下拖拽残影。
+                platform::cancel_local_drag();
+            }
             let was_sink = {
                 let mut r = match router.lock() {
                     Ok(g) => g,
@@ -547,8 +561,12 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 },
             ));
             // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
-            if platform::is_left_button_down() {
-                let content = platform::clipboard_read();
+            if left_button_down {
+                let content = if drag_paths.is_empty() {
+                    platform::clipboard_read()
+                } else {
+                    platform::ClipboardContent::Files(drag_paths)
+                };
                 let (has_text, has_image, has_files) = match &content {
                     platform::ClipboardContent::Text(_) => (true, false, false),
                     platform::ClipboardContent::Image(_) => (false, true, false),
@@ -581,7 +599,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                                     .into_iter()
                                     .map(std::path::PathBuf::from)
                                     .collect();
-                                if let Err(e) = sender.send_paths(paths) {
+                                if let Err(e) = sender.send_drag_paths(paths) {
                                     log::error!("[FILE] 拖拽文件发送失败: {e}");
                                 }
                             }
@@ -873,7 +891,7 @@ async fn run_incoming_router(
             }
             Payload::DragOffer { drag, has_text, has_image, has_files: _ } => {
                 // 文字/图片拖拽：剪贴板内容随后到达写入，延迟注入粘贴
-                // 文件拖拽：文件传完路径已入剪贴板，用户手动 Ctrl+V（传输耗时不确定）
+                // 文件拖拽：标记下一批文件，待校验完成、整批路径写入剪贴板后再粘贴。
                 if *drag && (*has_text || *has_image) {
                     let inj = injector.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1082,10 +1100,29 @@ async fn run_file_router(
             }
             _ => {
                 if let Some(receiver) = receiver {
-                    for response in receiver.handle(&msg.payload) {
+                    let responses = receiver.handle(&msg.payload);
+                    let should_drop = responses.iter().any(|response| {
+                        matches!(response, Payload::FileBatchResult {
+                            ok: true, drop_at_cursor: true, ..
+                        })
+                    });
+                    for response in responses {
                         if let Some(net) = &net {
                             net.send_ctrl(Message::clipboard(&name, response));
                         }
+                    }
+                    if should_drop {
+                        let injector = {
+                            let r = match router.lock() {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
+                            r.injector.clone()
+                        };
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            inject_paste(&injector);
+                        });
                     }
                 }
             }

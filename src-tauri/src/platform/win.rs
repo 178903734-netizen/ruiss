@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM, HGLOBAL};
+use windows::core::{implement, w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, POINTL, WPARAM, HGLOBAL};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -47,7 +48,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
     CreateCursor, SetSystemCursor,
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
-    SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
+    SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
     HICON,
     WM_CLIPBOARDUPDATE,
 };
@@ -56,7 +58,13 @@ use windows::Win32::System::DataExchange::{
     OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Com::{IDataObject, FORMATETC, DVASPECT_CONTENT, TYMED_HGLOBAL};
+use windows::Win32::System::Ole::{
+    CF_DIB, CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_NONE, IDropTarget,
+    OleInitialize, OleUninitialize, RegisterDragDrop, ReleaseStgMedium,
+    RevokeDragDrop,
+};
+use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::DragQueryFileW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 
@@ -93,6 +101,8 @@ static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 跨屏期间盖住整个桌面，鼠标移动消息打在罩子上（桌面收不到）→ 桌面文件零 hover；
 /// 低层钩子仍在罩子之前拿到事件，转发数据链完全不受影响。
 static SHIELD_HWND: Mutex<Option<isize>> = Mutex::new(None);
+static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
@@ -1366,6 +1376,161 @@ pub fn clipboard_write_files(paths: &[String]) {
 /// 鼠标左键是否按下（拖拽跨屏检测用）。
 pub fn is_left_button_down() -> bool {
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16) & 0x8000 != 0 }
+}
+
+/// 取走最近一次 OLE 文件拖拽进入跨屏边缘时捕获的路径。
+pub fn take_drag_paths() -> Vec<String> {
+    let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    match pending.take() {
+        Some((at, paths)) if at.elapsed() <= Duration::from_secs(2) => paths,
+        _ => Vec::new(),
+    }
+}
+
+#[implement(IDropTarget)]
+struct EdgeDropTarget;
+
+impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
+    fn DragEnter(
+        &self,
+        data: Option<&IDataObject>,
+        _keys: MODIFIERKEYS_FLAGS,
+        _point: &POINTL,
+        effect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        let paths = data.and_then(read_data_object_files).unwrap_or_default();
+        unsafe { *effect = DROPEFFECT_NONE; }
+        if !paths.is_empty() {
+            *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((Instant::now(), paths));
+        }
+        Ok(())
+    }
+
+    fn DragOver(
+        &self,
+        _keys: MODIFIERKEYS_FLAGS,
+        _point: &POINTL,
+        effect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        unsafe { *effect = DROPEFFECT_NONE; }
+        Ok(())
+    }
+
+    fn DragLeave(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn Drop(
+        &self,
+        _data: Option<&IDataObject>,
+        _keys: MODIFIERKEYS_FLAGS,
+        _point: &POINTL,
+        effect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        unsafe { *effect = DROPEFFECT_NONE; }
+        Ok(())
+    }
+}
+
+fn read_data_object_files(data: &IDataObject) -> Option<Vec<String>> {
+    unsafe {
+        let format = FORMATETC {
+            cfFormat: CF_HDROP.0 as u16,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0 as u32,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let mut medium = data.GetData(&format).ok()?;
+        let result = read_hdrop(medium.u.hGlobal.0 as *mut c_void);
+        ReleaseStgMedium(&mut medium);
+        result
+    }
+}
+
+/// 在出屏边缘放一个 2px 透明 OLE 目标。拖拽源进入时只读取路径，不接受 Drop，
+/// 因而用户仍可继续跨过边缘，实际文件由 Ruiss 传输协议发送。
+pub fn start_drag_path_probe() {
+    if DRAG_PROBE_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || unsafe {
+        if OleInitialize(None).is_err() {
+            DRAG_PROBE_STARTED.store(false, Ordering::SeqCst);
+            log::warn!("[DRAG] OLE 初始化失败，Windows 原生拖拽不可用");
+            return;
+        }
+        let class = w!("RuissDragEdgeWindow");
+        let Some(hinst) = GetModuleHandleW(None).ok().map(HINSTANCE::from) else {
+            DRAG_PROBE_STARTED.store(false, Ordering::SeqCst);
+            OleUninitialize();
+            return;
+        };
+        unsafe extern "system" fn drag_edge_wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(drag_edge_wnd_proc),
+            hInstance: hinst,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+        let (width, height) = screen_size();
+        let target: IDropTarget = EdgeDropTarget.into();
+        let mut windows = Vec::new();
+        for (index, x) in [0, width.saturating_sub(2)].into_iter().enumerate() {
+            let title = if index == 0 { w!("RuissDragLeft") } else { w!("RuissDragRight") };
+            match CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                class, title, WS_POPUP,
+                x, 0, 2, height,
+                None, None, hinst, None,
+            ) {
+                Ok(hwnd) => {
+                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
+                    if RegisterDragDrop(hwnd, &target).is_ok() {
+                        let _ = ShowWindow(hwnd, SW_SHOWNA);
+                        windows.push(hwnd);
+                    } else {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+                Err(e) => log::warn!("[DRAG] 创建 Windows 边缘拖拽探针失败: {e}"),
+            }
+        }
+        if windows.is_empty() {
+            DRAG_PROBE_STARTED.store(false, Ordering::SeqCst);
+            log::warn!("[DRAG] Windows OLE 边缘探针未能启用");
+        } else {
+            log::info!("[DRAG] Windows 原生文件拖拽探针已启用");
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        for hwnd in windows {
+            let _ = RevokeDragDrop(hwnd);
+            let _ = DestroyWindow(hwnd);
+        }
+        let _ = UnregisterClassW(class, hinst);
+        OleUninitialize();
+    });
+}
+
+pub fn cancel_local_drag() {
+    let mut inputs = key_inputs(Key::Esc, 0, false, true);
+    inputs.extend(key_inputs(Key::Esc, 0, false, false));
+    if !inputs.is_empty() {
+        unsafe { SendInput(&inputs, size_of::<INPUT>() as i32); }
+    }
 }
 
 /// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，

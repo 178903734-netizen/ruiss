@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1215,24 +1215,38 @@ pub fn key_to_cg(key: Key) -> u16 {
 // 首次 Mac 编译若有 API 签名差异，把错误信息发回迭代。
 
 use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
-use objc::runtime::{Class, Object, NO, YES};
+use objc::declare::ClassDecl;
+use objc::runtime::{BOOL, Class, Object, Sel, NO, YES};
 use objc::{class, msg_send};
-
-use core_foundation::base::CFTypeRef;
-use core_foundation::string::CFStringRef;
 
 /// 本机写入标志：本机主动写剪贴板时置 true，监听器跳过本次变化（防回环）。
 static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
+static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 取全局 NSPasteboard。
 unsafe fn general_pasteboard() -> *mut Object {
     msg_send![class!(NSPasteboard), generalPasteboard]
 }
 
-/// CFString → NSString（toll-free bridge）作为 NSPasteboard 类型参数。
+/// 返回进程期常驻的 NSString 类型名。剪贴板监听运行在自建线程，没有 Cocoa
+/// autorelease pool，因此不能每轮创建 autoreleased NSString。
 unsafe fn ns_type(name: &str) -> *mut Object {
-    let cf = CFString::new(name);
-    cf.as_concrete_TypeRef() as *mut Object
+    static TEXT: OnceLock<usize> = OnceLock::new();
+    static PNG: OnceLock<usize> = OnceLock::new();
+    static TIFF: OnceLock<usize> = OnceLock::new();
+    static FILE_URL: OnceLock<usize> = OnceLock::new();
+    static LEGACY_FILES: OnceLock<usize> = OnceLock::new();
+
+    let slot = match name {
+        "public.utf8-plain-text" => &TEXT,
+        "public.png" => &PNG,
+        "public.tiff" => &TIFF,
+        "public.file-url" => &FILE_URL,
+        "NSFilenamesPboardType" => &LEGACY_FILES,
+        _ => panic!("unsupported pasteboard type: {name}"),
+    };
+    *slot.get_or_init(|| string_to_nsstring(name) as usize) as *mut Object
 }
 
 /// NSString → Rust String。
@@ -1453,6 +1467,131 @@ pub fn is_left_button_down() -> bool {
     unsafe {
         let pressed: isize = msg_send![class!(NSEvent), pressedMouseButtons];
         (pressed & 1) != 0
+    }
+}
+
+pub fn take_drag_paths() -> Vec<String> {
+    let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    match pending.take() {
+        Some((at, paths)) if at.elapsed() <= Duration::from_secs(2) => paths,
+        _ => Vec::new(),
+    }
+}
+
+extern "C" fn drag_probe_entered(
+    _this: &Object,
+    _cmd: Sel,
+    sender: *mut Object,
+) -> usize {
+    unsafe {
+        let pasteboard: *mut Object = msg_send![sender, draggingPasteboard];
+        if let Some(paths) = read_files(pasteboard) {
+            if !paths.is_empty() {
+                *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((Instant::now(), paths));
+            }
+        }
+    }
+    0 // NSDragOperationNone：探针只读路径，不在本机执行放置。
+}
+
+extern "C" fn drag_probe_updated(
+    _this: &Object,
+    _cmd: Sel,
+    _sender: *mut Object,
+) -> usize {
+    0
+}
+
+extern "C" fn drag_probe_perform(
+    _this: &Object,
+    _cmd: Sel,
+    _sender: *mut Object,
+) -> BOOL {
+    NO
+}
+
+fn drag_probe_class() -> &'static Class {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let raw = *CLASS.get_or_init(|| unsafe {
+        if let Some(existing) = Class::get("RuissDragEdgeWindow") {
+            return existing as *const Class as usize;
+        }
+        let mut decl = ClassDecl::new("RuissDragEdgeWindow", class!(NSWindow))
+            .expect("RuissDragEdgeWindow class declaration");
+        decl.add_method(
+            sel!(draggingEntered:),
+            drag_probe_entered as extern "C" fn(&Object, Sel, *mut Object) -> usize,
+        );
+        decl.add_method(
+            sel!(draggingUpdated:),
+            drag_probe_updated as extern "C" fn(&Object, Sel, *mut Object) -> usize,
+        );
+        decl.add_method(
+            sel!(performDragOperation:),
+            drag_probe_perform as extern "C" fn(&Object, Sel, *mut Object) -> BOOL,
+        );
+        decl.register() as *const Class as usize
+    });
+    unsafe { &*(raw as *const Class) }
+}
+
+/// 在目标侧边创建 2pt 透明 NSDraggingDestination。AppKit 要求在主线程创建；
+/// Tauri setup 正好运行在应用主线程。
+pub fn start_drag_path_probe() {
+    if DRAG_PROBE_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let screen: *mut Object = msg_send![class!(NSScreen), mainScreen];
+        if screen.is_null() {
+            DRAG_PROBE_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
+        let frame: core_graphics::geometry::CGRect = msg_send![screen, frame];
+        let file_url = ns_type("public.file-url");
+        let legacy_files = ns_type("NSFilenamesPboardType");
+        let drag_types = [file_url, legacy_files];
+        let types: *mut Object = msg_send![
+            class!(NSArray),
+            arrayWithObjects: drag_types.as_ptr()
+            count: 2usize
+        ];
+        let clear: *mut Object = msg_send![class!(NSColor), clearColor];
+        for x in [frame.origin.x, frame.origin.x + frame.size.width - 2.0] {
+            let probe_frame = core_graphics::geometry::CGRect::new(
+                &core_graphics::geometry::CGPoint::new(x, frame.origin.y),
+                &core_graphics::geometry::CGSize::new(2.0, frame.size.height),
+            );
+            let window: *mut Object = msg_send![drag_probe_class(), alloc];
+            let window: *mut Object = msg_send![
+                window,
+                initWithContentRect: probe_frame
+                styleMask: 0usize
+                backing: 2usize
+                defer: NO
+            ];
+            if window.is_null() { continue; }
+            let _: () = msg_send![window, setOpaque: NO];
+            let _: () = msg_send![window, setBackgroundColor: clear];
+            let _: () = msg_send![window, setHasShadow: NO];
+            let _: () = msg_send![window, setReleasedWhenClosed: NO];
+            let _: () = msg_send![window, setLevel: 25isize];
+            let _: () = msg_send![window, registerForDraggedTypes: types];
+            let _: () = msg_send![window, orderFrontRegardless];
+        }
+        log::info!("[DRAG] macOS 原生文件拖拽探针已启用");
+    }
+}
+
+pub fn cancel_local_drag() {
+    if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+        for down in [true, false] {
+            if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_to_cg(Key::Esc), down) {
+                event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
+                event.post(CGEventTapLocation::HID);
+            }
+        }
     }
 }
 

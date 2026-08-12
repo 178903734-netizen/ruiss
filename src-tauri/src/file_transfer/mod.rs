@@ -60,6 +60,14 @@ impl FileSender {
     }
 
     pub fn send_paths(&self, paths: Vec<PathBuf>) -> Result<String, String> {
+        self.enqueue_paths(paths, false)
+    }
+
+    pub fn send_drag_paths(&self, paths: Vec<PathBuf>) -> Result<String, String> {
+        self.enqueue_paths(paths, true)
+    }
+
+    fn enqueue_paths(&self, paths: Vec<PathBuf>, drop_at_cursor: bool) -> Result<String, String> {
         if paths.is_empty() {
             return Err("没有选择文件或文件夹".into());
         }
@@ -88,7 +96,7 @@ impl FileSender {
         let sender = self.clone();
         let task_id = id.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = sender.run_batch(task_id.clone(), paths).await {
+            if let Err(error) = sender.run_batch(task_id.clone(), paths, drop_at_cursor).await {
                 log::error!("[FILE] 发送失败 batch={task_id}: {error}");
                 sender.inner.net.send_ctrl(Message::clipboard(
                     &sender.inner.name,
@@ -151,7 +159,7 @@ impl FileSender {
             Payload::FileReady { id, ok, error }
             | Payload::FileResult { id, ok, error }
             | Payload::FileBatchReady { id, ok, error }
-            | Payload::FileBatchResult { id, ok, error } => (
+            | Payload::FileBatchResult { id, ok, error, .. } => (
                 id,
                 if *ok {
                     Ok(())
@@ -173,7 +181,12 @@ impl FileSender {
         true
     }
 
-    async fn run_batch(&self, batch_id: String, paths: Vec<PathBuf>) -> Result<(), String> {
+    async fn run_batch(
+        &self,
+        batch_id: String,
+        paths: Vec<PathBuf>,
+        drop_at_cursor: bool,
+    ) -> Result<(), String> {
         let _permit = self
             .inner
             .gate
@@ -199,6 +212,7 @@ impl FileSender {
             roots: plan.roots.clone(),
             total_files,
             total_bytes: plan.total_bytes,
+            drop_at_cursor,
         })
         .await?;
         self.wait_result(ready, &batch_id, &batch_id).await?;
@@ -483,6 +497,7 @@ struct ReceiveBatch {
     failed: Option<String>,
     last_emit: Instant,
     last_activity: Instant,
+    drop_at_cursor: bool,
 }
 
 #[derive(Default)]
@@ -521,8 +536,12 @@ impl FileReceiver {
 
     pub fn handle(&self, payload: &Payload) -> Vec<Payload> {
         match payload {
-            Payload::FileBatchStart { id, roots, total_files, total_bytes } => {
-                let result = self.on_batch_start(id, roots, *total_files, *total_bytes);
+            Payload::FileBatchStart {
+                id, roots, total_files, total_bytes, drop_at_cursor,
+            } => {
+                let result = self.on_batch_start(
+                    id, roots, *total_files, *total_bytes, *drop_at_cursor,
+                );
                 vec![Payload::FileBatchReady {
                     id: id.clone(), ok: result.is_ok(), error: result.err(),
                 }]
@@ -559,22 +578,33 @@ impl FileReceiver {
                 Vec::new()
             }
             Payload::FileBatchEnd { id } => {
-                let result = self.on_batch_end(id);
+                let (result, drop_at_cursor) = self.on_batch_end(id);
                 vec![Payload::FileBatchResult {
                     id: id.clone(),
                     ok: result.is_ok(),
                     error: result.err(),
+                    drop_at_cursor,
                 }]
             }
             Payload::FileBatchCancel { id } => {
                 self.cancel_batch(id);
-                vec![Payload::FileBatchResult { id: id.clone(), ok: false, error: Some("发送端已取消".into()) }]
+                vec![Payload::FileBatchResult {
+                    id: id.clone(), ok: false, error: Some("发送端已取消".into()),
+                    drop_at_cursor: false,
+                }]
             }
             _ => Vec::new(),
         }
     }
 
-    fn on_batch_start(&self, id: &str, roots: &[TransferRoot], files: u32, bytes: u64) -> Result<(), String> {
+    fn on_batch_start(
+        &self,
+        id: &str,
+        roots: &[TransferRoot],
+        files: u32,
+        bytes: u64,
+        drop_at_cursor: bool,
+    ) -> Result<(), String> {
         let base = self.download_dir();
         let mut root_map = HashMap::new();
         let mut root_paths = Vec::new();
@@ -610,6 +640,7 @@ impl FileReceiver {
                 total_bytes: bytes, received_bytes: 0, failed: failure,
                 last_emit: Instant::now() - Duration::from_secs(1),
                 last_activity: Instant::now(),
+                drop_at_cursor,
             },
         );
         emit_update(&self.app, id, "receive", &title, "transferring", 0, bytes, 0, files, None, None);
@@ -740,14 +771,19 @@ impl FileReceiver {
         result
     }
 
-    fn on_batch_end(&self, id: &str) -> Result<(), String> {
+    fn on_batch_end(&self, id: &str) -> (Result<(), String>, bool) {
         let batch = self
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .batches
             .remove(id)
-            .ok_or_else(|| "接收任务不存在".to_string())?;
+            .ok_or_else(|| "接收任务不存在".to_string());
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => return (Err(error), false),
+        };
+        let drop_at_cursor = batch.drop_at_cursor;
         let result = if let Some(error) = batch.failed.clone() {
             Err(error)
         } else if batch.completed_files != batch.expected_files {
@@ -761,7 +797,7 @@ impl FileReceiver {
             emit_update(&self.app, id, "receive", &batch.title, "failed", batch.received_bytes,
                 batch.total_bytes, batch.completed_files, batch.expected_files, Some(error.clone()), None);
             cleanup_paths(&batch.root_paths);
-            return result;
+            return (result, drop_at_cursor);
         }
         let paths = batch.root_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>();
         platform::clipboard_write_files(&paths);
@@ -773,7 +809,7 @@ impl FileReceiver {
             "path": display_path.unwrap_or_default(),
             "paths": paths,
         }));
-        Ok(())
+        (Ok(()), drop_at_cursor)
     }
 
     fn resolve_target(&self, batch_id: &str, relative: &str) -> Result<PathBuf, String> {

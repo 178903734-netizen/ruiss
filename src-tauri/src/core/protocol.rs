@@ -83,6 +83,9 @@ pub enum Payload {
         roots: Vec<TransferRoot>,
         total_files: u32,
         total_bytes: u64,
+        /// 来自原生跨屏拖拽；完成后接收端在当前光标应用自动粘贴。
+        #[serde(default)]
+        drop_at_cursor: bool,
     },
     FileBatchReady { id: String, ok: bool, error: Option<String> },
     FileDirectory { batch_id: String, path: String },
@@ -104,7 +107,13 @@ pub enum Payload {
     FileBatchEnd { id: String },
     FileBatchCancel { id: String },
     FileResult { id: String, ok: bool, error: Option<String> },
-    FileBatchResult { id: String, ok: bool, error: Option<String> },
+    FileBatchResult {
+        id: String,
+        ok: bool,
+        error: Option<String>,
+        #[serde(default)]
+        drop_at_cursor: bool,
+    },
 
     // ===== M3：跨屏拖拽（拖动文件/图片跨屏到对端放下）=====
     /// 拖拽跨屏通告：Source 侧鼠标拖着东西滑到对端时随 TakeControl 一并发送，
@@ -140,6 +149,7 @@ mod file_protocol_tests {
                 roots: vec![TransferRoot { name: "folder".into(), is_dir: true }],
                 total_files: 1,
                 total_bytes: 5,
+                drop_at_cursor: false,
             },
             Payload::FileStart {
                 id: "file".into(),
@@ -148,7 +158,9 @@ mod file_protocol_tests {
                 size: 5,
             },
             Payload::FileEnd { id: "file".into(), sha256: "hash".into() },
-            Payload::FileBatchResult { id: "batch".into(), ok: true, error: None },
+            Payload::FileBatchResult {
+                id: "batch".into(), ok: true, error: None, drop_at_cursor: false,
+            },
         ];
         for payload in messages {
             let json = serde_json::to_string(&payload).unwrap();
