@@ -1,12 +1,11 @@
 // Ruiss 核心：Tauri 启动、托盘菜单、设置窗口、命令。
 //
 // M0：托盘 + 设置窗口。
-// M1：自测模式（本机捕获→注入回环，开发工具）。
 // M2：双机打通 —— 常驻捕获 → 仲裁（边缘停留/令牌，core/arbiter）→
 //     网络（TCP 按键点击控制 + UDP 鼠标移动，net/）→ 对端注入。
 //
 // 事件流：
-//   本机捕获(platform) → Router 闭包（消费线程）→ 自测回环 或 Arbiter → 网络
+//   本机捕获(platform) → Router 闭包 → Arbiter → 网络
 //   网络 incoming → 路由任务 → Arbiter（令牌）→ 注入(platform)
 
 mod clipboard;
@@ -15,8 +14,6 @@ mod file_transfer;
 mod net;
 mod platform;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +23,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
-use crate::core::keys::Key;
+use crate::core::keys::{Key, ModifierState, NativeShortcut};
 use crate::core::protocol::{Message, Payload};
 
 /// Tauri 入口。
@@ -48,15 +45,10 @@ pub fn run() {
                 injector.clone(),
             )));
 
-            // 开发自测：RUISS_SELF_TEST=1 启动即开自测回环
-            if std::env::var("RUISS_SELF_TEST").as_deref() == Ok("1") {
-                router.lock().unwrap().selftest = true;
-            }
-
             app.manage(router.clone());
 
             // 常驻捕获（自测/跨屏都要用；失败则 app 照常可用，仅无输入功能）
-            match start_capturer(router.clone(), injector.clone()) {
+            match start_capturer(router.clone()) {
                 Ok(c) => {
                     router.lock().unwrap().capture_ok = true;
                     app.manage(CapturerHandle(c));
@@ -93,10 +85,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
-            set_self_test,
-            get_self_test_stats,
             get_net_status,
-            test_inject,
             send_file,
             pick_and_send_file,
         ])
@@ -147,11 +136,8 @@ struct CapturerHandle(platform::InputCapturer);
 struct RouterState {
     /// 最近一次保存的设置（name/layout/peerIp 驱动网络与仲裁）
     settings: Settings,
-    /// M1 自测回环开关（开发工具）
-    selftest: bool,
     /// 输入捕获是否可用（Mac 上未授权辅助功能时为 false）
     capture_ok: bool,
-    stats: SelftestCounters,
     /// 网络已配置时的仲裁器
     arbiter: Option<Arbiter>,
     /// 无锁网络发送句柄
@@ -179,9 +165,7 @@ impl RouterState {
     fn new(settings: Settings, injector: Arc<platform::InputInjector>) -> Self {
         Self {
             settings,
-            selftest: false,
             capture_ok: false,
-            stats: SelftestCounters::default(),
             arbiter: None,
             net: None,
             engine: None,
@@ -346,45 +330,38 @@ fn forward_pointer_move(router: &Mutex<RouterState>, move_payload: Payload) {
     }
 }
 
-/// 常驻捕获：路由到自测回环 或 仲裁/转发。
-fn start_capturer(
-    router: Arc<Mutex<RouterState>>,
-    injector: Arc<platform::InputInjector>,
-) -> Result<platform::InputCapturer, String> {
-    let injector_cb = injector.clone();
+/// 常驻捕获：路由到仲裁/转发。
+fn start_capturer(router: Arc<Mutex<RouterState>>) -> Result<platform::InputCapturer, String> {
     let router_cb = router.clone();
-    // 自测回环的"按下待回声"表：键盘按 Key、鼠标按钮按 button（消费线程单线程，RefCell 安全）
-    let pending: RefCell<(HashMap<Key, Payload>, HashMap<u8, Payload>)> = RefCell::default();
     platform::InputCapturer::start(move |payload| {
         let actions: Vec<Action> = {
             let mut r = match router_cb.lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
-            if r.selftest {
-                // M1 自测回环（延迟回声），不参与链接逻辑
-                selftest_loopback(&injector_cb, &r.stats, &pending, payload);
-                return;
-            }
             let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
             if !connected {
                 return;
             }
-            match &payload {
-                Payload::MouseMove { x, y, .. } => match r.arbiter.as_mut() {
-                    Some(arb) => {
-                        let (w, h) = platform::screen_size();
-                        arb.on_cursor(*x, *y, w, h, Instant::now())
+            // Windows mouse bindings are target-native Mac shortcuts. Consume both
+            // button transitions while linked; emit one atomic shortcut on press.
+            if !platform::TARGET_IS_MAC {
+                let linked_source = r
+                    .arbiter
+                    .as_ref()
+                    .map(|a| a.mode == Mode::Source && a.linked)
+                    .unwrap_or(false);
+                if linked_source {
+                    if let Some(actions) = mouse_binding_actions(&r.settings, &payload) {
+                        actions
+                    } else {
+                        route_captured_payload(&mut r, payload)
                     }
-                    None => Vec::new(),
-                },
-                other => match r.arbiter.as_mut() {
-                    Some(arb) => match arb.on_input(other.clone()) {
-                        Action::None => Vec::new(),
-                        a => vec![a],
-                    },
-                    None => Vec::new(),
-                },
+                } else {
+                    route_captured_payload(&mut r, payload)
+                }
+            } else {
+                route_captured_payload(&mut r, payload)
             }
         };
         for action in actions {
@@ -392,6 +369,46 @@ fn start_capturer(
         }
     })
     .map_err(|e| e.to_string())
+}
+
+fn route_captured_payload(r: &mut RouterState, payload: Payload) -> Vec<Action> {
+    match &payload {
+        Payload::MouseMove { x, y, .. } => match r.arbiter.as_mut() {
+            Some(arb) => {
+                let (w, h) = platform::screen_size();
+                arb.on_cursor(*x, *y, w, h, Instant::now())
+            }
+            None => Vec::new(),
+        },
+        _ => match r.arbiter.as_mut() {
+            Some(arb) => match arb.on_input(payload) {
+                Action::None => Vec::new(),
+                action => vec![action],
+            },
+            None => Vec::new(),
+        },
+    }
+}
+
+/// Some(Vec) means the physical mouse button is handled (an empty Vec disables it).
+fn mouse_binding_actions(settings: &Settings, payload: &Payload) -> Option<Vec<Action>> {
+    let Payload::MouseButton { button, down } = payload else {
+        return None;
+    };
+    let binding = match button {
+        2 => settings.mouse_middle_shortcut,
+        3 => settings.mouse_back_shortcut,
+        4 => settings.mouse_forward_shortcut,
+        _ => return None,
+    };
+    if !down {
+        return Some(Vec::new());
+    }
+    Some(
+        binding
+            .map(|shortcut| vec![Action::Forward(Payload::Shortcut { shortcut })])
+            .unwrap_or_default(),
+    )
 }
 
 /// 空闲心跳：每 25ms 推进仲裁器停留判定（光标停在边缘不动时也能触发）。
@@ -598,7 +615,9 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
             }
             // Key/button up must never be silently dropped, otherwise the target can be
             // left with a stuck modifier or mouse button. Use the reliable control lane.
-            event @ (Payload::Key { .. } | Payload::MouseButton { .. }) => {
+            event @ (Payload::Key { .. }
+            | Payload::MouseButton { .. }
+            | Payload::Shortcut { .. }) => {
                 net.send_ctrl(Message::event(&name, event));
             }
             other => net.send(Message::event(&name, other)),
@@ -982,7 +1001,7 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
 
 // ======================== 设置（持久化到 app_data_dir/settings.json）=======================
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
     /// 本机名字
@@ -999,10 +1018,55 @@ struct Settings {
     clipboard_enabled: bool,
     /// 开机自启
     autostart: bool,
+    /// Windows 鼠标按键跨到 Mac 后触发的目标端原生快捷键；None 表示禁用。
+    #[serde(default = "default_mouse_back_shortcut")]
+    mouse_back_shortcut: Option<NativeShortcut>,
+    #[serde(default = "default_mouse_forward_shortcut")]
+    mouse_forward_shortcut: Option<NativeShortcut>,
+    #[serde(default = "default_mouse_middle_shortcut")]
+    mouse_middle_shortcut: Option<NativeShortcut>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn control_shortcut(key: Key) -> Option<NativeShortcut> {
+    Some(NativeShortcut {
+        key,
+        modifiers: ModifierState {
+            ctrl: true,
+            ..Default::default()
+        },
+    })
+}
+
+fn default_mouse_back_shortcut() -> Option<NativeShortcut> {
+    control_shortcut(Key::Digit1)
+}
+
+fn default_mouse_forward_shortcut() -> Option<NativeShortcut> {
+    control_shortcut(Key::Digit2)
+}
+
+fn default_mouse_middle_shortcut() -> Option<NativeShortcut> {
+    control_shortcut(Key::Digit3)
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            peer_ip: String::new(),
+            layout: "right".into(),
+            cross_screen_enabled: true,
+            clipboard_enabled: false,
+            autostart: false,
+            mouse_back_shortcut: default_mouse_back_shortcut(),
+            mouse_forward_shortcut: default_mouse_forward_shortcut(),
+            mouse_middle_shortcut: default_mouse_middle_shortcut(),
+        }
+    }
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -1047,122 +1111,6 @@ async fn save_settings(
     apply_link_config(state.inner(), &app).await?;
     log::info!("设置已保存: {}", settings.peer_ip);
     Ok(())
-}
-
-// ======================== M1 自测模式（开发工具）=======================
-
-#[derive(Default)]
-struct SelftestCounters {
-    captured_mouse: AtomicU64,
-    captured_keys: AtomicU64,
-    injected_ok: AtomicU64,
-    injected_fail: AtomicU64,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SelftestStatsView {
-    enabled: bool,
-    captured_mouse: u64,
-    captured_keys: u64,
-    injected_ok: u64,
-    injected_fail: u64,
-}
-
-/// 修饰键（按下期间不出回声）
-fn is_modifier_key(key: Key) -> bool {
-    matches!(key, Key::Ctrl | Key::Alt | Key::Shift | Key::Super)
-}
-
-/// M1 自测回环：延迟回声（按下先入表，松开时注入完整按下+松开对）。
-/// 为什么延迟：物理键没松手时注入同键按下会被系统合并丢弃。
-/// 鼠标移动只计数不回声（回环注入移动无意义且造成拖拽感）。
-fn selftest_loopback(
-    injector: &platform::InputInjector,
-    stats: &SelftestCounters,
-    pending: &RefCell<(HashMap<Key, Payload>, HashMap<u8, Payload>)>,
-    payload: Payload,
-) {
-    let inject = |p: Payload| {
-        if injector.inject(p) > 0 {
-            stats.injected_ok.fetch_add(1, Ordering::Relaxed);
-        } else {
-            stats.injected_fail.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    let maybe_echo = |pending: &mut (HashMap<Key, Payload>, HashMap<u8, Payload>),
-                      down_p: Option<Payload>,
-                      up_p: Payload| {
-        let down_p = match down_p {
-            Some(p) => p,
-            None => return, // 只捕获到松开（无按下记录），忽略
-        };
-        // 修饰键按住期间不回声，避免组合键被双重触发
-        let modifier_held = pending.0.keys().any(|k| is_modifier_key(*k));
-        if modifier_held {
-            return;
-        }
-        inject(down_p);
-        inject(up_p);
-    };
-
-    match &payload {
-        Payload::MouseMove { .. } => {
-            stats.captured_mouse.fetch_add(1, Ordering::Relaxed);
-            return; // 移动只计数
-        }
-        Payload::MouseButton { .. } => {
-            stats.captured_mouse.fetch_add(1, Ordering::Relaxed);
-        }
-        Payload::Key { .. } => {
-            stats.captured_keys.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {}
-    }
-
-    let mut pending = pending.borrow_mut();
-    match &payload {
-        Payload::Key { key, down, .. } => {
-            if *down {
-                pending.0.insert(*key, payload);
-            } else {
-                let down_p = pending.0.remove(key);
-                maybe_echo(&mut pending, down_p, payload);
-            }
-        }
-        Payload::MouseButton { button, down, .. } => {
-            if *down {
-                pending.1.insert(*button, payload);
-            } else {
-                let down_p = pending.1.remove(button);
-                maybe_echo(&mut pending, down_p, payload);
-            }
-        }
-        _ => inject(payload), // 滚轮等无状态事件立即回声
-    }
-}
-
-#[tauri::command]
-fn set_self_test(
-    state: State<'_, Arc<Mutex<RouterState>>>,
-    enabled: bool,
-) -> Result<bool, String> {
-    let mut r = state.inner().lock().map_err(|e| e.to_string())?;
-    r.selftest = enabled;
-    log::info!("自测模式 {}", if enabled { "已开启" } else { "已关闭" });
-    Ok(enabled)
-}
-
-#[tauri::command]
-fn get_self_test_stats(state: State<'_, Arc<Mutex<RouterState>>>) -> SelftestStatsView {
-    let r = state.inner().lock().unwrap_or_else(|e| e.into_inner());
-    SelftestStatsView {
-        enabled: r.selftest,
-        captured_mouse: r.stats.captured_mouse.load(Ordering::Relaxed),
-        captured_keys: r.stats.captured_keys.load(Ordering::Relaxed),
-        injected_ok: r.stats.injected_ok.load(Ordering::Relaxed),
-        injected_fail: r.stats.injected_fail.load(Ordering::Relaxed),
-    }
 }
 
 // ======================== 网络状态 ========================
@@ -1211,22 +1159,6 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
     }
 }
 
-/// 注入测试：往当前聚焦窗口输入一串字符（无需开自测模式），
-/// 独立验证"协议事件 → 注入 → 系统可见输入"这条注入链路。
-/// 当前支持小写字母、数字、空格。
-#[tauri::command]
-fn test_inject(text: String) -> Result<u32, String> {
-    let injector = platform::InputInjector::new();
-    let mut ok = 0u32;
-    for ch in text.chars() {
-        let key = crate::core::keys::char_to_key(ch)
-            .ok_or_else(|| format!("暂不支持字符 {ch:?}，请用字母/数字/空格"))?;
-        ok += injector.inject(Payload::Key { key, scan: 0, extended: false, down: true });
-        ok += injector.inject(Payload::Key { key, scan: 0, extended: false, down: false });
-    }
-    Ok(ok)
-}
-
 /// 发送指定路径的文件到对端（前端传完整路径）。
 #[tauri::command]
 fn send_file(
@@ -1263,4 +1195,59 @@ async fn pick_and_send_file(
     let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
     sender.send_file(path);
     Ok(())
+}
+
+#[cfg(test)]
+mod mouse_binding_tests {
+    use super::*;
+
+    #[test]
+    fn default_mouse_buttons_are_native_mac_control_shortcuts() {
+        let settings = Settings::default();
+        for (button, key) in [(3, Key::Digit1), (4, Key::Digit2), (2, Key::Digit3)] {
+            let actions = mouse_binding_actions(
+                &settings,
+                &Payload::MouseButton { button, down: true },
+            )
+            .expect("configured mouse button");
+            assert_eq!(
+                actions,
+                vec![Action::Forward(Payload::Shortcut {
+                    shortcut: NativeShortcut {
+                        key,
+                        modifiers: ModifierState {
+                            ctrl: true,
+                            ..Default::default()
+                        },
+                    },
+                })]
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_binding_release_is_consumed_without_second_shortcut() {
+        let actions = mouse_binding_actions(
+            &Settings::default(),
+            &Payload::MouseButton {
+                button: 3,
+                down: false,
+            },
+        );
+        assert_eq!(actions, Some(Vec::new()));
+    }
+
+    #[test]
+    fn cleared_binding_consumes_button_without_action() {
+        let mut settings = Settings::default();
+        settings.mouse_back_shortcut = None;
+        let actions = mouse_binding_actions(
+            &settings,
+            &Payload::MouseButton {
+                button: 3,
+                down: true,
+            },
+        );
+        assert_eq!(actions, Some(Vec::new()));
+    }
 }

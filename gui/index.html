@@ -43,29 +43,41 @@
         <input id="crossScreenEnabled" type="checkbox" checked />
       </label>
 
-      <div class="divider"></div>
-
-      <h2 class="section-title">M1 自测</h2>
-
-      <label class="row">
-        <span>自测模式（本机捕获→注入回环）</span>
-        <input id="selfTest" type="checkbox" />
-      </label>
-
-      <div id="stats" class="stats">自测关闭</div>
-
       <div id="netStatus" class="stats net">网络：未配置</div>
 
-      <h2 class="section-title">跨屏文件传输</h2>
+      <div class="divider"></div>
 
+      <h2 class="section-title">Windows 鼠标跨屏到 Mac</h2>
+      <p class="section-help">点击“录制”，然后直接按下想让 Mac 执行的组合键。这里的 Control、Option、Command 都按 Mac 含义保存。</p>
+
+      <div class="shortcut-list">
+        <div class="shortcut-row">
+          <span class="shortcut-name">后退侧键</span>
+          <button class="shortcut-record" data-binding="mouseBackShortcut">Control + 1</button>
+          <button class="shortcut-clear" data-binding="mouseBackShortcut">清除</button>
+        </div>
+        <div class="shortcut-row">
+          <span class="shortcut-name">前进侧键</span>
+          <button class="shortcut-record" data-binding="mouseForwardShortcut">Control + 2</button>
+          <button class="shortcut-clear" data-binding="mouseForwardShortcut">清除</button>
+        </div>
+        <div class="shortcut-row">
+          <span class="shortcut-name">中键</span>
+          <button class="shortcut-record" data-binding="mouseMiddleShortcut">Control + 3</button>
+          <button class="shortcut-clear" data-binding="mouseMiddleShortcut">清除</button>
+        </div>
+      </div>
+      <p class="hint small">侧滑滚轮仍沿用罗技软件产生的桌面切换快捷键。清除某项后，该按键跨屏时不执行动作。</p>
+
+      <div class="divider"></div>
+
+      <h2 class="section-title">跨屏文件传输</h2>
       <div class="file-send">
         <button id="pickFileBtn" class="test-btn">选择文件发送至对端</button>
         <span id="fileStatus" class="status"></span>
       </div>
       <ul id="fileLog" class="file-log"></ul>
-      <p class="hint small">复制/拖动文件到对端也会自动传；收到的文件落在下载目录，并自动填入本机剪贴板，可直接 Ctrl+V（Mac: Cmd+V）粘贴。</p>
-
-      <button id="testInjectBtn" class="test-btn">注入测试：先聚焦记事本，再点我</button>
+      <p class="hint small">复制或拖动文件到对端也会自动传输；收到的文件会放入下载目录并写入本机剪贴板。</p>
 
       <div class="actions">
         <button id="saveBtn">保存</button>
@@ -73,7 +85,7 @@
       </div>
     </section>
 
-    <p class="hint">双机使用：两台都填好"本机名字 + 对方 IP + 布局"并保存，鼠标滑到屏幕边缘停留一会儿即滑到对端（键盘/点击/滚轮跟着走），回到边缘停留即返回。自测模式是开发验证工具，测完记得关。</p>
+    <p class="hint">两台机器都填好本机名字、对方 IP 和屏幕布局并保存。鼠标滑到屏幕边缘即可跨屏，键盘、点击和滚轮会跟随当前显示鼠标的屏幕。</p>
   </main>
   <script src="main.js"></script>
 </body>

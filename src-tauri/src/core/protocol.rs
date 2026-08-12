@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::keys::Key;
+use crate::core::keys::{Key, NativeShortcut};
 
 /// 消息类型标记：区分"事件流"与"控制流"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,8 @@ pub enum Payload {
     /// down=true 按下，false 抬起。
     /// scan/extended 是 Windows 专用（精确回放同码键），Mac 端恒为 0/false 并忽略。
     Key { key: Key, scan: u16, extended: bool, down: bool },
+    /// 目标端原生快捷键。修饰键不做 Ctrl/Command 跨平台翻译，一次完整注入。
+    Shortcut { shortcut: NativeShortcut },
     /// 剪贴板文本
     ClipboardText { text: String },
     /// 剪贴板图片（PNG 字节）

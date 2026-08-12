@@ -26,12 +26,31 @@ pub enum Key {
     Other(u32), // 未覆盖键：透传原始码
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
 pub struct ModifierState {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
     pub super_key: bool,
+}
+
+/// A shortcut expressed in the target operating system's native semantics.
+/// Unlike ordinary forwarded keyboard input, its modifiers are not translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeShortcut {
+    pub key: Key,
+    pub modifiers: ModifierState,
 }
 
 impl ModifierState {
@@ -338,25 +357,6 @@ pub fn translate_macos_shortcut_to_windows(
         _ => {}
     }
     mapped
-}
-
-/// 字符 → 抽象键码（注入测试用；仅支持小写字母/数字/空格）。
-pub fn char_to_key(c: char) -> Option<Key> {
-    const LETTERS: [Key; 26] = [
-        Key::A, Key::B, Key::C, Key::D, Key::E, Key::F, Key::G, Key::H, Key::I, Key::J, Key::K,
-        Key::L, Key::M, Key::N, Key::O, Key::P, Key::Q, Key::R, Key::S, Key::T, Key::U, Key::V,
-        Key::W, Key::X, Key::Y, Key::Z,
-    ];
-    const DIGITS: [Key; 10] = [
-        Key::Digit0, Key::Digit1, Key::Digit2, Key::Digit3, Key::Digit4, Key::Digit5, Key::Digit6,
-        Key::Digit7, Key::Digit8, Key::Digit9,
-    ];
-    match c {
-        'a'..='z' => Some(LETTERS[(c as u32 - 'a' as u32) as usize]),
-        '0'..='9' => Some(DIGITS[(c as u32 - '0' as u32) as usize]),
-        ' ' => Some(Key::Space),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

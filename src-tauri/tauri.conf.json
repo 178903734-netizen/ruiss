@@ -15,7 +15,7 @@
         "label": "settings",
         "title": "Ruiss 设置",
         "width": 480,
-        "height": 600,
+        "height": 760,
         "resizable": false,
         "center": true,
         "visible": false

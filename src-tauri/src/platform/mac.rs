@@ -32,7 +32,8 @@ use core_graphics::geometry::CGPoint;
 use objc::{sel, sel_impl};
 
 use crate::core::keys::{
-    map_modifiers, translate_windows_shortcut_to_mac, Key, ModifierState, ShortcutStroke,
+    map_modifiers, translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut,
+    ShortcutStroke,
 };
 use crate::core::protocol::Payload;
 
@@ -776,6 +777,9 @@ impl InputInjector {
                 *p = Some((*x as f64, *y as f64));
             }
         }
+        if let Payload::Shortcut { shortcut } = &event {
+            return self.inject_native_shortcut(*shortcut);
+        }
         let source = match CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
             Ok(s) => s,
             Err(_) => return 0,
@@ -986,6 +990,41 @@ impl InputInjector {
             }
         }
         1
+    }
+
+    /// Inject a complete shortcut using target-macOS modifier semantics. This is
+    /// deliberately atomic so mouse bindings cannot leave a modifier held down.
+    fn inject_native_shortcut(&self, shortcut: NativeShortcut) -> u32 {
+        let mut keyboard = match self.keyboard.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(source) = keyboard.event_source() else {
+            log::error!("[MAC-KEY] persistent HID event source unavailable");
+            return 0;
+        };
+        let restore = map_modifiers(true, keyboard.source_modifiers);
+        if !sync_mac_modifiers(&mut keyboard, &source, shortcut.modifiers) {
+            return 0;
+        }
+
+        let mut posted = 0;
+        for down in [true, false] {
+            let Ok(event) = CGEvent::new_keyboard_event(
+                source.clone(),
+                key_to_cg(shortcut.key),
+                down,
+            ) else {
+                continue;
+            };
+            event.set_flags(mac_keyboard_event_flags(shortcut.key, shortcut.modifiers));
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
+            event.post(CGEventTapLocation::HID);
+            posted += 1;
+        }
+        let _ = sync_mac_modifiers(&mut keyboard, &source, restore);
+        log::info!("[MAC-KEY] mouse binding -> {:?}+{:?}", shortcut.modifiers, shortcut.key);
+        posted
     }
 
     /// Release remote keys/buttons that might still be down after a handoff or disconnect.

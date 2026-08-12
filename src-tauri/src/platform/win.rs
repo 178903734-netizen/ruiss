@@ -43,7 +43,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_INPUT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    WM_INPUT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
     CreateCursor, SetSystemCursor,
     SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
     SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP,
@@ -379,18 +380,24 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // 豁免是安全的——跨屏时注入发生在对端机器上，不产生本地回环；
         // Sink 侧 Arbiter 不会转发任何事件，也不会形成死循环。
         let is_wheel = msg == WM_MOUSEWHEEL || msg == 0x020E;
+        let is_xbutton = msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP;
+        let injected = ms.flags & LLMHF_INJECTED != 0;
+        let source_injected_xbutton = is_xbutton
+            && BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+            && !SINK_ACTIVE.load(Ordering::Relaxed);
         // 注入滚轮放行标记：对端注入的滚轮（LLMHF_INJECTED + 滚轮消息）不得吞——
         // Sink 侧吞掉注入滚轮会导致对端滚动在本机失效（mac→win 滚动失效根因）。
         // 罗技平滑滚动同样带 INJECTED，一并放行；Sink 时本机无人操作，无双滚副作用。
-        let injected_wheel = is_wheel && ms.flags & LLMHF_INJECTED != 0;
-        if !suppress_injected() || ms.flags & LLMHF_INJECTED == 0 || is_wheel {
+        let injected_wheel = is_wheel && injected;
+        if !suppress_injected() || !injected || is_wheel || source_injected_xbutton {
             if let Some(p) = mouse_to_payload(wparam.0 as u32, ms) {
                 log::debug!("捕获: {p:?}");
                 // 跨屏期间：点击/滚轮吞掉（只转发对端，本机不生效）；移动放行（本机光标还要动）。
                 // 被控端（Sink）：本机 MouseMove 不吞——光标跟随本机鼠标，用户可推到
                 // 出口边反向夺回控制权（自由双向切换，见 arbiter.on_cursor 的 Sink 分支）。
                 // 例外：注入滚轮（injected_wheel）不吞——那是对端转发来的滚动，放行让本机页面滚动。
-                let swallow = (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed))
+                let swallow = (BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    || SINK_ACTIVE.load(Ordering::Relaxed))
                     && matches!(p, Payload::MouseButton { .. } | Payload::MouseWheel { .. })
                     && !injected_wheel;
                 // Source 跨屏后的移动改由 WM_INPUT 发送相对 delta。这里继续处理
@@ -484,6 +491,14 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
         WM_RBUTTONUP => Some(Payload::MouseButton { button: 1, down: false }),
         WM_MBUTTONDOWN => Some(Payload::MouseButton { button: 2, down: true }),
         WM_MBUTTONUP => Some(Payload::MouseButton { button: 2, down: false }),
+        WM_XBUTTONDOWN => Some(Payload::MouseButton {
+            button: xbutton_id(ms)?,
+            down: true,
+        }),
+        WM_XBUTTONUP => Some(Payload::MouseButton {
+            button: xbutton_id(ms)?,
+            down: false,
+        }),
         WM_MOUSEWHEEL => {
             let dy = wheel_delta(ms, &WHEEL_ACCUM_V);
             if dy == 0 { return None; }
@@ -495,7 +510,21 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
             if dx == 0 { return None; }
             Some(Payload::MouseWheel { dx, dy: 0 })
         }
-        _ => None, // WM_XBUTTON* 等 M2 再支持
+        _ => None,
+    }
+}
+
+/// XBUTTON1/2 live in the high word of MSLLHOOKSTRUCT.mouseData.
+/// Ruiss reserves button 3 for Back and button 4 for Forward.
+fn xbutton_id(ms: &MSLLHOOKSTRUCT) -> Option<u8> {
+    xbutton_id_from_mouse_data(ms.mouseData)
+}
+
+fn xbutton_id_from_mouse_data(mouse_data: u32) -> Option<u8> {
+    match (mouse_data >> 16) & 0xffff {
+        1 => Some(3),
+        2 => Some(4),
+        _ => None,
     }
 }
 
@@ -773,6 +802,18 @@ impl InputInjector {
                     }
                     inputs
                 }
+            }
+            Payload::Shortcut { shortcut } => {
+                let mut keyboard = match self.keyboard.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let restore = map_modifiers(false, keyboard.source_modifiers);
+                let mut inputs = sync_windows_modifiers(&mut keyboard, shortcut.modifiers);
+                inputs.extend(key_inputs(shortcut.key, 0, false, true));
+                inputs.extend(key_inputs(shortcut.key, 0, false, false));
+                inputs.extend(sync_windows_modifiers(&mut keyboard, restore));
+                inputs
             }
             other => {
                 log::debug!("注入跳过（非输入事件）: {other:?}");
@@ -1464,5 +1505,12 @@ mod tests {
         assert!(should_capture_keyboard_event(true, true, true, false));
         assert!(!should_capture_keyboard_event(true, true, true, true));
         assert!(should_capture_keyboard_event(false, true, false, false));
+    }
+
+    #[test]
+    fn xbuttons_map_to_back_and_forward_ids() {
+        assert_eq!(xbutton_id_from_mouse_data(1 << 16), Some(3));
+        assert_eq!(xbutton_id_from_mouse_data(2 << 16), Some(4));
+        assert_eq!(xbutton_id_from_mouse_data(0), None);
     }
 }

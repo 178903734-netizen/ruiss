@@ -5,6 +5,7 @@ body {
   background: #f4f6fa;
   color: #1f2430;
   user-select: none;
+  overflow-y: auto;
 }
 
 .panel { padding: 20px 24px; }
@@ -35,6 +36,28 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
 .divider { height: 1px; background: #e2e7f0; margin: 4px 0; }
 
 .section-title { font-size: 13px; color: #232a3b; margin-top: 2px; }
+.section-help { font-size: 11px; color: #7a8499; line-height: 1.55; margin-top: -7px; }
+
+.shortcut-list { display: flex; flex-direction: column; gap: 8px; }
+.shortcut-row { display: grid; grid-template-columns: 76px 1fr 48px; gap: 8px; align-items: center; }
+.shortcut-name { font-size: 12px; color: #4a5268; }
+.shortcut-record, .shortcut-clear {
+  height: 32px;
+  border: 1px solid #c9d4e8;
+  border-radius: 6px;
+  background: #fff;
+  color: #273047;
+  font-size: 12px;
+  cursor: pointer;
+}
+.shortcut-record { text-align: left; padding: 0 10px; }
+.shortcut-record:hover, .shortcut-clear:hover { border-color: #4f8ff7; }
+.shortcut-record.recording {
+  border-color: #4f8ff7;
+  box-shadow: 0 0 0 2px rgba(79,143,247,.15);
+  color: #2f72dc;
+}
+.shortcut-clear { color: #7a8499; }
 
 #saveBtn {
   padding: 8px 22px;
