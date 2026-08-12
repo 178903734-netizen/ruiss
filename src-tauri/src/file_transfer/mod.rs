@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use base64::Engine as _;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Semaphore};
 
@@ -13,7 +12,7 @@ use crate::core::protocol::{Message, Payload, TransferRoot};
 use crate::net::NetHandle;
 use crate::platform;
 
-const CHUNK_SIZE: usize = 256 * 1024;
+const CHUNK_SIZE: usize = 1024 * 1024;
 const RESULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
@@ -28,6 +27,7 @@ struct SenderInner {
     waiters: Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
     cancelled: Mutex<HashSet<String>>,
     retries: Mutex<HashMap<String, Vec<PathBuf>>>,
+    pending_drags: Mutex<HashMap<String, Vec<PathBuf>>>,
     gate: Semaphore,
 }
 
@@ -54,20 +54,86 @@ impl FileSender {
                 waiters: Mutex::new(HashMap::new()),
                 cancelled: Mutex::new(HashSet::new()),
                 retries: Mutex::new(HashMap::new()),
+                pending_drags: Mutex::new(HashMap::new()),
                 gate: Semaphore::new(1),
             }),
         }
     }
 
     pub fn send_paths(&self, paths: Vec<PathBuf>) -> Result<String, String> {
-        self.enqueue_paths(paths, false)
+        self.enqueue_paths(paths, false, None)
     }
 
-    pub fn send_drag_paths(&self, paths: Vec<PathBuf>) -> Result<String, String> {
-        self.enqueue_paths(paths, true)
+    pub fn send_drag_session(
+        &self,
+        drag_id: String,
+        paths: Vec<PathBuf>,
+    ) -> Result<String, String> {
+        self.enqueue_paths(paths, false, Some(drag_id))
     }
 
-    fn enqueue_paths(&self, paths: Vec<PathBuf>, drop_at_cursor: bool) -> Result<String, String> {
+    pub fn offer_drag_paths(&self, paths: Vec<PathBuf>) -> Result<String, String> {
+        if paths.is_empty() || !self.inner.net.connected() {
+            return Err("no connected file drag".into());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.inner
+            .pending_drags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), paths.clone());
+        let sender = self.clone();
+        let task_id = id.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || build_plan(paths)).await;
+            match result {
+                Ok(Ok(plan)) => {
+                    sender.inner.net.send_ctrl(Message::ctrl(
+                        &sender.inner.name,
+                        Payload::DragStart {
+                            id: task_id.clone(),
+                            roots: plan.roots,
+                        },
+                    ));
+                }
+                Ok(Err(error)) => {
+                    log::error!("[DRAG] unable to prepare drag {task_id}: {error}");
+                    sender.cancel_drag(&task_id);
+                }
+                Err(error) => {
+                    log::error!("[DRAG] drag preparation task failed {task_id}: {error}");
+                    sender.cancel_drag(&task_id);
+                }
+            }
+        });
+        Ok(id)
+    }
+
+    pub fn commit_drag(&self, id: &str) -> Result<String, String> {
+        let paths = self
+            .inner
+            .pending_drags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+            .ok_or_else(|| "drag session is no longer available".to_string())?;
+        self.send_drag_session(id.to_string(), paths)
+    }
+
+    pub fn cancel_drag(&self, id: &str) {
+        self.inner
+            .pending_drags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    fn enqueue_paths(
+        &self,
+        paths: Vec<PathBuf>,
+        drop_at_cursor: bool,
+        drag_id: Option<String>,
+    ) -> Result<String, String> {
         if paths.is_empty() {
             return Err("没有选择文件或文件夹".into());
         }
@@ -96,13 +162,22 @@ impl FileSender {
         let sender = self.clone();
         let task_id = id.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = sender.run_batch(task_id.clone(), paths, drop_at_cursor).await {
+            if let Err(error) = sender
+                .run_batch(task_id.clone(), paths, drop_at_cursor, drag_id)
+                .await
+            {
                 log::error!("[FILE] 发送失败 batch={task_id}: {error}");
                 sender.inner.net.send_ctrl(Message::clipboard(
                     &sender.inner.name,
-                    Payload::FileBatchCancel { id: task_id.clone() },
+                    Payload::FileBatchCancel {
+                        id: task_id.clone(),
+                    },
                 ));
-                let status = if error == "传输已取消" { "cancelled" } else { "failed" };
+                let status = if error == "传输已取消" {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
                 emit_update(
                     &sender.inner.app,
                     &task_id,
@@ -117,8 +192,17 @@ impl FileSender {
                     None,
                 );
             }
-            sender.inner.cancelled.lock().unwrap_or_else(|e| e.into_inner()).remove(&task_id);
-            sender.inner.waiters.lock().unwrap_or_else(|e| e.into_inner())
+            sender
+                .inner
+                .cancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id);
+            sender
+                .inner
+                .waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|_, waiter| !waiter.is_closed());
         });
         Ok(id)
@@ -186,6 +270,7 @@ impl FileSender {
         batch_id: String,
         paths: Vec<PathBuf>,
         drop_at_cursor: bool,
+        drag_id: Option<String>,
     ) -> Result<(), String> {
         let _permit = self
             .inner
@@ -213,6 +298,7 @@ impl FileSender {
             total_files,
             total_bytes: plan.total_bytes,
             drop_at_cursor,
+            drag_id,
         })
         .await?;
         self.wait_result(ready, &batch_id, &batch_id).await?;
@@ -262,7 +348,7 @@ impl FileSender {
                 self.send_payload(Payload::FileChunk {
                     id: file_id.clone(),
                     seq,
-                    data: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
+                    data: buf[..n].to_vec(),
                 })
                 .await?;
                 seq = seq.saturating_add(1);
@@ -307,8 +393,10 @@ impl FileSender {
         }
 
         let rx = self.register_waiter(&batch_id);
-        self.send_payload(Payload::FileBatchEnd { id: batch_id.clone() })
-            .await?;
+        self.send_payload(Payload::FileBatchEnd {
+            id: batch_id.clone(),
+        })
+        .await?;
         self.wait_result(rx, &batch_id, &batch_id).await?;
         emit_update(
             &self.inner.app,
@@ -417,18 +505,33 @@ fn build_plan(paths: Vec<PathBuf>) -> Result<SendPlan, String> {
             .ok_or_else(|| format!("无效路径: {}", source.display()))?;
         let root_name = unique_logical_name(original, &mut used);
         if metadata.is_dir() {
-            roots.push(TransferRoot { name: root_name.clone(), is_dir: true });
+            roots.push(TransferRoot {
+                name: root_name.clone(),
+                is_dir: true,
+            });
             directories.push(root_name.clone());
             walk_directory(&source, &root_name, &mut directories, &mut files)?;
         } else if metadata.is_file() {
-            roots.push(TransferRoot { name: root_name.clone(), is_dir: false });
-            files.push(SendFile { source, relative: root_name, size: metadata.len() });
+            roots.push(TransferRoot {
+                name: root_name.clone(),
+                is_dir: false,
+            });
+            files.push(SendFile {
+                source,
+                relative: root_name,
+                size: metadata.len(),
+            });
         } else {
             return Err("只支持普通文件和文件夹".into());
         }
     }
     let total_bytes = files.iter().map(|f| f.size).sum();
-    Ok(SendPlan { roots, directories, files, total_bytes })
+    Ok(SendPlan {
+        roots,
+        directories,
+        files,
+        total_bytes,
+    })
 }
 
 fn walk_directory(
@@ -455,7 +558,11 @@ fn walk_directory(
             directories.push(child.clone());
             walk_directory(&path, &child, directories, files)?;
         } else if metadata.is_file() {
-            files.push(SendFile { source: path, relative: child, size: metadata.len() });
+            files.push(SendFile {
+                source: path,
+                relative: child,
+                size: metadata.len(),
+            });
         }
     }
     Ok(())
@@ -498,6 +605,8 @@ struct ReceiveBatch {
     last_emit: Instant,
     last_activity: Instant,
     drop_at_cursor: bool,
+    drag_id: Option<String>,
+    drag_stage_dir: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -519,7 +628,11 @@ impl FileReceiver {
             log::error!("[FILE] 无法创建接收目录 {}: {e}", download_dir.display());
         }
         log::info!("[FILE] 接收目录: {}", download_dir.display());
-        Self { state: Mutex::new(ReceiverState::default()), download_dir: Mutex::new(download_dir), app }
+        Self {
+            state: Mutex::new(ReceiverState::default()),
+            download_dir: Mutex::new(download_dir),
+            app,
+        }
     }
 
     pub fn set_download_dir(&self, configured_dir: &str) -> Result<PathBuf, String> {
@@ -531,36 +644,68 @@ impl FileReceiver {
     }
 
     pub fn download_dir(&self) -> PathBuf {
-        self.download_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.download_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn handle(&self, payload: &Payload) -> Vec<Payload> {
         match payload {
             Payload::FileBatchStart {
-                id, roots, total_files, total_bytes, drop_at_cursor,
+                id,
+                roots,
+                total_files,
+                total_bytes,
+                drop_at_cursor,
+                drag_id,
             } => {
                 let result = self.on_batch_start(
-                    id, roots, *total_files, *total_bytes, *drop_at_cursor,
+                    id,
+                    roots,
+                    *total_files,
+                    *total_bytes,
+                    *drop_at_cursor,
+                    drag_id.clone(),
                 );
                 vec![Payload::FileBatchReady {
-                    id: id.clone(), ok: result.is_ok(), error: result.err(),
+                    id: id.clone(),
+                    ok: result.is_ok(),
+                    error: result.err(),
                 }]
             }
             Payload::FileDirectory { batch_id, path } => {
                 self.on_directory(batch_id, path);
                 Vec::new()
             }
-            Payload::FileStart { id, batch_id, path, size } => {
+            Payload::FileStart {
+                id,
+                batch_id,
+                path,
+                size,
+            } => {
                 if let Err(error) = self.on_start(id, batch_id, path, *size) {
-                    vec![Payload::FileReady { id: id.clone(), ok: false, error: Some(error) }]
+                    vec![Payload::FileReady {
+                        id: id.clone(),
+                        ok: false,
+                        error: Some(error),
+                    }]
                 } else {
-                    vec![Payload::FileReady { id: id.clone(), ok: true, error: None }]
+                    vec![Payload::FileReady {
+                        id: id.clone(),
+                        ok: true,
+                        error: None,
+                    }]
                 }
             }
             Payload::FileChunk { id, seq, data } => {
                 if let Err(error) = self.on_chunk(id, *seq, data) {
                     self.fail_file(id, &error);
-                    vec![Payload::FileResult { id: id.clone(), ok: false, error: Some(error) }]
+                    vec![Payload::FileResult {
+                        id: id.clone(),
+                        ok: false,
+                        error: Some(error),
+                    }]
                 } else {
                     Vec::new()
                 }
@@ -589,7 +734,9 @@ impl FileReceiver {
             Payload::FileBatchCancel { id } => {
                 self.cancel_batch(id);
                 vec![Payload::FileBatchResult {
-                    id: id.clone(), ok: false, error: Some("发送端已取消".into()),
+                    id: id.clone(),
+                    ok: false,
+                    error: Some("发送端已取消".into()),
                     drop_at_cursor: false,
                 }]
             }
@@ -604,8 +751,21 @@ impl FileReceiver {
         files: u32,
         bytes: u64,
         drop_at_cursor: bool,
+        drag_id: Option<String>,
     ) -> Result<(), String> {
-        let base = self.download_dir();
+        let drag_stage_dir = drag_id
+            .as_ref()
+            .map(|drag_id| std::env::temp_dir().join("ruiss-drag").join(drag_id));
+        let base = if let Some(path) = &drag_stage_dir {
+            if path.exists() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            std::fs::create_dir_all(path)
+                .map_err(|e| format!("unable to create drag staging directory: {e}"))?;
+            path.clone()
+        } else {
+            self.download_dir()
+        };
         let mut root_map = HashMap::new();
         let mut root_paths = Vec::new();
         let mut failure = None;
@@ -631,21 +791,54 @@ impl FileReceiver {
             root_map.insert(root.name.clone(), target.clone());
             root_paths.push(target);
         }
-        let title = roots.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join("、");
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).batches.insert(
-            id.to_string(),
-            ReceiveBatch {
-                title: title.clone(), roots: root_map, root_paths,
-                expected_files: files, completed_files: 0,
-                total_bytes: bytes, received_bytes: 0, failed: failure,
-                last_emit: Instant::now() - Duration::from_secs(1),
-                last_activity: Instant::now(),
-                drop_at_cursor,
-            },
+        let title = roots
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batches
+            .insert(
+                id.to_string(),
+                ReceiveBatch {
+                    title: title.clone(),
+                    roots: root_map,
+                    root_paths,
+                    expected_files: files,
+                    completed_files: 0,
+                    total_bytes: bytes,
+                    received_bytes: 0,
+                    failed: failure,
+                    last_emit: Instant::now() - Duration::from_secs(1),
+                    last_activity: Instant::now(),
+                    drop_at_cursor,
+                    drag_id,
+                    drag_stage_dir,
+                },
+            );
+        emit_update(
+            &self.app,
+            id,
+            "receive",
+            &title,
+            "transferring",
+            0,
+            bytes,
+            0,
+            files,
+            None,
+            None,
         );
-        emit_update(&self.app, id, "receive", &title, "transferring", 0, bytes, 0, files, None, None);
-        if let Some(error) = self.state.lock().unwrap_or_else(|e| e.into_inner())
-            .batches.get(id).and_then(|batch| batch.failed.clone()) {
+        if let Some(error) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batches
+            .get(id)
+            .and_then(|batch| batch.failed.clone())
+        {
             let batch = self
                 .state
                 .lock()
@@ -654,6 +847,9 @@ impl FileReceiver {
                 .remove(id);
             if let Some(batch) = batch {
                 cleanup_paths(&batch.root_paths);
+                if let Some(stage) = &batch.drag_stage_dir {
+                    let _ = std::fs::remove_dir_all(stage);
+                }
             }
             Err(error)
         } else {
@@ -680,38 +876,56 @@ impl FileReceiver {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("无法创建目录 {}: {e}", parent.display()))?;
         }
-        let file_name = final_path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let file_name = final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
         let temp_path = final_path.with_file_name(format!(".{file_name}.ruiss-{id}.part"));
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
             .map_err(|e| format!("无法创建临时文件 {}: {e}", temp_path.display()))?;
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).files.insert(
-            id.to_string(),
-            ReceiveFile {
-                file: Some(file), batch_id: batch_id.to_string(), expected: size,
-                written: 0, next_seq: 0, hasher: Sha256::new(), temp_path, final_path,
-            },
-        );
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .insert(
+                id.to_string(),
+                ReceiveFile {
+                    file: Some(file),
+                    batch_id: batch_id.to_string(),
+                    expected: size,
+                    written: 0,
+                    next_seq: 0,
+                    hasher: Sha256::new(),
+                    temp_path,
+                    final_path,
+                },
+            );
         self.touch_batch(batch_id);
         Ok(())
     }
 
-    fn on_chunk(&self, id: &str, seq: u32, encoded: &str) -> Result<(), String> {
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| format!("文件数据解码失败: {e}"))?;
+    fn on_chunk(&self, id: &str, seq: u32, data: &[u8]) -> Result<(), String> {
         let (batch_id, written) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let file = state.files.get_mut(id).ok_or_else(|| "文件任务不存在或已失败".to_string())?;
+            let file = state
+                .files
+                .get_mut(id)
+                .ok_or_else(|| "文件任务不存在或已失败".to_string())?;
             if seq != file.next_seq {
-                return Err(format!("数据块序号错误，期望 {}，收到 {seq}", file.next_seq));
+                return Err(format!(
+                    "数据块序号错误，期望 {}，收到 {seq}",
+                    file.next_seq
+                ));
             }
             if file.written.saturating_add(data.len() as u64) > file.expected {
                 return Err("收到的数据超过声明大小".into());
             }
-            file.file.as_mut().ok_or_else(|| "临时文件已关闭".to_string())?
+            file.file
+                .as_mut()
+                .ok_or_else(|| "临时文件已关闭".to_string())?
                 .write_all(&data)
                 .map_err(|e| format!("写入磁盘失败: {e}"))?;
             file.hasher.update(&data);
@@ -739,7 +953,10 @@ impl FileReceiver {
             .ok_or_else(|| "文件任务不存在或已失败".to_string())?;
         let result = (|| {
             if file.written != file.expected {
-                return Err(format!("文件大小不符：期望 {}，实际 {}", file.expected, file.written));
+                return Err(format!(
+                    "文件大小不符：期望 {}，实际 {}",
+                    file.expected, file.written
+                ));
             }
             let actual_hash = format!("{:x}", file.hasher.finalize());
             if actual_hash != expected_hash {
@@ -747,7 +964,9 @@ impl FileReceiver {
             }
             if let Some(mut output) = file.file.take() {
                 output.flush().map_err(|e| format!("刷新文件失败: {e}"))?;
-                output.sync_all().map_err(|e| format!("文件落盘失败: {e}"))?;
+                output
+                    .sync_all()
+                    .map_err(|e| format!("文件落盘失败: {e}"))?;
             }
             if file.final_path.exists() {
                 std::fs::remove_file(&file.final_path)
@@ -787,36 +1006,92 @@ impl FileReceiver {
         let result = if let Some(error) = batch.failed.clone() {
             Err(error)
         } else if batch.completed_files != batch.expected_files {
-            Err(format!("文件数量不符：期望 {}，完成 {}", batch.expected_files, batch.completed_files))
+            Err(format!(
+                "文件数量不符：期望 {}，完成 {}",
+                batch.expected_files, batch.completed_files
+            ))
         } else if batch.received_bytes != batch.total_bytes {
-            Err(format!("总大小不符：期望 {}，收到 {}", batch.total_bytes, batch.received_bytes))
+            Err(format!(
+                "总大小不符：期望 {}，收到 {}",
+                batch.total_bytes, batch.received_bytes
+            ))
         } else {
             Ok(())
         };
         if let Err(error) = &result {
-            emit_update(&self.app, id, "receive", &batch.title, "failed", batch.received_bytes,
-                batch.total_bytes, batch.completed_files, batch.expected_files, Some(error.clone()), None);
+            emit_update(
+                &self.app,
+                id,
+                "receive",
+                &batch.title,
+                "failed",
+                batch.received_bytes,
+                batch.total_bytes,
+                batch.completed_files,
+                batch.expected_files,
+                Some(error.clone()),
+                None,
+            );
             cleanup_paths(&batch.root_paths);
+            if let Some(stage) = &batch.drag_stage_dir {
+                let _ = std::fs::remove_dir_all(stage);
+            }
             return (result, drop_at_cursor);
         }
-        let paths = batch.root_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        platform::clipboard_write_files(&paths);
+        let paths = batch
+            .root_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if let Some(drag_id) = &batch.drag_id {
+            platform::complete_remote_file_drag(drag_id, &paths, None);
+        } else {
+            platform::clipboard_write_files(&paths);
+        }
         let display_path = paths.first().cloned();
-        emit_update(&self.app, id, "receive", &batch.title, "completed", batch.total_bytes,
-            batch.total_bytes, batch.expected_files, batch.expected_files, None, display_path.clone());
-        let _ = self.app.emit("file-received", serde_json::json!({
-            "name": batch.title,
-            "path": display_path.unwrap_or_default(),
-            "paths": paths,
-        }));
+        emit_update(
+            &self.app,
+            id,
+            "receive",
+            &batch.title,
+            "completed",
+            batch.total_bytes,
+            batch.total_bytes,
+            batch.expected_files,
+            batch.expected_files,
+            None,
+            display_path.clone(),
+        );
+        let _ = self.app.emit(
+            "file-received",
+            serde_json::json!({
+                "name": batch.title,
+                "path": display_path.unwrap_or_default(),
+                "paths": paths,
+            }),
+        );
+        if let Some(stage) = batch.drag_stage_dir {
+            std::thread::spawn(move || {
+                // The OS drop target may still be copying a very large staged file
+                // into its final destination after the network batch completes.
+                std::thread::sleep(Duration::from_secs(60 * 60));
+                let _ = std::fs::remove_dir_all(stage);
+            });
+        }
         (Ok(()), drop_at_cursor)
     }
 
     fn resolve_target(&self, batch_id: &str, relative: &str) -> Result<PathBuf, String> {
         let components = safe_relative_components(relative)?;
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let batch = state.batches.get(batch_id).ok_or_else(|| "接收批次不存在".to_string())?;
-        let root = batch.roots.get(&components[0]).ok_or_else(|| "文件不属于声明的根目录".to_string())?;
+        let batch = state
+            .batches
+            .get(batch_id)
+            .ok_or_else(|| "接收批次不存在".to_string())?;
+        let root = batch
+            .roots
+            .get(&components[0])
+            .ok_or_else(|| "文件不属于声明的根目录".to_string())?;
         let mut result = root.clone();
         for component in components.iter().skip(1) {
             result.push(component);
@@ -825,7 +1100,12 @@ impl FileReceiver {
     }
 
     fn fail_file(&self, id: &str, error: &str) {
-        let removed = self.state.lock().unwrap_or_else(|e| e.into_inner()).files.remove(id);
+        let removed = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .remove(id);
         if let Some(file) = removed {
             drop(file.file);
             let _ = std::fs::remove_file(file.temp_path);
@@ -834,7 +1114,13 @@ impl FileReceiver {
     }
 
     fn mark_batch_failed(&self, id: &str, error: String) {
-        if let Some(batch) = self.state.lock().unwrap_or_else(|e| e.into_inner()).batches.get_mut(id) {
+        if let Some(batch) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batches
+            .get_mut(id)
+        {
             if batch.failed.is_none() {
                 batch.failed = Some(error);
             }
@@ -842,7 +1128,13 @@ impl FileReceiver {
     }
 
     fn touch_batch(&self, id: &str) {
-        if let Some(batch) = self.state.lock().unwrap_or_else(|e| e.into_inner()).batches.get_mut(id) {
+        if let Some(batch) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .batches
+            .get_mut(id)
+        {
             batch.last_activity = Instant::now();
         }
     }
@@ -853,7 +1145,9 @@ impl FileReceiver {
             state
                 .batches
                 .iter()
-                .filter_map(|(id, batch)| (batch.last_activity.elapsed() >= max_age).then(|| id.clone()))
+                .filter_map(|(id, batch)| {
+                    (batch.last_activity.elapsed() >= max_age).then(|| id.clone())
+                })
                 .collect::<Vec<_>>()
         };
         for id in stale {
@@ -868,9 +1162,11 @@ impl FileReceiver {
 
     fn cancel_batch_with_reason(&self, id: &str, reason: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let file_ids = state.files.iter().filter_map(|(file_id, file)| {
-            (file.batch_id == id).then(|| file_id.clone())
-        }).collect::<Vec<_>>();
+        let file_ids = state
+            .files
+            .iter()
+            .filter_map(|(file_id, file)| (file.batch_id == id).then(|| file_id.clone()))
+            .collect::<Vec<_>>();
         for file_id in file_ids {
             if let Some(file) = state.files.remove(&file_id) {
                 drop(file.file);
@@ -878,27 +1174,60 @@ impl FileReceiver {
             }
         }
         if let Some(batch) = state.batches.remove(id) {
-            emit_update(&self.app, id, "receive", &batch.title, "cancelled", batch.received_bytes,
-                batch.total_bytes, batch.completed_files, batch.expected_files, Some(reason.into()), None);
+            if let Some(drag_id) = &batch.drag_id {
+                platform::complete_remote_file_drag(drag_id, &[], Some(reason.to_string()));
+            }
+            emit_update(
+                &self.app,
+                id,
+                "receive",
+                &batch.title,
+                "cancelled",
+                batch.received_bytes,
+                batch.total_bytes,
+                batch.completed_files,
+                batch.expected_files,
+                Some(reason.into()),
+                None,
+            );
             cleanup_paths(&batch.root_paths);
+            if let Some(stage) = &batch.drag_stage_dir {
+                let _ = std::fs::remove_dir_all(stage);
+            }
         }
     }
 
     fn emit_receive_progress(&self, id: &str, force: bool) {
         let snapshot = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(batch) = state.batches.get_mut(id) else { return };
+            let Some(batch) = state.batches.get_mut(id) else {
+                return;
+            };
             if !force && batch.last_emit.elapsed() < Duration::from_millis(100) {
                 return;
             }
             batch.last_emit = Instant::now();
             (
-                batch.title.clone(), batch.received_bytes, batch.total_bytes,
-                batch.completed_files, batch.expected_files,
+                batch.title.clone(),
+                batch.received_bytes,
+                batch.total_bytes,
+                batch.completed_files,
+                batch.expected_files,
             )
         };
-        emit_update(&self.app, id, "receive", &snapshot.0, "transferring", snapshot.1,
-            snapshot.2, snapshot.3, snapshot.4, None, None);
+        emit_update(
+            &self.app,
+            id,
+            "receive",
+            &snapshot.0,
+            "transferring",
+            snapshot.1,
+            snapshot.2,
+            snapshot.3,
+            snapshot.4,
+            None,
+            None,
+        );
     }
 }
 
@@ -914,7 +1243,9 @@ fn resolve_download_dir(configured: &str) -> PathBuf {
 fn safe_single_name(name: &str) -> Option<String> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
-        (Some(Component::Normal(value)), None) => value.to_str().filter(|s| !s.is_empty()).map(str::to_string),
+        (Some(Component::Normal(value)), None) => {
+            value.to_str().filter(|s| !s.is_empty()).map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -987,18 +1318,21 @@ fn emit_update(
     error: Option<String>,
     path: Option<String>,
 ) {
-    let _ = app.emit("file-transfer-update", serde_json::json!({
-        "id": id,
-        "direction": direction,
-        "name": name,
-        "status": status,
-        "transferred": transferred,
-        "total": total,
-        "filesDone": files_done,
-        "filesTotal": files_total,
-        "error": error,
-        "path": path,
-    }));
+    let _ = app.emit(
+        "file-transfer-update",
+        serde_json::json!({
+            "id": id,
+            "direction": direction,
+            "name": name,
+            "status": status,
+            "transferred": transferred,
+            "total": total,
+            "filesDone": files_done,
+            "filesTotal": files_total,
+            "error": error,
+            "path": path,
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -1034,7 +1368,10 @@ mod tests {
         assert_eq!(plan.roots.len(), 1);
         assert_eq!(plan.total_bytes, 5);
         assert!(plan.directories.contains(&format!("{root_name}/empty")));
-        assert!(plan.files.iter().any(|file| file.relative == format!("{root_name}/nested/hello.txt")));
+        assert!(plan
+            .files
+            .iter()
+            .any(|file| file.relative == format!("{root_name}/nested/hello.txt")));
 
         std::fs::remove_dir_all(root).unwrap();
     }

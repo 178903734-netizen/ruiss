@@ -23,9 +23,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
-use crate::core::keys::{
-    translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut,
-};
+use crate::core::keys::{translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut};
 use crate::core::protocol::{Message, Payload};
 
 /// Tauri 入口。
@@ -58,7 +56,9 @@ pub fn run() {
                 Err(e) => {
                     log::error!("输入捕获启动失败（自测/跨屏不可用）: {e}");
                     // Mac 上常见原因：未授予辅助功能权限
-                    log::error!("若在 Mac 上：请到 系统设置 → 隐私与安全性 → 辅助功能 授权后重启应用");
+                    log::error!(
+                        "若在 Mac 上：请到 系统设置 → 隐私与安全性 → 辅助功能 授权后重启应用"
+                    );
                 }
             }
 
@@ -177,6 +177,8 @@ struct RouterState {
     /// 本机作为 Sink 时当前接受的跨屏轮次及最后 UDP 序号。
     rx_pointer_session: u64,
     rx_pointer_seq: u64,
+    outgoing_drag: Option<String>,
+    incoming_drag: Option<String>,
 }
 
 impl RouterState {
@@ -197,6 +199,8 @@ impl RouterState {
             pending_pointer_move: None,
             rx_pointer_session: 0,
             rx_pointer_seq: 0,
+            outgoing_drag: None,
+            incoming_drag: None,
         }
     }
 }
@@ -212,7 +216,11 @@ fn next_pointer_session() -> u64 {
         time ^ ((std::process::id() as u64) << 32)
     });
     let session = seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed));
-    if session == 0 { u64::MAX } else { session }
+    if session == 0 {
+        u64::MAX
+    } else {
+        session
+    }
 }
 
 fn merge_pending_pointer(slot: &mut Option<Payload>, next: Payload) {
@@ -246,12 +254,7 @@ fn accept_pointer_sequence(
 
 fn make_pointer_frame(session: u64, seq: u64, payload: Payload) -> Option<Payload> {
     match payload {
-        Payload::MouseMove {
-            x,
-            y,
-            src_w,
-            src_h,
-        } => Some(Payload::PointerMove {
+        Payload::MouseMove { x, y, src_w, src_h } => Some(Payload::PointerMove {
             session,
             seq,
             x,
@@ -451,6 +454,16 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                 };
                 let mut acts = Vec::new();
                 let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
+                if !connected {
+                    if let Some(id) = r.incoming_drag.take() {
+                        platform::cancel_remote_file_drag(&id);
+                    }
+                    if let Some(id) = r.outgoing_drag.take() {
+                        if let Some(sender) = &r.file_sender {
+                            sender.cancel_drag(&id);
+                        }
+                    }
+                }
                 if let Some(a) = r.arbiter.as_mut() {
                     let (w, h) = platform::screen_size();
                     if !connected {
@@ -480,7 +493,12 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                     }
                     if a.mode == Mode::Sink {
                         // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
-                        acts.extend(a.on_sink_tick(platform::last_injected_pos(), w, h, Instant::now()));
+                        acts.extend(a.on_sink_tick(
+                            platform::last_injected_pos(),
+                            w,
+                            h,
+                            Instant::now(),
+                        ));
                     } else {
                         acts.extend(a.on_tick(Instant::now()));
                     }
@@ -561,12 +579,8 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 },
             ));
             // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
-            if left_button_down {
-                let content = if drag_paths.is_empty() {
-                    platform::clipboard_read()
-                } else {
-                    platform::ClipboardContent::Files(drag_paths)
-                };
+            if left_button_down && drag_paths.is_empty() {
+                let content = platform::clipboard_read();
                 let (has_text, has_image, has_files) = match &content {
                     platform::ClipboardContent::Text(_) => (true, false, false),
                     platform::ClipboardContent::Image(_) => (false, true, false),
@@ -575,43 +589,56 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 };
                 if has_text || has_image || has_files {
                     log::info!("拖拽跨屏：携带剪贴板内容 text={has_text} image={has_image} files={has_files}");
-                    net.send_ctrl(Message::ctrl(&name, Payload::DragOffer {
-                        drag: true, has_text, has_image, has_files,
-                    }));
+                    net.send_ctrl(Message::ctrl(
+                        &name,
+                        Payload::DragOffer {
+                            drag: true,
+                            has_text,
+                            has_image,
+                            has_files,
+                        },
+                    ));
                     match content {
                         platform::ClipboardContent::Text(t) => {
-                            net.send(Message::clipboard(&name, Payload::ClipboardText { text: t }));
+                            net.send(Message::clipboard(
+                                &name,
+                                Payload::ClipboardText { text: t },
+                            ));
                         }
                         platform::ClipboardContent::Image(png) => {
                             net.send(Message::clipboard(&name, Payload::ClipboardImage { png }));
                         }
-                        platform::ClipboardContent::Files(paths) => {
-                            // 每个文件走分块传输
-                            let sender = {
-                                let r = match router.lock() {
-                                    Ok(g) => g,
-                                    Err(e) => e.into_inner(),
-                                };
-                                r.file_sender.clone()
-                            };
-                            if let Some(sender) = sender {
-                                let paths = paths
-                                    .into_iter()
-                                    .map(std::path::PathBuf::from)
-                                    .collect();
-                                if let Err(e) = sender.send_drag_paths(paths) {
-                                    log::error!("[FILE] 拖拽文件发送失败: {e}");
-                                }
-                            }
-                        }
+                        platform::ClipboardContent::Files(_) => {}
                         platform::ClipboardContent::Empty => {}
+                    }
+                }
+            }
+            if !drag_paths.is_empty() {
+                let sender = router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file_sender
+                    .clone();
+                if let Some(sender) = sender {
+                    let paths = drag_paths
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                    match sender.offer_drag_paths(paths) {
+                        Ok(id) => {
+                            router
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .outgoing_drag = Some(id)
+                        }
+                        Err(error) => log::error!("[DRAG] unable to start file drag: {error}"),
                     }
                 }
             }
         }
         Action::ReleaseControl => {
             injector.reset_keyboard_state();
-            let session = {
+            let (session, cancelled_drag) = {
                 let mut r = match router.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
@@ -627,8 +654,19 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 r.pending_pointer_move = None;
                 r.rx_pointer_session = 0;
                 r.rx_pointer_seq = 0;
-                session
+                (session, r.outgoing_drag.take())
             };
+            if let Some(id) = cancelled_drag {
+                if let Some(sender) = router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file_sender
+                    .clone()
+                {
+                    sender.cancel_drag(&id);
+                }
+                net.send_ctrl(Message::ctrl(&name, Payload::DragCancel { id }));
+            }
             log::info!("返回本机 session={session} → ReleaseControl");
             platform::show_cursor();
             platform::set_local_input_blocked(false);
@@ -747,11 +785,7 @@ async fn run_incoming_router(
                             r.tx_pointer_seq = r.tx_pointer_seq.saturating_add(1);
                             if let (Some(net), Some(frame)) = (
                                 r.net.clone(),
-                                make_pointer_frame(
-                                    r.tx_pointer_session,
-                                    r.tx_pointer_seq,
-                                    pending,
-                                ),
+                                make_pointer_frame(r.tx_pointer_session, r.tx_pointer_seq, pending),
                             ) {
                                 net.send_pointer(frame);
                             }
@@ -766,8 +800,8 @@ async fn run_incoming_router(
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
                     };
-                    let accepted = r.tx_pointer_session == *session
-                        || r.rx_pointer_session == *session;
+                    let accepted =
+                        r.tx_pointer_session == *session || r.rx_pointer_session == *session;
                     if accepted {
                         r.tx_pointer_session = 0;
                         r.tx_pointer_ready = false;
@@ -835,12 +869,7 @@ async fn run_incoming_router(
                 if accepted {
                     let (tw, th) = platform::screen_size();
                     let (mx, my) = crate::core::geometry::map_coords(
-                        *x,
-                        *y,
-                        *src_w,
-                        *src_h,
-                        tw as u32,
-                        th as u32,
+                        *x, *y, *src_w, *src_h, tw as u32, th as u32,
                     );
                     injector.inject(Payload::MouseMove {
                         x: mx,
@@ -849,9 +878,7 @@ async fn run_incoming_router(
                         src_h: th as u32,
                     });
                 } else {
-                    log::debug!(
-                        "丢弃非当前/乱序绝对指针帧 session={session} seq={seq}"
-                    );
+                    log::debug!("丢弃非当前/乱序绝对指针帧 session={session} seq={seq}");
                 }
             }
             Payload::PointerMoveRelative {
@@ -881,15 +908,20 @@ async fn run_incoming_router(
                 if accepted {
                     injector.inject(Payload::MouseMoveRelative { dx: *dx, dy: *dy });
                 } else {
-                    log::debug!(
-                        "丢弃非当前/乱序相对指针帧 session={session} seq={seq}"
-                    );
+                    log::debug!("丢弃非当前/乱序相对指针帧 session={session} seq={seq}");
                 }
             }
-            Payload::ClipboardText { .. } | Payload::ClipboardImage { .. } | Payload::ClipboardFiles { .. } => {
+            Payload::ClipboardText { .. }
+            | Payload::ClipboardImage { .. }
+            | Payload::ClipboardFiles { .. } => {
                 clipboard::handle_remote(&msg.payload);
             }
-            Payload::DragOffer { drag, has_text, has_image, has_files: _ } => {
+            Payload::DragOffer {
+                drag,
+                has_text,
+                has_image,
+                has_files: _,
+            } => {
                 // 文字/图片拖拽：剪贴板内容随后到达写入，延迟注入粘贴
                 // 文件拖拽：标记下一批文件，待校验完成、整批路径写入剪贴板后再粘贴。
                 if *drag && (*has_text || *has_image) {
@@ -911,7 +943,10 @@ async fn run_incoming_router(
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
                     };
-                    r.arbiter.as_ref().map(|a| a.mode == Mode::Sink).unwrap_or(false)
+                    r.arbiter
+                        .as_ref()
+                        .map(|a| a.mode == Mode::Sink)
+                        .unwrap_or(false)
                 };
                 if sink {
                     injector.inject(msg.payload.clone());
@@ -929,15 +964,42 @@ async fn run_incoming_router(
 fn inject_paste(injector: &platform::InputInjector) {
     // InputInjector consumes the peer/source-side semantic key and performs the
     // Ctrl↔Command mapping. Feed the opposite key to obtain the native target modifier.
-    let mod_key = if platform::TARGET_IS_MAC { Key::Ctrl } else { Key::Super };
-    injector.inject(Payload::Key { key: mod_key, scan: 0, extended: false, down: true });
-    injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: true });
-    injector.inject(Payload::Key { key: Key::V, scan: 0, extended: false, down: false });
-    injector.inject(Payload::Key { key: mod_key, scan: 0, extended: false, down: false });
+    let mod_key = if platform::TARGET_IS_MAC {
+        Key::Ctrl
+    } else {
+        Key::Super
+    };
+    injector.inject(Payload::Key {
+        key: mod_key,
+        scan: 0,
+        extended: false,
+        down: true,
+    });
+    injector.inject(Payload::Key {
+        key: Key::V,
+        scan: 0,
+        extended: false,
+        down: true,
+    });
+    injector.inject(Payload::Key {
+        key: Key::V,
+        scan: 0,
+        extended: false,
+        down: false,
+    });
+    injector.inject(Payload::Key {
+        key: mod_key,
+        scan: 0,
+        extended: false,
+        down: false,
+    });
 }
 
 /// 按当前设置（重）配置网络与仲裁器。
-async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -> Result<(), String> {
+async fn apply_link_config(
+    router: &Arc<Mutex<RouterState>>,
+    _app: &AppHandle,
+) -> Result<(), String> {
     let (peer_ip, layout, name, cross_enabled, clip_enabled) = {
         let r = match router.lock() {
             Ok(g) => g,
@@ -985,8 +1047,16 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
         return Ok(());
     }
 
-    let layout = if layout == "left" { Layout::PeerLeft } else { Layout::PeerRight };
-    let name = if name.is_empty() { "ruiss".to_string() } else { name };
+    let layout = if layout == "left" {
+        Layout::PeerLeft
+    } else {
+        Layout::PeerRight
+    };
+    let name = if name.is_empty() {
+        "ruiss".to_string()
+    } else {
+        name
+    };
     let cfg = net::PeerConfig::new(peer_ip.clone());
     let start = net::NetEngine::start(name.clone(), cfg)
         .await
@@ -1007,13 +1077,14 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
         r.engine = Some(start.engine);
         r.net = Some(handle.clone());
         // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
-        r.arbiter = if cross_enabled { Some(Arbiter::new(layout)) } else { None };
+        r.arbiter = if cross_enabled {
+            Some(Arbiter::new(layout))
+        } else {
+            None
+        };
         // 文件发送器（剪贴板文件 + GUI 手动发送 + 拖拽，都用它）
-        let file_sender = file_transfer::FileSender::new(
-            handle.clone(),
-            name.clone(),
-            _app.clone(),
-        );
+        let file_sender =
+            file_transfer::FileSender::new(handle.clone(), name.clone(), _app.clone());
         r.file_sender = Some(file_sender.clone());
         // 剪贴板同步：监听本机剪贴板变化发对端，剪贴板开关关闭时不启动
         if clip_enabled {
@@ -1030,7 +1101,11 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
             r.clipboard = Some(clip);
         }
     }
-    tauri::async_runtime::spawn(run_incoming_router(start.incoming, router.clone(), injector));
+    tauri::async_runtime::spawn(run_incoming_router(
+        start.incoming,
+        router.clone(),
+        injector,
+    ));
     tauri::async_runtime::spawn(run_file_router(start.file_incoming, router.clone()));
     log::info!(
         "网络已启动：对端 {peer_ip}（跨屏{}，剪贴板{}）",
@@ -1098,13 +1173,93 @@ async fn run_file_router(
                     sender.handle_result(&msg.payload);
                 }
             }
+            Payload::DragStart { id, roots } => {
+                let (net, name) = {
+                    let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(previous) = r.incoming_drag.replace(id.clone()) {
+                        platform::cancel_remote_file_drag(&previous);
+                    }
+                    (r.net.clone(), r.settings.name.clone())
+                };
+                if let Some(net) = net {
+                    let drag_id = id.clone();
+                    let callback_net = net.clone();
+                    let callback_name = name.clone();
+                    let callback =
+                        Arc::new(move |event: platform::RemoteFileDragEvent| match event {
+                            platform::RemoteFileDragEvent::DataRequested(_) => {
+                                callback_net.send_ctrl(Message::ctrl(
+                                    &callback_name,
+                                    Payload::DragCommit {
+                                        id: drag_id.clone(),
+                                    },
+                                ));
+                            }
+                            platform::RemoteFileDragEvent::Cancelled(_) => {
+                                callback_net.send_ctrl(Message::ctrl(
+                                    &callback_name,
+                                    Payload::DragCancel {
+                                        id: drag_id.clone(),
+                                    },
+                                ));
+                            }
+                        });
+                    if let Err(error) =
+                        platform::start_remote_file_drag(id.clone(), roots.clone(), callback)
+                    {
+                        router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .incoming_drag = None;
+                        log::error!("[DRAG] unable to start target drag {id}: {error}");
+                        net.send_ctrl(Message::ctrl(&name, Payload::DragCancel { id: id.clone() }));
+                    }
+                }
+            }
+            Payload::DragCommit { id } => {
+                let sender = {
+                    let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                    if r.outgoing_drag.as_deref() == Some(id) {
+                        r.outgoing_drag = None;
+                        r.file_sender.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(sender) = sender {
+                    if let Err(error) = sender.commit_drag(id) {
+                        log::error!("[DRAG] unable to commit drag {id}: {error}");
+                    }
+                }
+            }
+            Payload::DragCancel { id } => {
+                platform::cancel_remote_file_drag(id);
+                let sender = {
+                    let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                    if r.incoming_drag.as_deref() == Some(id) {
+                        r.incoming_drag = None;
+                    }
+                    if r.outgoing_drag.as_deref() == Some(id) {
+                        r.outgoing_drag = None;
+                    }
+                    r.file_sender.clone()
+                };
+                if let Some(sender) = sender {
+                    sender.cancel_drag(id);
+                }
+            }
             _ => {
                 if let Some(receiver) = receiver {
                     let responses = receiver.handle(&msg.payload);
                     let should_drop = responses.iter().any(|response| {
-                        matches!(response, Payload::FileBatchResult {
-                            ok: true, drop_at_cursor: true, ..
-                        })
+                        matches!(
+                            response,
+                            Payload::FileBatchResult {
+                                ok: true,
+                                drop_at_cursor: true,
+                                ..
+                            }
+                        )
                     });
                     for response in responses {
                         if let Some(net) = &net {
@@ -1259,7 +1414,11 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
     };
     let (mode, linked) = match &r.arbiter {
         Some(a) => {
-            let mode = if a.mode == Mode::Sink { "sink" } else { "source" };
+            let mode = if a.mode == Mode::Sink {
+                "sink"
+            } else {
+                "source"
+            };
             (mode, a.linked)
         }
         None => ("source", false),
@@ -1278,16 +1437,15 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
 
 /// 发送指定路径的文件到对端（前端传完整路径）。
 #[tauri::command]
-fn send_file(
-    state: State<'_, Arc<Mutex<RouterState>>>,
-    path: String,
-) -> Result<(), String> {
+fn send_file(state: State<'_, Arc<Mutex<RouterState>>>, path: String) -> Result<(), String> {
     let sender = {
         let r = state.inner().lock().map_err(|e| e.to_string())?;
         r.file_sender.clone()
     };
     let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
-    sender.send_paths(vec![std::path::PathBuf::from(path)]).map(|_| ())
+    sender
+        .send_paths(vec![std::path::PathBuf::from(path)])
+        .map(|_| ())
 }
 
 /// 弹出文件选择框，选完即发送（用 tauri-plugin-dialog）。
@@ -1302,7 +1460,9 @@ async fn pick_and_send_file(
         .file()
         .add_filter("所有文件", &["*"])
         .blocking_pick_files();
-    let Some(picked) = picked else { return Ok(None); };
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
     let paths = picked
         .into_iter()
         .map(|path| path.into_path().map_err(|e| e.to_string()))
@@ -1341,7 +1501,11 @@ fn pick_receive_directory(app: AppHandle) -> Result<Option<String>, String> {
     app.dialog()
         .file()
         .blocking_pick_folder()
-        .map(|path| path.into_path().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string()))
+        .map(|path| {
+            path.into_path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| e.to_string())
+        })
         .transpose()
 }
 
@@ -1384,11 +1548,9 @@ mod mouse_binding_tests {
     fn default_mouse_buttons_match_windows_ctrl_keyboard_translation() {
         let settings = Settings::default();
         for (button, key) in [(3, Key::Digit1), (4, Key::Digit2), (2, Key::Digit3)] {
-            let actions = mouse_binding_actions(
-                &settings,
-                &Payload::MouseButton { button, down: true },
-            )
-            .expect("configured mouse button");
+            let actions =
+                mouse_binding_actions(&settings, &Payload::MouseButton { button, down: true })
+                    .expect("configured mouse button");
             assert_eq!(
                 actions,
                 vec![Action::Forward(Payload::Shortcut {

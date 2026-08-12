@@ -24,8 +24,8 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
 use core_graphics::event::{
-    CallbackResult, CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-    CGEventTapPlacement, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CGMouseButton, CallbackResult, EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -246,7 +246,10 @@ impl InputCapturer {
             .spawn(move || run_hook_loop(tx, ready_tx))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { hook_thread, consume_thread }),
+            Ok(Ok(())) => Ok(Self {
+                hook_thread,
+                consume_thread,
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("事件 tap 线程异常退出")),
         }
@@ -299,9 +302,7 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     if !tap_ptr.is_null() {
                         unsafe { CGEventTapEnable(tap_ptr, true) };
                     }
-                    log::warn!(
-                        "[MAC-TAP] HID tap 被系统禁用，已自动重新启用: {event_type:?}"
-                    );
+                    log::warn!("[MAC-TAP] HID tap 被系统禁用，已自动重新启用: {event_type:?}");
                     return CallbackResult::Drop;
                 }
 
@@ -314,8 +315,7 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 );
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::SeqCst);
                 let sink = SINK_ACTIVE.load(Ordering::SeqCst);
-                let marked = event
-                    .get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                let marked = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                     == RUISS_EVENT_MARKER;
 
                 if marked {
@@ -419,59 +419,59 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
             CGEventTapOptions::Default,
             event_types,
             move |_proxy, event_type, event| {
-            // macOS 会在 tap 超时或用户请求后禁用它；不重新启用时，本机输入将完全
-            // 绕过 Ruiss。特殊通知不属于用户输入，恢复 tap 后直接丢弃通知本身。
-            if matches!(
-                event_type,
-                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-            ) {
-                let tap_ptr = SESSION_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
-                if !tap_ptr.is_null() {
-                    unsafe { CGEventTapEnable(tap_ptr, true) };
-                }
-                log::warn!("[MAC-TAP] 事件 tap 被系统禁用，已自动重新启用: {event_type:?}");
-                return CallbackResult::Drop;
-            }
-
-            // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
-            // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
-            let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
-            if marker == RUISS_EVENT_MARKER {
-                // Source 不应接收远程按键/滚动；即便合成事件意外继承 marker，也不能
-                // 绕过本机隔离。Sink 上的对端注入则必须放行。
-                return if BLOCK_LOCAL_INPUT.load(Ordering::SeqCst) {
-                    CallbackResult::Drop
-                } else {
-                    CallbackResult::Keep
-                };
-            }
-            if let Some(p) = event_to_payload(event_type, event) {
-                let _ = tx.send(p);
-            }
-
-            // 输入所有权判断必须基于原始 CGEventType，不能依赖 event_to_payload 是否
-            // 认识/成功转换该事件。跨屏期间所有真实键盘、按键和滚动都只允许发往
-            // 对端，本机一律吞掉；移动已在上面的 Source/Sink 分支单独处理。
-            let owns_remote = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
-                || SINK_ACTIVE.load(Ordering::Relaxed);
-            if owns_remote
-                && matches!(
+                // macOS 会在 tap 超时或用户请求后禁用它；不重新启用时，本机输入将完全
+                // 绕过 Ruiss。特殊通知不属于用户输入，恢复 tap 后直接丢弃通知本身。
+                if matches!(
                     event_type,
-                    CGEventType::ScrollWheel
-                        | CGEventType::KeyDown
-                        | CGEventType::KeyUp
-                        | CGEventType::FlagsChanged
-                        | CGEventType::LeftMouseDown
-                        | CGEventType::LeftMouseUp
-                        | CGEventType::RightMouseDown
-                        | CGEventType::RightMouseUp
-                        | CGEventType::OtherMouseDown
-                        | CGEventType::OtherMouseUp
-                )
-            {
-                return CallbackResult::Drop;
-            }
-            // 监听模式：原样放行，绝不吞事件
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ) {
+                    let tap_ptr = SESSION_TAP_PORT_PTR.load(Ordering::SeqCst) as *const c_void;
+                    if !tap_ptr.is_null() {
+                        unsafe { CGEventTapEnable(tap_ptr, true) };
+                    }
+                    log::warn!("[MAC-TAP] 事件 tap 被系统禁用，已自动重新启用: {event_type:?}");
+                    return CallbackResult::Drop;
+                }
+
+                // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
+                // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
+                let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+                if marker == RUISS_EVENT_MARKER {
+                    // Source 不应接收远程按键/滚动；即便合成事件意外继承 marker，也不能
+                    // 绕过本机隔离。Sink 上的对端注入则必须放行。
+                    return if BLOCK_LOCAL_INPUT.load(Ordering::SeqCst) {
+                        CallbackResult::Drop
+                    } else {
+                        CallbackResult::Keep
+                    };
+                }
+                if let Some(p) = event_to_payload(event_type, event) {
+                    let _ = tx.send(p);
+                }
+
+                // 输入所有权判断必须基于原始 CGEventType，不能依赖 event_to_payload 是否
+                // 认识/成功转换该事件。跨屏期间所有真实键盘、按键和滚动都只允许发往
+                // 对端，本机一律吞掉；移动已在上面的 Source/Sink 分支单独处理。
+                let owns_remote = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed)
+                    || SINK_ACTIVE.load(Ordering::Relaxed);
+                if owns_remote
+                    && matches!(
+                        event_type,
+                        CGEventType::ScrollWheel
+                            | CGEventType::KeyDown
+                            | CGEventType::KeyUp
+                            | CGEventType::FlagsChanged
+                            | CGEventType::LeftMouseDown
+                            | CGEventType::LeftMouseUp
+                            | CGEventType::RightMouseDown
+                            | CGEventType::RightMouseUp
+                            | CGEventType::OtherMouseDown
+                            | CGEventType::OtherMouseUp
+                    )
+                {
+                    return CallbackResult::Drop;
+                }
+                // 监听模式：原样放行，绝不吞事件
                 CallbackResult::Keep
             },
         )
@@ -534,18 +534,46 @@ fn event_to_payload(event_type: CGEventType, event: &CGEvent) -> Option<Payload>
         | CGEventType::OtherMouseDragged => {
             let p = event.location();
             let (w, h) = screen_size();
-            Some(Payload::MouseMove { x: p.x as i32, y: p.y as i32, src_w: w as u32, src_h: h as u32 })
+            Some(Payload::MouseMove {
+                x: p.x as i32,
+                y: p.y as i32,
+                src_w: w as u32,
+                src_h: h as u32,
+            })
         }
-        CGEventType::LeftMouseDown => Some(Payload::MouseButton { button: 0, down: true }),
-        CGEventType::LeftMouseUp => Some(Payload::MouseButton { button: 0, down: false }),
-        CGEventType::RightMouseDown => Some(Payload::MouseButton { button: 1, down: true }),
-        CGEventType::RightMouseUp => Some(Payload::MouseButton { button: 1, down: false }),
-        CGEventType::OtherMouseDown => Some(Payload::MouseButton { button: 2, down: true }),
-        CGEventType::OtherMouseUp => Some(Payload::MouseButton { button: 2, down: false }),
+        CGEventType::LeftMouseDown => Some(Payload::MouseButton {
+            button: 0,
+            down: true,
+        }),
+        CGEventType::LeftMouseUp => Some(Payload::MouseButton {
+            button: 0,
+            down: false,
+        }),
+        CGEventType::RightMouseDown => Some(Payload::MouseButton {
+            button: 1,
+            down: true,
+        }),
+        CGEventType::RightMouseUp => Some(Payload::MouseButton {
+            button: 1,
+            down: false,
+        }),
+        CGEventType::OtherMouseDown => Some(Payload::MouseButton {
+            button: 2,
+            down: true,
+        }),
+        CGEventType::OtherMouseUp => Some(Payload::MouseButton {
+            button: 2,
+            down: false,
+        }),
         CGEventType::ScrollWheel => {
-            let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-            let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-            Some(Payload::MouseWheel { dx: dx as i32, dy: dy as i32 })
+            let dy =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+            let dx =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+            Some(Payload::MouseWheel {
+                dx: dx as i32,
+                dy: dy as i32,
+            })
         }
         CGEventType::KeyDown | CGEventType::KeyUp => {
             // 过滤自动重复（按住不放的重复帧不需要转发，目标端自己会重复）
@@ -567,7 +595,12 @@ fn event_to_payload(event_type: CGEventType, event: &CGEvent) -> Option<Payload>
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             let key = cg_to_key(code);
             let down = modifier_down(&key, event);
-            Some(Payload::Key { key, scan: 0, extended: false, down })
+            Some(Payload::Key {
+                key,
+                scan: 0,
+                extended: false,
+                down,
+            })
         }
         _ => None,
     }
@@ -784,7 +817,10 @@ impl InputInjector {
             Ok(s) => s,
             Err(_) => return 0,
         };
-        if matches!(event, Payload::MouseButton { .. } | Payload::MouseWheel { .. }) {
+        if matches!(
+            event,
+            Payload::MouseButton { .. } | Payload::MouseWheel { .. }
+        ) {
             let mut keyboard = match self.keyboard.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
@@ -886,7 +922,10 @@ impl InputInjector {
                         st.last_pos = (x, y);
                     }
                     // down 计算/更新计数，up 沿用当前计数（不重置、不再判定）
-                    ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, st.count as i64);
+                    ev.set_integer_value_field(
+                        EventField::MOUSE_EVENT_CLICK_STATE,
+                        st.count as i64,
+                    );
                 }
                 ev
             }
@@ -915,11 +954,7 @@ impl InputInjector {
                     };
                     if keyboard.source_modifiers.set(*key, *down) {
                         let desired = map_modifiers(true, keyboard.source_modifiers);
-                        return if sync_mac_modifiers(
-                            &mut keyboard,
-                            &key_source,
-                            desired,
-                        ) {
+                        return if sync_mac_modifiers(&mut keyboard, &key_source, desired) {
                             1
                         } else {
                             0
@@ -941,23 +976,14 @@ impl InputInjector {
                             );
                         }
                     }
-                    if !sync_mac_modifiers(
-                        &mut keyboard,
-                        &key_source,
-                        stroke.modifiers,
-                    ) {
+                    if !sync_mac_modifiers(&mut keyboard, &key_source, stroke.modifiers) {
                         return 0;
                     }
                     if !*down
-                        && translate_windows_shortcut_to_mac(
-                            keyboard.source_modifiers,
-                            *key,
-                        ) != stroke
+                        && translate_windows_shortcut_to_mac(keyboard.source_modifiers, *key)
+                            != stroke
                     {
-                        restore_modifiers = Some(map_modifiers(
-                            true,
-                            keyboard.source_modifiers,
-                        ));
+                        restore_modifiers = Some(map_modifiers(true, keyboard.source_modifiers));
                     }
                     (stroke, key_source)
                 };
@@ -1010,11 +1036,9 @@ impl InputInjector {
 
         let mut posted = 0;
         for down in [true, false] {
-            let Ok(event) = CGEvent::new_keyboard_event(
-                source.clone(),
-                key_to_cg(shortcut.key),
-                down,
-            ) else {
+            let Ok(event) =
+                CGEvent::new_keyboard_event(source.clone(), key_to_cg(shortcut.key), down)
+            else {
                 continue;
             };
             event.set_flags(mac_keyboard_event_flags(shortcut.key, shortcut.modifiers));
@@ -1023,7 +1047,11 @@ impl InputInjector {
             posted += 1;
         }
         let _ = sync_mac_modifiers(&mut keyboard, &source, restore);
-        log::info!("[MAC-KEY] mouse binding -> {:?}+{:?}", shortcut.modifiers, shortcut.key);
+        log::info!(
+            "[MAC-KEY] mouse binding -> {:?}+{:?}",
+            shortcut.modifiers,
+            shortcut.key
+        );
         posted
     }
 
@@ -1041,11 +1069,7 @@ impl InputInjector {
                 .map(|stroke| stroke.key)
                 .collect::<Vec<_>>();
             if let Some(source) = &key_source {
-                let _ = sync_mac_modifiers(
-                    &mut keyboard,
-                    source,
-                    ModifierState::default(),
-                );
+                let _ = sync_mac_modifiers(&mut keyboard, source, ModifierState::default());
             }
             keyboard.source_modifiers = ModifierState::default();
             keyboard.applied_modifiers = ModifierState::default();
@@ -1064,12 +1088,9 @@ impl InputInjector {
                 .map(|pos| pos.unwrap_or((0.0, 0.0)))
                 .unwrap_or((0.0, 0.0));
             if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
-                if let Ok(event) = CGEvent::new_mouse_event(
-                    source,
-                    event_type,
-                    CGPoint::new(x, y),
-                    button,
-                ) {
+                if let Ok(event) =
+                    CGEvent::new_mouse_event(source, event_type, CGPoint::new(x, y), button)
+                {
                     event.set_flags(CGEventFlags::empty());
                     event.set_integer_value_field(
                         EventField::EVENT_SOURCE_USER_DATA,
@@ -1082,17 +1103,11 @@ impl InputInjector {
 
         if let Some(source) = key_source {
             for key in active_keys {
-                let Ok(event) = CGEvent::new_keyboard_event(
-                    source.clone(),
-                    key_to_cg(key),
-                    false,
-                ) else {
+                let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_to_cg(key), false)
+                else {
                     continue;
                 };
-                event.set_flags(mac_keyboard_event_flags(
-                    key,
-                    ModifierState::default(),
-                ));
+                event.set_flags(mac_keyboard_event_flags(key, ModifierState::default()));
                 event.set_integer_value_field(
                     EventField::EVENT_SOURCE_USER_DATA,
                     RUISS_EVENT_MARKER,
@@ -1100,12 +1115,7 @@ impl InputInjector {
                 event.post(CGEventTapLocation::HID);
             }
             for key in [Key::Shift, Key::Ctrl, Key::Alt, Key::Super] {
-                let _ = post_mac_modifier(
-                    &source,
-                    key,
-                    false,
-                    ModifierState::default(),
-                );
+                let _ = post_mac_modifier(&source, key, false, ModifierState::default());
             }
         }
     }
@@ -1160,35 +1170,94 @@ pub fn warp_cursor_cross(x: i32, y: i32) {
 
 const CG_MAP: &[(u16, Key)] = &[
     // 字母
-    (0, Key::A), (11, Key::B), (8, Key::C), (2, Key::D), (14, Key::E), (3, Key::F),
-    (5, Key::G), (4, Key::H), (34, Key::I), (38, Key::J), (40, Key::K), (37, Key::L),
-    (46, Key::M), (45, Key::N), (31, Key::O), (35, Key::P), (12, Key::Q), (15, Key::R),
-    (1, Key::S), (17, Key::T), (32, Key::U), (9, Key::V), (13, Key::W), (7, Key::X),
-    (16, Key::Y), (6, Key::Z),
+    (0, Key::A),
+    (11, Key::B),
+    (8, Key::C),
+    (2, Key::D),
+    (14, Key::E),
+    (3, Key::F),
+    (5, Key::G),
+    (4, Key::H),
+    (34, Key::I),
+    (38, Key::J),
+    (40, Key::K),
+    (37, Key::L),
+    (46, Key::M),
+    (45, Key::N),
+    (31, Key::O),
+    (35, Key::P),
+    (12, Key::Q),
+    (15, Key::R),
+    (1, Key::S),
+    (17, Key::T),
+    (32, Key::U),
+    (9, Key::V),
+    (13, Key::W),
+    (7, Key::X),
+    (16, Key::Y),
+    (6, Key::Z),
     // 数字（主键盘行）
-    (29, Key::Digit0), (18, Key::Digit1), (19, Key::Digit2), (20, Key::Digit3),
-    (21, Key::Digit4), (23, Key::Digit5), (22, Key::Digit6), (26, Key::Digit7),
-    (28, Key::Digit8), (25, Key::Digit9),
+    (29, Key::Digit0),
+    (18, Key::Digit1),
+    (19, Key::Digit2),
+    (20, Key::Digit3),
+    (21, Key::Digit4),
+    (23, Key::Digit5),
+    (22, Key::Digit6),
+    (26, Key::Digit7),
+    (28, Key::Digit8),
+    (25, Key::Digit9),
     // 修饰键（左右各一组）
-    (56, Key::Shift), (59, Key::Ctrl), (58, Key::Alt), (55, Key::Super),
-    (60, Key::Shift), (62, Key::Ctrl), (61, Key::Alt), (54, Key::Super),
+    (56, Key::Shift),
+    (59, Key::Ctrl),
+    (58, Key::Alt),
+    (55, Key::Super),
+    (60, Key::Shift),
+    (62, Key::Ctrl),
+    (61, Key::Alt),
+    (54, Key::Super),
     // 功能键
-    (36, Key::Enter), (49, Key::Space), (51, Key::Backspace), (48, Key::Tab), (53, Key::Esc),
-    (123, Key::ArrowLeft), (126, Key::ArrowUp), (124, Key::ArrowRight), (125, Key::ArrowDown),
+    (36, Key::Enter),
+    (49, Key::Space),
+    (51, Key::Backspace),
+    (48, Key::Tab),
+    (53, Key::Esc),
+    (123, Key::ArrowLeft),
+    (126, Key::ArrowUp),
+    (124, Key::ArrowRight),
+    (125, Key::ArrowDown),
     // 导航/编辑键
     (117, Key::Delete), // ForwardDelete（Fn+Delete 的效果）
-    (115, Key::Home), (119, Key::End),
-    (116, Key::PageUp), (121, Key::PageDown),
+    (115, Key::Home),
+    (119, Key::End),
+    (116, Key::PageUp),
+    (121, Key::PageDown),
     (114, Key::Insert), // Mac 全键盘 Insert 位是 Help 键，这里映射为 Help
     (57, Key::CapsLock),
     // 标点符号（中英文输入必备）
-    (43, Key::Comma), (47, Key::Period), (44, Key::Slash),
-    (41, Key::Semicolon), (39, Key::Quote),
-    (33, Key::LBracket), (30, Key::RBracket), (42, Key::Backslash),
-    (27, Key::Minus), (24, Key::Equals), (50, Key::Backtick),
-    (122, Key::F1), (120, Key::F2), (99, Key::F3), (118, Key::F4), (96, Key::F5),
-    (97, Key::F6), (98, Key::F7), (100, Key::F8), (101, Key::F9), (109, Key::F10),
-    (103, Key::F11), (111, Key::F12),
+    (43, Key::Comma),
+    (47, Key::Period),
+    (44, Key::Slash),
+    (41, Key::Semicolon),
+    (39, Key::Quote),
+    (33, Key::LBracket),
+    (30, Key::RBracket),
+    (42, Key::Backslash),
+    (27, Key::Minus),
+    (24, Key::Equals),
+    (50, Key::Backtick),
+    (122, Key::F1),
+    (120, Key::F2),
+    (99, Key::F3),
+    (118, Key::F4),
+    (96, Key::F5),
+    (97, Key::F6),
+    (98, Key::F7),
+    (100, Key::F8),
+    (101, Key::F9),
+    (109, Key::F10),
+    (103, Key::F11),
+    (111, Key::F12),
 ];
 
 /// CGKeyCode → 抽象键码（未覆盖的键透传为 Other）。
@@ -1204,7 +1273,11 @@ pub fn cg_to_key(code: u16) -> Key {
 pub fn key_to_cg(key: Key) -> u16 {
     match key {
         Key::Other(n) => n as u16,
-        k => CG_MAP.iter().find(|(_, m)| *m == k).map(|(c, _)| *c).unwrap_or(0),
+        k => CG_MAP
+            .iter()
+            .find(|(_, m)| *m == k)
+            .map(|(c, _)| *c)
+            .unwrap_or(0),
     }
 }
 
@@ -1216,13 +1289,193 @@ pub fn key_to_cg(key: Key) -> u16 {
 
 use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
 use objc::declare::ClassDecl;
-use objc::runtime::{BOOL, Class, Object, Sel, NO, YES};
+use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::{class, msg_send};
 
 /// 本机写入标志：本机主动写剪贴板时置 true，监听器跳过本次变化（防回环）。
 static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
 static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
 static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+type RemoteDragCallback = std::sync::Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>;
+static REMOTE_DRAG_CALLBACKS: OnceLock<Mutex<HashMap<String, RemoteDragCallback>>> =
+    OnceLock::new();
+static REMOTE_DRAG_RESULTS: OnceLock<Mutex<HashMap<String, Result<Vec<String>, String>>>> =
+    OnceLock::new();
+
+fn ns_utf8_string(value: *mut Object) -> Option<String> {
+    unsafe {
+        if value.is_null() {
+            return None;
+        }
+        let ptr: *const std::os::raw::c_char = msg_send![value, UTF8String];
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+fn remote_drag_callback(id: &str, event: super::RemoteFileDragEvent) {
+    let callback = REMOTE_DRAG_CALLBACKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned();
+    if let Some(callback) = callback {
+        callback(event);
+    }
+}
+
+extern "C" fn promise_filename(
+    this: &Object,
+    _cmd: Sel,
+    _provider: *mut Object,
+    _destination: *mut Object,
+) -> *mut Object {
+    unsafe { *this.get_ivar::<*mut Object>("fileName") }
+}
+
+extern "C" fn promise_write(
+    this: &Object,
+    _cmd: Sel,
+    _provider: *mut Object,
+    destination: *mut Object,
+    completion: *mut Object,
+) {
+    unsafe {
+        let id_obj = *this.get_ivar::<*mut Object>("dragId");
+        let Some(id) = ns_utf8_string(id_obj) else {
+            return;
+        };
+        let destination_path: *mut Object = msg_send![destination, path];
+        let Some(destination_path) = ns_utf8_string(destination_path) else {
+            return;
+        };
+        remote_drag_callback(&id, super::RemoteFileDragEvent::DataRequested(id.clone()));
+        let completion = block::RcBlock::<(*mut Object,), ()>::copy(
+            completion as *mut block::Block<(*mut Object,), ()>,
+        );
+        std::thread::spawn(move || {
+            let result = loop {
+                if let Some(result) = REMOTE_DRAG_RESULTS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id)
+                {
+                    break result;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let result = result.and_then(|paths| {
+                let destination = std::path::PathBuf::from(destination_path);
+                let destination_dir = destination
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or(destination);
+                for source in paths {
+                    let source = std::path::PathBuf::from(source);
+                    let name = source
+                        .file_name()
+                        .ok_or_else(|| "remote drag has an invalid file name".to_string())?;
+                    let target = destination_dir.join(name);
+                    if source.is_dir() {
+                        copy_directory_tree(&source, &target)?;
+                    } else {
+                        std::fs::copy(&source, &target).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            });
+            unsafe { completion.call((std::ptr::null_mut(),)); }
+            if let Err(error) = result {
+                log::error!("[DRAG] macOS file promise failed: {error}");
+            }
+        });
+    }
+}
+
+extern "C" fn promise_source_mask(
+    _this: &Object,
+    _cmd: Sel,
+    _session: *mut Object,
+    _context: usize,
+) -> usize {
+    1
+}
+
+extern "C" fn promise_drag_ended(
+    this: &Object,
+    _cmd: Sel,
+    _session: *mut Object,
+    _point: CGPoint,
+    operation: usize,
+) {
+    unsafe {
+        let id_obj = *this.get_ivar::<*mut Object>("dragId");
+        if let Some(id) = ns_utf8_string(id_obj) {
+            if operation == 0 {
+                remote_drag_callback(&id, super::RemoteFileDragEvent::Cancelled(id.clone()));
+            }
+            REMOTE_DRAG_CALLBACKS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+    }
+}
+
+fn remote_promise_delegate_class() -> &'static Class {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let raw = *CLASS.get_or_init(|| unsafe {
+        if let Some(existing) = Class::get("RuissRemoteFilePromiseDelegate") {
+            return existing as *const Class as usize;
+        }
+        let mut decl = ClassDecl::new("RuissRemoteFilePromiseDelegate", class!(NSObject)).unwrap();
+        decl.add_protocol(objc::runtime::Protocol::get("NSFilePromiseProviderDelegate").unwrap());
+        decl.add_protocol(objc::runtime::Protocol::get("NSDraggingSource").unwrap());
+        decl.add_ivar::<*mut Object>("dragId");
+        decl.add_ivar::<*mut Object>("fileName");
+        decl.add_method(
+            sel!(filePromiseProvider:promiseFilenameForDestination:),
+            promise_filename
+                as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
+        );
+        decl.add_method(
+            sel!(filePromiseProvider:writePromiseToURL:completionHandler:),
+            promise_write as extern "C" fn(&Object, Sel, *mut Object, *mut Object, *mut Object),
+        );
+        decl.add_method(
+            sel!(draggingSession:sourceOperationMaskForDraggingContext:),
+            promise_source_mask as extern "C" fn(&Object, Sel, *mut Object, usize) -> usize,
+        );
+        decl.add_method(
+            sel!(draggingSession:endedAtPoint:operation:),
+            promise_drag_ended as extern "C" fn(&Object, Sel, *mut Object, CGPoint, usize),
+        );
+        decl.register() as *const Class as usize
+    });
+    unsafe { &*(raw as *const Class) }
+}
+
+fn copy_directory_tree(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_directory_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
 
 /// 取全局 NSPasteboard。
 unsafe fn general_pasteboard() -> *mut Object {
@@ -1478,11 +1731,7 @@ pub fn take_drag_paths() -> Vec<String> {
     }
 }
 
-extern "C" fn drag_probe_entered(
-    _this: &Object,
-    _cmd: Sel,
-    sender: *mut Object,
-) -> usize {
+extern "C" fn drag_probe_entered(_this: &Object, _cmd: Sel, sender: *mut Object) -> usize {
     unsafe {
         let pasteboard: *mut Object = msg_send![sender, draggingPasteboard];
         if let Some(paths) = read_files(pasteboard) {
@@ -1495,19 +1744,11 @@ extern "C" fn drag_probe_entered(
     0 // NSDragOperationNone：探针只读路径，不在本机执行放置。
 }
 
-extern "C" fn drag_probe_updated(
-    _this: &Object,
-    _cmd: Sel,
-    _sender: *mut Object,
-) -> usize {
+extern "C" fn drag_probe_updated(_this: &Object, _cmd: Sel, _sender: *mut Object) -> usize {
     0
 }
 
-extern "C" fn drag_probe_perform(
-    _this: &Object,
-    _cmd: Sel,
-    _sender: *mut Object,
-) -> BOOL {
+extern "C" fn drag_probe_perform(_this: &Object, _cmd: Sel, _sender: *mut Object) -> BOOL {
     NO
 }
 
@@ -1571,7 +1812,9 @@ pub fn start_drag_path_probe() {
                 backing: 2usize
                 defer: NO
             ];
-            if window.is_null() { continue; }
+            if window.is_null() {
+                continue;
+            }
             let _: () = msg_send![window, setOpaque: NO];
             let _: () = msg_send![window, setBackgroundColor: clear];
             let _: () = msg_send![window, setHasShadow: NO];
@@ -1587,17 +1830,118 @@ pub fn start_drag_path_probe() {
 pub fn cancel_local_drag() {
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
         for down in [true, false] {
-            if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_to_cg(Key::Esc), down) {
-                event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, RUISS_EVENT_MARKER);
+            if let Ok(event) =
+                CGEvent::new_keyboard_event(source.clone(), key_to_cg(Key::Esc), down)
+            {
+                event.set_integer_value_field(
+                    EventField::EVENT_SOURCE_USER_DATA,
+                    RUISS_EVENT_MARKER,
+                );
                 event.post(CGEventTapLocation::HID);
             }
         }
     }
 }
 
+/// macOS receives remote file promises through this platform boundary. The network
+/// transfer starts only after the target-side drag requests its promised contents.
+pub fn start_remote_file_drag(
+    id: String,
+    roots: Vec<crate::core::protocol::TransferRoot>,
+    callback: std::sync::Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
+) -> Result<()> {
+    unsafe {
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if !is_main {
+            dispatch::Queue::main().exec_async(move || {
+                if let Err(error) = start_remote_file_drag(id.clone(), roots, callback.clone()) {
+                    callback(super::RemoteFileDragEvent::Cancelled(format!(
+                        "AppKit drag startup failed: {error}"
+                    )));
+                }
+            });
+            return Ok(());
+        }
+    }
+    let root = roots
+        .first()
+        .ok_or_else(|| anyhow!("remote drag has no roots"))?;
+    REMOTE_DRAG_CALLBACKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), callback);
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let window: *mut Object = msg_send![app, keyWindow];
+        let window = if window.is_null() {
+            let windows: *mut Object = msg_send![app, orderedWindows];
+            if windows.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![windows, firstObject]
+            }
+        } else {
+            window
+        };
+        if window.is_null() {
+            return Err(anyhow!("no AppKit window for remote drag"));
+        }
+        let view: *mut Object = msg_send![window, contentView];
+        let id_ns = string_to_nsstring(&id);
+        let name_ns = string_to_nsstring(&root.name);
+        let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
+        (*delegate).set_ivar("dragId", id_ns);
+        (*delegate).set_ivar("fileName", name_ns);
+        let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
+        let provider: *mut Object = msg_send![provider, initWithFileType: string_to_nsstring("public.data") delegate: delegate];
+        let item: *mut Object = msg_send![class!(NSDraggingItem), alloc];
+        let item: *mut Object = msg_send![item, initWithPasteboardWriter: provider];
+        let location: CGPoint = msg_send![window, mouseLocationOutsideOfEventStream];
+        let frame = core_graphics::geometry::CGRect::new(
+            &location,
+            &core_graphics::geometry::CGSize::new(48.0, 48.0),
+        );
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let icon: *mut Object =
+            msg_send![workspace, iconForFileType: string_to_nsstring("public.data")];
+        let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
+        let items: *mut Object = msg_send![class!(NSArray), arrayWithObject: item];
+        let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 6usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: msg_send![window, windowNumber] context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
+        let session: *mut Object =
+            msg_send![view, beginDraggingSessionWithItems: items event: event source: delegate];
+        if session.is_null() {
+            REMOTE_DRAG_CALLBACKS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return Err(anyhow!("AppKit refused remote drag session"));
+        }
+    }
+    Ok(())
+}
+
+pub fn complete_remote_file_drag(id: &str, paths: &[String], error: Option<String>) {
+    REMOTE_DRAG_RESULTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id.to_string(),
+            error.map_or_else(|| Ok(paths.to_vec()), Err),
+        );
+}
+
+pub fn cancel_remote_file_drag(id: &str) {
+    complete_remote_file_drag(id, &[], Some("drag cancelled".into()));
+}
+
 /// 启动剪贴板监听：1s 轮询 NSPasteboard changeCount，变化时读 + 回调。
 /// Mac 没有像 Windows AddClipboardFormatListener 那样的通知机制，轮询最稳。
-pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static>) -> ClipboardWatcherHandle {
+pub fn start_clipboard_watcher(
+    cb: Box<dyn Fn(ClipboardContent) + Send + 'static>,
+) -> ClipboardWatcherHandle {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1614,7 +1958,12 @@ pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static
             last = cur;
             // 本机写入触发跳过（防回环）
             if LOCAL_WRITE
-                .compare_exchange(true, false, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 continue;

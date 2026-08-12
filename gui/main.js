@@ -227,6 +227,13 @@
     return (value / 1024 / 1024 / 1024).toFixed(2) + ' GB';
   }
 
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 60) return `${Math.max(1, Math.round(seconds))} 秒`;
+    if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`;
+    return `${Math.floor(seconds / 3600)} 小时 ${Math.ceil((seconds % 3600) / 60)} 分`;
+  }
+
   function statusText(status) {
     return {
       preparing: '正在整理', transferring: '传输中', completed: '已完成',
@@ -261,7 +268,9 @@
       const meta = document.createElement('div');
       meta.className = 'transfer-meta';
       const progress = document.createElement('span');
-      progress.textContent = `${formatBytes(task.transferred)} / ${formatBytes(task.total)}`;
+      const speed = task.speed > 0 ? ` · ${formatBytes(task.speed)}/s` : '';
+      const eta = task.eta > 0 && task.status === 'transferring' ? ` · 剩余 ${formatDuration(task.eta)}` : '';
+      progress.textContent = `${formatBytes(task.transferred)} / ${formatBytes(task.total)}${speed}${eta}`;
       const state = document.createElement('span');
       const files = task.filesTotal ? ` · ${task.filesDone || 0}/${task.filesTotal} 个` : '';
       state.textContent = statusText(task.status) + files;
@@ -304,7 +313,21 @@
   function onTransferUpdate(payload) {
     if (!payload || !payload.id) return;
     const previous = transfers.get(payload.id) || {};
-    transfers.set(payload.id, { ...previous, ...payload });
+    const now = performance.now();
+    let speed = Number(previous.speed || 0);
+    const elapsed = (now - Number(previous.sampleAt || now)) / 1000;
+    const delta = Number(payload.transferred || 0) - Number(previous.sampleBytes || 0);
+    if (payload.status === 'transferring' && elapsed >= 0.08 && delta >= 0) {
+      const instant = delta / elapsed;
+      speed = speed > 0 ? speed * 0.72 + instant * 0.28 : instant;
+    }
+    if (payload.status !== 'transferring') speed = 0;
+    const remaining = Math.max(0, Number(payload.total || 0) - Number(payload.transferred || 0));
+    const eta = speed > 1 ? remaining / speed : 0;
+    transfers.set(payload.id, {
+      ...previous, ...payload, speed, eta,
+      sampleAt: now, sampleBytes: Number(payload.transferred || 0),
+    });
     while (transfers.size > 30) transfers.delete(transfers.keys().next().value);
     renderTransfers();
   }
@@ -323,8 +346,22 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     $('saveBtn').addEventListener('click', save);
-    $('pickFileBtn').addEventListener('click', pickAndSendFile);
-    $('pickFolderBtn').addEventListener('click', pickAndSendFolder);
+    const pickerMenu = $('pickTransferMenu');
+    $('pickTransferBtn').addEventListener('click', (event) => {
+      event.stopPropagation();
+      pickerMenu.hidden = !pickerMenu.hidden;
+    });
+    $('pickFileBtn').addEventListener('click', () => { pickerMenu.hidden = true; pickAndSendFile(); });
+    $('pickFolderBtn').addEventListener('click', () => { pickerMenu.hidden = true; pickAndSendFolder(); });
+    document.addEventListener('click', () => { pickerMenu.hidden = true; });
+    $('clearTransfersBtn').addEventListener('click', () => {
+      for (const [id, task] of transfers) {
+        if (!['preparing', 'transferring'].includes(task.status)) transfers.delete(id);
+      }
+      renderTransfers();
+      $('fileStatus').textContent = transfers.size ? '进行中的任务已保留' : '传输记录已清空';
+      setTimeout(() => ($('fileStatus').textContent = ''), 1800);
+    });
     $('pickReceiveDirBtn').addEventListener('click', pickReceiveDirectory);
     $('clearReceiveDirBtn').addEventListener('click', () => { $('receiveDir').value = ''; });
     document.querySelectorAll('.shortcut-record').forEach((button) => {

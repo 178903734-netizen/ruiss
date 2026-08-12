@@ -97,6 +97,32 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
 .hint.small { margin-top: 8px; font-size: 10.5px; }
 
 .file-send { display: flex; align-items: center; gap: 10px; }
+.file-picker { position: relative; }
+.file-picker-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 5px);
+  left: 0;
+  min-width: 178px;
+  padding: 5px;
+  border: 1px solid #cfd8e8;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(26, 39, 68, .16);
+}
+.file-picker-menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #30394c;
+  text-align: left;
+  font-size: 11px;
+  cursor: pointer;
+}
+.file-picker-menu button:hover { background: #edf3fd; }
 
 .directory-row { display: grid; grid-template-columns: 1fr auto auto; gap: 7px; }
 .directory-row input { min-width: 0; }

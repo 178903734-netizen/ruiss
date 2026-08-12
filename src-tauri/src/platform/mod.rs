@@ -13,6 +13,12 @@ mod mac;
 #[cfg(target_os = "macos")]
 pub use mac::*;
 
+#[derive(Debug, Clone)]
+pub enum RemoteFileDragEvent {
+    DataRequested(String),
+    Cancelled(String),
+}
+
 /// 剪贴板内容快照（平台无关）。
 /// 读取时按 files > image > text 优先级返回当前剪贴板里"最高级"的那一种；
 /// 写入时由调用方指定类型。监听器变化回调也用这个类型。

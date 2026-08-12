@@ -81,8 +81,14 @@
         </div>
       </label>
       <div class="file-send">
-        <button id="pickFileBtn" class="test-btn">选择文件</button>
-        <button id="pickFolderBtn" class="test-btn">选择文件夹</button>
+        <div class="file-picker">
+          <button id="pickTransferBtn" class="test-btn" type="button">添加文件或文件夹</button>
+          <div id="pickTransferMenu" class="file-picker-menu" hidden>
+            <button id="pickFileBtn" type="button">选择文件（可多选）</button>
+            <button id="pickFolderBtn" type="button">选择文件夹</button>
+          </div>
+        </div>
+        <button id="clearTransfersBtn" class="test-btn secondary" type="button">清空记录</button>
         <span id="fileStatus" class="status"></span>
       </div>
       <div id="transferList" class="transfer-list"></div>

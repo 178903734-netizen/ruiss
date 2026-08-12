@@ -15,58 +15,61 @@ use std::ffi::c_void;
 use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use windows::core::{implement, w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, POINTL, WPARAM, HGLOBAL};
+use windows::core::{implement, w, Error as WinError, HRESULT, PCWSTR};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
+    DV_E_FORMATETC, E_NOTIMPL, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED,
+    POINT, POINTL, S_OK, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::System::Com::{
+    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, DVASPECT_CONTENT,
+    FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::{
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::{
+    DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, OleInitialize, OleUninitialize,
+    RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_DIB, CF_HDROP, CF_UNICODETEXT,
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE,
+};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    VIRTUAL_KEY,
+};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, SendInput,
-    VIRTUAL_KEY,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT, LWA_ALPHA, LLKHF_EXTENDED, LLKHF_INJECTED,
-    LLMHF_INJECTED, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetCursorPos,
-    SetLayeredWindowAttributes, SetWindowsHookExW, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WNDCLASSW,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_INPUT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    CreateCursor, SetSystemCursor,
-    SPI_SETCURSORS, SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, HCURSOR,
-    SW_HIDE, SW_SHOWNA, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
-    HICON,
-    WM_CLIPBOARDUPDATE,
-};
-use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
-};
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Com::{IDataObject, FORMATETC, DVASPECT_CONTENT, TYMED_HGLOBAL};
-use windows::Win32::System::Ole::{
-    CF_DIB, CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_NONE, IDropTarget,
-    OleInitialize, OleUninitialize, RegisterDragDrop, ReleaseStgMedium,
-    RevokeDragDrop,
-};
-use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::DragQueryFileW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, PostThreadMessageW, RegisterClassW, SetCursorPos,
+    SetLayeredWindowAttributes, SetSystemCursor, SetWindowsHookExW, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HCURSOR, HICON,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MSG,
+    MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNA, SYSTEM_CURSOR_ID,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_CLIPBOARDUPDATE, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
 
 use crate::core::keys::{
     map_modifiers, translate_macos_shortcut_to_windows, Key, ModifierState, ShortcutStroke,
@@ -284,7 +287,11 @@ impl InputCapturer {
             .spawn(move || run_hook_loop(tx, ready_tx))?;
 
         match ready_rx.recv() {
-            Ok(Ok(tid)) => Ok(Self { thread_id: tid, hook_thread, consume_thread }),
+            Ok(Ok(tid)) => Ok(Self {
+                thread_id: tid,
+                hook_thread,
+                consume_thread,
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow!("钩子线程异常退出")),
         }
@@ -314,7 +321,9 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<u32>>) {
         match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) } {
             Ok(h) => h,
             Err(e) => {
-                unsafe { let _ = UnhookWindowsHookEx(mouse_hook); }
+                unsafe {
+                    let _ = UnhookWindowsHookEx(mouse_hook);
+                }
                 return finish_hook_setup_failed(ready, format!("WH_KEYBOARD_LL 安装失败: {e}"));
             }
         };
@@ -493,14 +502,37 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
     match wparam {
         WM_MOUSEMOVE => {
             let (w, h) = screen_size();
-            Some(Payload::MouseMove { x: ms.pt.x, y: ms.pt.y, src_w: w as u32, src_h: h as u32 })
+            Some(Payload::MouseMove {
+                x: ms.pt.x,
+                y: ms.pt.y,
+                src_w: w as u32,
+                src_h: h as u32,
+            })
         }
-        WM_LBUTTONDOWN => Some(Payload::MouseButton { button: 0, down: true }),
-        WM_LBUTTONUP => Some(Payload::MouseButton { button: 0, down: false }),
-        WM_RBUTTONDOWN => Some(Payload::MouseButton { button: 1, down: true }),
-        WM_RBUTTONUP => Some(Payload::MouseButton { button: 1, down: false }),
-        WM_MBUTTONDOWN => Some(Payload::MouseButton { button: 2, down: true }),
-        WM_MBUTTONUP => Some(Payload::MouseButton { button: 2, down: false }),
+        WM_LBUTTONDOWN => Some(Payload::MouseButton {
+            button: 0,
+            down: true,
+        }),
+        WM_LBUTTONUP => Some(Payload::MouseButton {
+            button: 0,
+            down: false,
+        }),
+        WM_RBUTTONDOWN => Some(Payload::MouseButton {
+            button: 1,
+            down: true,
+        }),
+        WM_RBUTTONUP => Some(Payload::MouseButton {
+            button: 1,
+            down: false,
+        }),
+        WM_MBUTTONDOWN => Some(Payload::MouseButton {
+            button: 2,
+            down: true,
+        }),
+        WM_MBUTTONUP => Some(Payload::MouseButton {
+            button: 2,
+            down: false,
+        }),
         WM_XBUTTONDOWN => Some(Payload::MouseButton {
             button: xbutton_id(ms)?,
             down: true,
@@ -511,13 +543,17 @@ fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
         }),
         WM_MOUSEWHEEL => {
             let dy = wheel_delta(ms, &WHEEL_ACCUM_V);
-            if dy == 0 { return None; }
+            if dy == 0 {
+                return None;
+            }
             Some(Payload::MouseWheel { dx: 0, dy })
         }
         0x020E => {
             // WM_MOUSEHWHEEL（0.58 未导出该常量）
             let dx = wheel_delta(ms, &WHEEL_ACCUM_H);
-            if dx == 0 { return None; }
+            if dx == 0 {
+                return None;
+            }
             Some(Payload::MouseWheel { dx, dy: 0 })
         }
         _ => None,
@@ -561,7 +597,10 @@ fn create_transparent_cursor() -> Option<HCURSOR> {
         let xor_mask: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         CreateCursor(
             None,
-            0, 0, 1, 1,
+            0,
+            0,
+            1,
+            1,
             and_mask.as_ptr() as *const c_void,
             xor_mask.as_ptr() as *const c_void,
         )
@@ -665,39 +704,98 @@ fn keyboard_to_payload(wparam: u32, ks: &KBDLLHOOKSTRUCT) -> Option<Payload> {
 
 const VK_MAP: &[(u32, Key)] = &[
     // 字母 A-Z（0x41..=0x5A）
-    (0x41, Key::A), (0x42, Key::B), (0x43, Key::C), (0x44, Key::D), (0x45, Key::E),
-    (0x46, Key::F), (0x47, Key::G), (0x48, Key::H), (0x49, Key::I), (0x4A, Key::J),
-    (0x4B, Key::K), (0x4C, Key::L), (0x4D, Key::M), (0x4E, Key::N), (0x4F, Key::O),
-    (0x50, Key::P), (0x51, Key::Q), (0x52, Key::R), (0x53, Key::S), (0x54, Key::T),
-    (0x55, Key::U), (0x56, Key::V), (0x57, Key::W), (0x58, Key::X), (0x59, Key::Y),
+    (0x41, Key::A),
+    (0x42, Key::B),
+    (0x43, Key::C),
+    (0x44, Key::D),
+    (0x45, Key::E),
+    (0x46, Key::F),
+    (0x47, Key::G),
+    (0x48, Key::H),
+    (0x49, Key::I),
+    (0x4A, Key::J),
+    (0x4B, Key::K),
+    (0x4C, Key::L),
+    (0x4D, Key::M),
+    (0x4E, Key::N),
+    (0x4F, Key::O),
+    (0x50, Key::P),
+    (0x51, Key::Q),
+    (0x52, Key::R),
+    (0x53, Key::S),
+    (0x54, Key::T),
+    (0x55, Key::U),
+    (0x56, Key::V),
+    (0x57, Key::W),
+    (0x58, Key::X),
+    (0x59, Key::Y),
     (0x5A, Key::Z),
     // 数字 0-9（0x30..=0x39）
-    (0x30, Key::Digit0), (0x31, Key::Digit1), (0x32, Key::Digit2), (0x33, Key::Digit3),
-    (0x34, Key::Digit4), (0x35, Key::Digit5), (0x36, Key::Digit6), (0x37, Key::Digit7),
-    (0x38, Key::Digit8), (0x39, Key::Digit9),
+    (0x30, Key::Digit0),
+    (0x31, Key::Digit1),
+    (0x32, Key::Digit2),
+    (0x33, Key::Digit3),
+    (0x34, Key::Digit4),
+    (0x35, Key::Digit5),
+    (0x36, Key::Digit6),
+    (0x37, Key::Digit7),
+    (0x38, Key::Digit8),
+    (0x39, Key::Digit9),
     // 修饰键
     // WH_KEYBOARD_LL 的 vkCode 通常给出左右侧专用码，不能只认通用码。
-    (0x10, Key::Shift), (0xA0, Key::Shift), (0xA1, Key::Shift),
-    (0x11, Key::Ctrl), (0xA2, Key::Ctrl), (0xA3, Key::Ctrl),
-    (0x12, Key::Alt), (0xA4, Key::Alt), (0xA5, Key::Alt),
-    (0x5B, Key::Super), (0x5C, Key::Super), // 左/右 Win 键
+    (0x10, Key::Shift),
+    (0xA0, Key::Shift),
+    (0xA1, Key::Shift),
+    (0x11, Key::Ctrl),
+    (0xA2, Key::Ctrl),
+    (0xA3, Key::Ctrl),
+    (0x12, Key::Alt),
+    (0xA4, Key::Alt),
+    (0xA5, Key::Alt),
+    (0x5B, Key::Super),
+    (0x5C, Key::Super), // 左/右 Win 键
     // 功能键
-    (0x0D, Key::Enter), (0x20, Key::Space), (0x08, Key::Backspace),
-    (0x09, Key::Tab), (0x1B, Key::Esc),
-    (0x25, Key::ArrowLeft), (0x26, Key::ArrowUp), (0x27, Key::ArrowRight),
+    (0x0D, Key::Enter),
+    (0x20, Key::Space),
+    (0x08, Key::Backspace),
+    (0x09, Key::Tab),
+    (0x1B, Key::Esc),
+    (0x25, Key::ArrowLeft),
+    (0x26, Key::ArrowUp),
+    (0x27, Key::ArrowRight),
     (0x28, Key::ArrowDown),
     // 导航/编辑键
-    (0x2E, Key::Delete), (0x24, Key::Home), (0x23, Key::End),
-    (0x21, Key::PageUp), (0x22, Key::PageDown), (0x2D, Key::Insert),
+    (0x2E, Key::Delete),
+    (0x24, Key::Home),
+    (0x23, Key::End),
+    (0x21, Key::PageUp),
+    (0x22, Key::PageDown),
+    (0x2D, Key::Insert),
     (0x14, Key::CapsLock),
     // 标点符号（中英文输入必备）
-    (0xBC, Key::Comma), (0xBE, Key::Period), (0xBF, Key::Slash),
-    (0xBA, Key::Semicolon), (0xDE, Key::Quote),
-    (0xDB, Key::LBracket), (0xDD, Key::RBracket), (0xDC, Key::Backslash),
-    (0xBD, Key::Minus), (0xBB, Key::Equals), (0xC0, Key::Backtick),
-    (0x70, Key::F1), (0x71, Key::F2), (0x72, Key::F3), (0x73, Key::F4),
-    (0x74, Key::F5), (0x75, Key::F6), (0x76, Key::F7), (0x77, Key::F8),
-    (0x78, Key::F9), (0x79, Key::F10), (0x7A, Key::F11), (0x7B, Key::F12),
+    (0xBC, Key::Comma),
+    (0xBE, Key::Period),
+    (0xBF, Key::Slash),
+    (0xBA, Key::Semicolon),
+    (0xDE, Key::Quote),
+    (0xDB, Key::LBracket),
+    (0xDD, Key::RBracket),
+    (0xDC, Key::Backslash),
+    (0xBD, Key::Minus),
+    (0xBB, Key::Equals),
+    (0xC0, Key::Backtick),
+    (0x70, Key::F1),
+    (0x71, Key::F2),
+    (0x72, Key::F3),
+    (0x73, Key::F4),
+    (0x74, Key::F5),
+    (0x75, Key::F6),
+    (0x76, Key::F7),
+    (0x77, Key::F8),
+    (0x78, Key::F9),
+    (0x79, Key::F10),
+    (0x7A, Key::F11),
+    (0x7B, Key::F12),
 ];
 
 /// Windows VK 虚拟键码 → 抽象键码（未覆盖的键透传为 Other）。
@@ -713,7 +811,11 @@ pub fn vk_to_key(vk: u32) -> Key {
 pub fn key_to_vk(key: Key) -> u32 {
     match key {
         Key::Other(n) => n,
-        k => VK_MAP.iter().find(|(_, m)| *m == k).map(|(v, _)| *v).unwrap_or(0),
+        k => VK_MAP
+            .iter()
+            .find(|(_, m)| *m == k)
+            .map(|(v, _)| *v)
+            .unwrap_or(0),
     }
 }
 
@@ -751,7 +853,8 @@ impl InputInjector {
             Payload::MouseMove { x, y, .. } => mouse_move_inputs(*x, *y),
             Payload::MouseMoveRelative { dx, dy } => mouse_move_relative_inputs(*dx, *dy),
             Payload::MouseButton { button, down } => {
-                self.held_button.store(if *down { *button as i32 } else { -1 }, Ordering::Relaxed);
+                self.held_button
+                    .store(if *down { *button as i32 } else { -1 }, Ordering::Relaxed);
                 let mut keyboard = match self.keyboard.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
@@ -771,7 +874,12 @@ impl InputInjector {
                 inputs.extend(mouse_wheel_inputs(*dx, *dy));
                 inputs
             }
-            Payload::Key { key, scan, extended, down } => {
+            Payload::Key {
+                key,
+                scan,
+                extended,
+                down,
+            } => {
                 let mut keyboard = match self.keyboard.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
@@ -781,10 +889,8 @@ impl InputInjector {
                     sync_windows_modifiers(&mut keyboard, desired)
                 } else {
                     let stroke = if *down {
-                        let stroke = translate_macos_shortcut_to_windows(
-                            keyboard.source_modifiers,
-                            *key,
-                        );
+                        let stroke =
+                            translate_macos_shortcut_to_windows(keyboard.source_modifiers, *key);
                         keyboard.active.insert(*key, stroke);
                         stroke
                     } else {
@@ -793,10 +899,8 @@ impl InputInjector {
                         })
                     };
                     let restore_after_key_up = !*down
-                        && translate_macos_shortcut_to_windows(
-                            keyboard.source_modifiers,
-                            *key,
-                        ) != stroke;
+                        && translate_macos_shortcut_to_windows(keyboard.source_modifiers, *key)
+                            != stroke;
                     let mut inputs = sync_windows_modifiers(&mut keyboard, stroke.modifiers);
                     // A translated key must use its target VK, not the source scan code.
                     let translated = stroke.key != *key;
@@ -873,10 +977,7 @@ impl InputInjector {
     }
 }
 
-fn sync_windows_modifiers(
-    keyboard: &mut KeyboardState,
-    desired: ModifierState,
-) -> Vec<INPUT> {
+fn sync_windows_modifiers(keyboard: &mut KeyboardState, desired: ModifierState) -> Vec<INPUT> {
     let current = keyboard.applied_modifiers;
     let mut inputs = Vec::new();
     for (key, was_down, should_down) in [
@@ -1051,8 +1152,7 @@ pub fn warp_cursor(x: i32, y: i32) {
 
 /// 跨屏触发时 Windows 不再回绕本机光标。隐藏光标留在出口边，后续移动直接读取
 /// Raw Input 相对 delta；因此没有 SetCursorPos 产生的旧绝对帧，也不受屏幕边缘钳制。
-pub fn warp_cursor_cross(_x: i32, _y: i32) {
-}
+pub fn warp_cursor_cross(_x: i32, _y: i32) {}
 
 // ======================== M3：剪贴板 + 拖拽检测 ========================
 
@@ -1208,7 +1308,11 @@ fn dib_bytes_to_png(data: &[u8]) -> Option<Vec<u8>> {
             let b = data[s];
             let g = data[s + 1];
             let r = data[s + 2];
-            let a = if bytes_per_pixel == 4 { data[s + 3] } else { 255 };
+            let a = if bytes_per_pixel == 4 {
+                data[s + 3]
+            } else {
+                255
+            };
             let d = (dst_row * width as usize + x) * 4;
             rgba[d] = r;
             rgba[d + 1] = g;
@@ -1245,7 +1349,10 @@ pub fn clipboard_write_text(text: &str) {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
                 let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                let _ = SetClipboardData(
+                    CF_UNICODETEXT.0 as u32,
+                    windows::Win32::Foundation::HANDLE(hmem.0),
+                );
             }
         }
         let _ = CloseClipboard();
@@ -1268,7 +1375,10 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
                 if !ptr.is_null() {
                     std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr as *mut u8, dib.len());
                     let _ = GlobalUnlock(hmem);
-                    let _ = SetClipboardData(CF_DIB.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                    let _ = SetClipboardData(
+                        CF_DIB.0 as u32,
+                        windows::Win32::Foundation::HANDLE(hmem.0),
+                    );
                 }
             }
         }
@@ -1278,7 +1388,11 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, png_bytes.len()) {
                 let ptr = GlobalLock(hmem);
                 if !ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(png_bytes.as_ptr(), ptr as *mut u8, png_bytes.len());
+                    std::ptr::copy_nonoverlapping(
+                        png_bytes.as_ptr(),
+                        ptr as *mut u8,
+                        png_bytes.len(),
+                    );
                     let _ = GlobalUnlock(hmem);
                     let _ = SetClipboardData(png_fmt, windows::Win32::Foundation::HANDLE(hmem.0));
                 }
@@ -1300,18 +1414,18 @@ fn png_to_dib(png_bytes: &[u8]) -> Option<Vec<u8>> {
 
     let mut dib = Vec::with_capacity(40 + (width * height * 4) as usize);
     // BITMAPINFOHEADER
-    dib.extend_from_slice(&40u32.to_le_bytes());          // biSize
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
     dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
-    dib.extend_from_slice(&(height as i32).to_le_bytes());// biHeight (正=bottom-up)
-    dib.extend_from_slice(&1u16.to_le_bytes());           // biPlanes
-    dib.extend_from_slice(&32u16.to_le_bytes());          // biBitCount
-    dib.extend_from_slice(&0u32.to_le_bytes());           // biCompression = BI_RGB
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (正=bottom-up)
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
     dib.extend_from_slice(&(width * height * 4).to_le_bytes()); // biSizeImage
-    dib.extend_from_slice(&0u32.to_le_bytes());           // biXPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes());           // biYPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes());           // biClrUsed
-    dib.extend_from_slice(&0u32.to_le_bytes());           // biClrImportant
-    // 像素：RGBA → BGRA，bottom-up
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+                                                // 像素：RGBA → BGRA，bottom-up
     let row = (width * 4) as usize;
     for y in (0..height).rev() {
         for x in 0..width {
@@ -1366,7 +1480,10 @@ pub fn clipboard_write_files(paths: &[String]) {
                 let bytes = payload.align_to::<u8>().1;
                 buf[dropfiles_size..].copy_from_slice(bytes);
                 let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(CF_HDROP.0 as u32, windows::Win32::Foundation::HANDLE(hmem.0));
+                let _ = SetClipboardData(
+                    CF_HDROP.0 as u32,
+                    windows::Win32::Foundation::HANDLE(hmem.0),
+                );
             }
         }
         let _ = CloseClipboard();
@@ -1399,7 +1516,9 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let paths = data.and_then(read_data_object_files).unwrap_or_default();
-        unsafe { *effect = DROPEFFECT_NONE; }
+        unsafe {
+            *effect = DROPEFFECT_NONE;
+        }
         if !paths.is_empty() {
             *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((Instant::now(), paths));
@@ -1413,7 +1532,9 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         _point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        unsafe { *effect = DROPEFFECT_NONE; }
+        unsafe {
+            *effect = DROPEFFECT_NONE;
+        }
         Ok(())
     }
 
@@ -1428,7 +1549,9 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         _point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
-        unsafe { *effect = DROPEFFECT_NONE; }
+        unsafe {
+            *effect = DROPEFFECT_NONE;
+        }
         Ok(())
     }
 }
@@ -1486,12 +1609,24 @@ pub fn start_drag_path_probe() {
         let target: IDropTarget = EdgeDropTarget.into();
         let mut windows = Vec::new();
         for (index, x) in [0, width.saturating_sub(2)].into_iter().enumerate() {
-            let title = if index == 0 { w!("RuissDragLeft") } else { w!("RuissDragRight") };
+            let title = if index == 0 {
+                w!("RuissDragLeft")
+            } else {
+                w!("RuissDragRight")
+            };
             match CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-                class, title, WS_POPUP,
-                x, 0, 2, height,
-                None, None, hinst, None,
+                class,
+                title,
+                WS_POPUP,
+                x,
+                0,
+                2,
+                height,
+                None,
+                None,
+                hinst,
+                None,
             ) {
                 Ok(hwnd) => {
                     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
@@ -1529,13 +1664,258 @@ pub fn cancel_local_drag() {
     let mut inputs = key_inputs(Key::Esc, 0, false, true);
     inputs.extend(key_inputs(Key::Esc, 0, false, false));
     if !inputs.is_empty() {
-        unsafe { SendInput(&inputs, size_of::<INPUT>() as i32); }
+        unsafe {
+            SendInput(&inputs, size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+struct RemoteDragReady {
+    requested: bool,
+    result: Option<Result<Vec<String>, String>>,
+}
+
+type RemoteReady = Arc<(Mutex<RemoteDragReady>, Condvar)>;
+static REMOTE_DRAGS: OnceLock<Mutex<HashMap<String, RemoteReady>>> = OnceLock::new();
+
+#[implement(windows::Win32::System::Com::IDataObject)]
+struct RemoteDragDataObject {
+    id: String,
+    ready: RemoteReady,
+    callback: Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
+}
+
+impl RemoteDragDataObject {
+    fn supported(format: *const FORMATETC) -> bool {
+        unsafe {
+            format.as_ref().is_some_and(|f| {
+                f.cfFormat == CF_HDROP.0
+                    && f.dwAspect == DVASPECT_CONTENT.0 as u32
+                    && (f.tymed & TYMED_HGLOBAL.0 as u32) != 0
+            })
+        }
+    }
+
+    fn wait_for_paths(&self) -> windows::core::Result<Vec<String>> {
+        let (lock, cv) = &*self.ready;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.requested {
+            state.requested = true;
+            (self.callback)(super::RemoteFileDragEvent::DataRequested(self.id.clone()));
+        }
+        while state.result.is_none() {
+            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        match state.result.clone().unwrap() {
+            Ok(paths) if !paths.is_empty() => Ok(paths),
+            Ok(_) => Err(WinError::new(E_NOTIMPL, "remote drag has no files")),
+            Err(error) => Err(WinError::new(E_NOTIMPL, error)),
+        }
+    }
+
+    fn hdrop(paths: &[String]) -> windows::core::Result<HGLOBAL> {
+        let mut names = Vec::<u16>::new();
+        for path in paths {
+            names.extend(path.encode_utf16());
+            names.push(0);
+        }
+        names.push(0);
+        let header = 20usize;
+        let total = header + names.len() * 2;
+        unsafe {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, total)?;
+            let ptr = GlobalLock(memory);
+            if ptr.is_null() {
+                return Err(WinError::from_win32());
+            }
+            let bytes = std::slice::from_raw_parts_mut(ptr as *mut u8, total);
+            bytes.fill(0);
+            bytes[0..4].copy_from_slice(&(header as u32).to_le_bytes());
+            bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+            std::ptr::copy_nonoverlapping(
+                names.as_ptr() as *const u8,
+                bytes[header..].as_mut_ptr(),
+                names.len() * 2,
+            );
+            GlobalUnlock(memory)?;
+            Ok(memory)
+        }
+    }
+}
+
+impl IDataObject_Impl for RemoteDragDataObject_Impl {
+    fn GetData(&self, format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        if !RemoteDragDataObject::supported(format) {
+            return Err(WinError::new(DV_E_FORMATETC, "unsupported drag format"));
+        }
+        Ok(STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 {
+                hGlobal: RemoteDragDataObject::hdrop(&self.wait_for_paths()?)?,
+            },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        })
+    }
+    fn GetDataHere(&self, _: *const FORMATETC, _: *mut STGMEDIUM) -> windows::core::Result<()> {
+        Err(WinError::new(DV_E_FORMATETC, "unsupported drag format"))
+    }
+    fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        if RemoteDragDataObject::supported(format) {
+            S_OK
+        } else {
+            DV_E_FORMATETC
+        }
+    }
+    fn GetCanonicalFormatEtc(&self, _: *const FORMATETC, out: *mut FORMATETC) -> HRESULT {
+        unsafe {
+            if let Some(out) = out.as_mut() {
+                out.ptd = std::ptr::null_mut();
+            }
+        }
+        E_NOTIMPL
+    }
+    fn SetData(
+        &self,
+        _: *const FORMATETC,
+        _: *const STGMEDIUM,
+        _: BOOL,
+    ) -> windows::core::Result<()> {
+        Err(WinError::new(E_NOTIMPL, ""))
+    }
+    fn EnumFormatEtc(&self, _: u32) -> windows::core::Result<IEnumFORMATETC> {
+        Err(WinError::new(E_NOTIMPL, ""))
+    }
+    fn DAdvise(
+        &self,
+        _: *const FORMATETC,
+        _: u32,
+        _: Option<&IAdviseSink>,
+    ) -> windows::core::Result<u32> {
+        Err(WinError::new(OLE_E_ADVISENOTSUPPORTED, ""))
+    }
+    fn DUnadvise(&self, _: u32) -> windows::core::Result<()> {
+        Err(WinError::new(OLE_E_ADVISENOTSUPPORTED, ""))
+    }
+    fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+        Err(WinError::new(OLE_E_ADVISENOTSUPPORTED, ""))
+    }
+}
+
+#[implement(windows::Win32::System::Ole::IDropSource)]
+struct RemoteDropSource;
+
+impl IDropSource_Impl for RemoteDropSource_Impl {
+    fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if escape.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if (keys & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
+            DRAGDROP_S_DROP
+        } else {
+            S_OK
+        }
+    }
+    fn GiveFeedback(&self, _: DROPEFFECT) -> HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+pub fn start_remote_file_drag(
+    id: String,
+    _roots: Vec<crate::core::protocol::TransferRoot>,
+    callback: Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
+) -> Result<()> {
+    let ready = Arc::new((
+        Mutex::new(RemoteDragReady {
+            requested: false,
+            result: None,
+        }),
+        Condvar::new(),
+    ));
+    REMOTE_DRAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), ready.clone());
+    std::thread::spawn(move || unsafe {
+        if let Err(error) = OleInitialize(None) {
+            callback(super::RemoteFileDragEvent::Cancelled(format!(
+                "OLE initialization failed: {error}"
+            )));
+            REMOTE_DRAGS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return;
+        }
+        let input = [INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_LEFTDOWN,
+                    ..Default::default()
+                },
+            },
+        }];
+        SendInput(&input, size_of::<INPUT>() as i32);
+        let data: IDataObject = RemoteDragDataObject {
+            id: id.clone(),
+            ready,
+            callback: callback.clone(),
+        }
+        .into();
+        let source: IDropSource = RemoteDropSource.into();
+        let mut effect = DROPEFFECT_NONE;
+        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+        if result != DRAGDROP_S_DROP {
+            callback(super::RemoteFileDragEvent::Cancelled(id.clone()));
+        }
+        REMOTE_DRAGS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        OleUninitialize();
+    });
+    Ok(())
+}
+
+pub fn complete_remote_file_drag(id: &str, paths: &[String], error: Option<String>) {
+    let ready = REMOTE_DRAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned();
+    if let Some(ready) = ready {
+        let (lock, cv) = &*ready;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).result =
+            Some(error.map_or_else(|| Ok(paths.to_vec()), Err));
+        cv.notify_all();
+    }
+}
+
+pub fn cancel_remote_file_drag(id: &str) {
+    complete_remote_file_drag(id, &[], Some("drag cancelled".into()));
+    let input = [INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: MOUSEEVENTF_LEFTUP,
+                ..Default::default()
+            },
+        },
+    }];
+    unsafe {
+        SendInput(&input, size_of::<INPUT>() as i32);
     }
 }
 
 /// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，
 /// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（本机写入触发的变化跳过防回环）。
-pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static>) -> ClipboardWatcherHandle {
+pub fn start_clipboard_watcher(
+    cb: Box<dyn Fn(ClipboardContent) + Send + 'static>,
+) -> ClipboardWatcherHandle {
     use std::sync::OnceLock;
     static WATCHER_TID: OnceLock<u32> = OnceLock::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -1564,8 +1944,14 @@ pub fn start_clipboard_watcher(cb: Box<dyn Fn(ClipboardContent) + Send + 'static
                 class,
                 w!("ruiss-clip"),
                 WS_POPUP,
-                0, 0, 0, 0,
-                None, None, hinst, None,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                hinst,
+                None,
             );
             let hwnd = match hwnd {
                 Ok(h) => h,
