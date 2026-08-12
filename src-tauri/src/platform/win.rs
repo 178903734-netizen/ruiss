@@ -422,11 +422,33 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let ks = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        if !suppress_injected() || ks.flags.0 & LLKHF_INJECTED.0 == 0 {
+        let injected = ks.flags.0 & LLKHF_INJECTED.0 != 0;
+        let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
+        let sink = SINK_ACTIVE.load(Ordering::Relaxed);
+        // Windows 作为 Source 控制对端时，Logi Options/G Hub 生成的快捷键也是用户
+        // 当前鼠标操作的一部分。接管并吞掉这些 injected 键，才能把侧滚轮映射的
+        // Win+Ctrl+Left/Right 转发给 Mac，同时阻止 Windows 本机切换桌面。
+        // Sink 侧仍严格过滤 injected 键，避免对端 SendInput 被再次转发形成回环。
+        if should_capture_keyboard_event(suppress_injected(), injected, blocked, sink) {
             if let Some(p) = keyboard_to_payload(wparam.0 as u32, ks) {
                 log::debug!("捕获: {p:?}");
+                if injected
+                    && matches!(
+                        &p,
+                        Payload::Key {
+                            key: Key::ArrowLeft | Key::ArrowRight,
+                            down: true,
+                            ..
+                        }
+                    )
+                {
+                    log::info!(
+                        "[WIN-KEY] 已接管软件生成的桌面切换方向键 vk=0x{:02X}",
+                        ks.vkCode
+                    );
+                }
                 // 跨屏期间：键盘事件吞掉（只转发对端，本机不生效）
-                let swallow = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed) || SINK_ACTIVE.load(Ordering::Relaxed);
+                let swallow = blocked || sink;
                 HOOK_SENDER.with(|s| {
                     if let Some(tx) = s.borrow().as_ref() {
                         let _ = tx.send(p);
@@ -439,6 +461,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+fn should_capture_keyboard_event(
+    suppress_injected_events: bool,
+    injected: bool,
+    blocked: bool,
+    sink: bool,
+) -> bool {
+    !suppress_injected_events || !injected || (blocked && !sink)
 }
 
 fn mouse_to_payload(wparam: u32, ms: &MSLLHOOKSTRUCT) -> Option<Payload> {
@@ -1424,5 +1455,14 @@ mod tests {
         assert_eq!(vk_to_key(0xA3), Key::Ctrl);
         assert_eq!(vk_to_key(0xA4), Key::Alt);
         assert_eq!(vk_to_key(0xA5), Key::Alt);
+    }
+
+    #[test]
+    fn injected_keyboard_is_captured_only_while_windows_controls_remote() {
+        assert!(should_capture_keyboard_event(true, false, false, false));
+        assert!(!should_capture_keyboard_event(true, true, false, false));
+        assert!(should_capture_keyboard_event(true, true, true, false));
+        assert!(!should_capture_keyboard_event(true, true, true, true));
+        assert!(should_capture_keyboard_event(false, true, false, false));
     }
 }
