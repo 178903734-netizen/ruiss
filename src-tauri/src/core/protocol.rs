@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::keys::{Key, NativeShortcut};
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransferRoot {
+    pub name: String,
+    pub is_dir: bool,
+}
+
 /// 消息类型标记：区分"事件流"与"控制流"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,17 +77,34 @@ pub enum Payload {
     ReleaseControl { session: u64 },
 
     // ===== M3：文件传输（分块流，支持任意大小文件）=====
-    /// 文件传输开始：声明一个新文件流。id 为本次传输唯一标识（uuid），
-    /// name 为文件名（不含路径，接收端据此命名），size 为字节数。
-    FileStart { id: String, name: String, size: u64 },
+    /// 一批文件/文件夹的清单与总大小；接收端预留安全且不重名的根路径后确认。
+    FileBatchStart {
+        id: String,
+        roots: Vec<TransferRoot>,
+        total_files: u32,
+        total_bytes: u64,
+    },
+    FileBatchReady { id: String, ok: bool, error: Option<String> },
+    FileDirectory { batch_id: String, path: String },
+    FileStart {
+        id: String,
+        batch_id: String,
+        path: String,
+        size: u64,
+    },
+    FileReady { id: String, ok: bool, error: Option<String> },
     /// 文件数据块：id 对应 FileStart，seq 从 0 递增（接收端按序写盘，
     /// 丢块则整文件作废），data 为原始字节（建议 256KB/块）。
-    FileChunk { id: String, seq: u32, data: Vec<u8> },
-    /// 文件传输结束：id 对应 FileStart。接收端校验已写字节 = size 后
-    /// 把文件路径写入剪贴板并通知前端。
-    FileEnd { id: String },
+    /// Base64 数据避免 serde_json 把每个字节展开成十进制数组，显著降低网络帧体积。
+    FileChunk { id: String, seq: u32, data: String },
+    /// 单文件结束；接收端同时校验大小与 SHA-256，成功后原子替换临时文件。
+    FileEnd { id: String, sha256: String },
     /// 取消文件传输（发送方主动取消或接收方拒绝）。
     FileCancel { id: String },
+    FileBatchEnd { id: String },
+    FileBatchCancel { id: String },
+    FileResult { id: String, ok: bool, error: Option<String> },
+    FileBatchResult { id: String, ok: bool, error: Option<String> },
 
     // ===== M3：跨屏拖拽（拖动文件/图片跨屏到对端放下）=====
     /// 拖拽跨屏通告：Source 侧鼠标拖着东西滑到对端时随 TakeControl 一并发送，
@@ -102,5 +125,35 @@ impl Message {
     }
     pub fn ctrl(from: &str, payload: Payload) -> Self {
         Self { kind: MsgKind::Ctrl, from: from.into(), payload }
+    }
+}
+
+#[cfg(test)]
+mod file_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn file_batch_messages_round_trip_json() {
+        let messages = [
+            Payload::FileBatchStart {
+                id: "batch".into(),
+                roots: vec![TransferRoot { name: "folder".into(), is_dir: true }],
+                total_files: 1,
+                total_bytes: 5,
+            },
+            Payload::FileStart {
+                id: "file".into(),
+                batch_id: "batch".into(),
+                path: "folder/a.txt".into(),
+                size: 5,
+            },
+            Payload::FileEnd { id: "file".into(), sha256: "hash".into() },
+            Payload::FileBatchResult { id: "batch".into(), ok: true, error: None },
+        ];
+        for payload in messages {
+            let json = serde_json::to_string(&payload).unwrap();
+            let decoded: Payload = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, payload);
+        }
     }
 }

@@ -98,23 +98,37 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
 
 .file-send { display: flex; align-items: center; gap: 10px; }
 
-.file-log {
-  list-style: none;
-  margin: 10px 0 2px;
+.directory-row { display: grid; grid-template-columns: 1fr auto auto; gap: 7px; }
+.directory-row input { min-width: 0; }
+.test-btn.secondary { color: #6c758a; }
+
+.transfer-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 140px;
+  gap: 8px;
+  max-height: 220px;
   overflow-y: auto;
 }
-.file-log li {
-  font-size: 11.5px;
-  color: #1f2430;
-  background: #eaf6ee;
-  border: 1px solid #cfe9d6;
-  border-radius: 6px;
-  padding: 6px 9px;
-  line-height: 1.5;
-  word-break: break-all;
+.transfer-item {
+  padding: 9px 10px;
+  border: 1px solid #d8e0ee;
+  border-radius: 7px;
+  background: #fff;
 }
-.file-log .path { color: #7a8aa0; font-size: 10.5px; font-family: Consolas, "Courier New", monospace; }
+.transfer-head, .transfer-meta, .transfer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.transfer-name { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-direction, .transfer-meta { color: #7a8499; font-size: 10.5px; }
+.transfer-bar { height: 5px; margin: 7px 0 5px; border-radius: 4px; background: #e5eaf2; overflow: hidden; }
+.transfer-bar > span { display: block; height: 100%; width: 0; background: #4f8ff7; transition: width .12s linear; }
+.transfer-item.completed { border-color: #cfe9d6; background: #f4fbf6; }
+.transfer-item.completed .transfer-bar > span { background: #2e9e5b; }
+.transfer-item.failed, .transfer-item.cancelled { border-color: #f2cccc; background: #fff7f7; }
+.transfer-item.failed .transfer-bar > span, .transfer-item.cancelled .transfer-bar > span { background: #d95b5b; }
+.transfer-error { margin-top: 5px; color: #c54545; font-size: 10.5px; line-height: 1.4; word-break: break-all; }
+.transfer-actions { justify-content: flex-end; margin-top: 6px; }
+.transfer-action { border: 0; background: transparent; color: #397ad8; font-size: 10.5px; cursor: pointer; }

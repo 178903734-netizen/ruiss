@@ -6,6 +6,7 @@
     mouseMiddleShortcut: nativeShortcut('Digit3', { ctrl: true }),
   };
   const bindings = { ...defaults };
+  const transfers = new Map();
   let recording = null;
 
   function nativeShortcut(key, modifiers = {}) {
@@ -32,7 +33,7 @@
     if (cmd === 'get_settings') {
       return {
         name: '', peerIp: '', layout: 'right', clipboardEnabled: true,
-        autostart: false, crossScreenEnabled: true, ...defaults,
+        autostart: false, crossScreenEnabled: true, receiveDir: '', ...defaults,
       };
     }
     return undefined;
@@ -47,6 +48,7 @@
     $('clipboardEnabled').checked = !!s.clipboardEnabled;
     $('autostart').checked = !!s.autostart;
     $('crossScreenEnabled').checked = s.crossScreenEnabled !== false;
+    $('receiveDir').value = s.receiveDir || '';
     for (const name of Object.keys(defaults)) {
       bindings[name] = s[name] === undefined ? defaults[name] : s[name];
     }
@@ -68,6 +70,7 @@
           mouseBackShortcut: bindings.mouseBackShortcut,
           mouseForwardShortcut: bindings.mouseForwardShortcut,
           mouseMiddleShortcut: bindings.mouseMiddleShortcut,
+          receiveDir: $('receiveDir').value.trim(),
         },
       });
       status.textContent = '已保存 ✓';
@@ -187,25 +190,123 @@
     const status = $('fileStatus');
     status.textContent = '选择文件中…';
     try {
-      await invoke('pick_and_send_file');
-      status.textContent = '已发送 ✓';
+      const id = await invoke('pick_and_send_file');
+      status.textContent = id ? '已加入传输任务' : '';
     } catch (e) {
       status.textContent = '发送失败：' + e;
     }
     setTimeout(() => (status.textContent = ''), 2500);
   }
 
-  function logReceived(name, path) {
-    const ul = $('fileLog');
-    const li = document.createElement('li');
-    const title = document.createElement('b');
-    const pathEl = document.createElement('span');
-    title.textContent = `收到 ${name}`;
-    pathEl.className = 'path';
-    pathEl.textContent = path;
-    li.append(title, document.createElement('br'), pathEl);
-    ul.prepend(li);
-    if (ul.children.length > 20) ul.lastChild.remove();
+  async function pickAndSendFolder() {
+    const status = $('fileStatus');
+    status.textContent = '选择文件夹中…';
+    try {
+      const id = await invoke('pick_and_send_folder');
+      status.textContent = id ? '已加入传输任务' : '';
+    } catch (e) {
+      status.textContent = '发送失败：' + e;
+    }
+    setTimeout(() => (status.textContent = ''), 2500);
+  }
+
+  async function pickReceiveDirectory() {
+    try {
+      const path = await invoke('pick_receive_directory');
+      if (path) $('receiveDir').value = path;
+    } catch (e) {
+      $('fileStatus').textContent = '选择目录失败：' + e;
+    }
+  }
+
+  function formatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (value < 1024) return value + ' B';
+    if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+    if (value < 1024 * 1024 * 1024) return (value / 1024 / 1024).toFixed(1) + ' MB';
+    return (value / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  function statusText(status) {
+    return {
+      preparing: '正在整理', transferring: '传输中', completed: '已完成',
+      failed: '失败', cancelled: '已取消',
+    }[status] || status;
+  }
+
+  function renderTransfers() {
+    const list = $('transferList');
+    list.replaceChildren();
+    Array.from(transfers.values()).reverse().forEach((task) => {
+      const item = document.createElement('div');
+      item.className = `transfer-item ${task.status || ''}`;
+      const head = document.createElement('div');
+      head.className = 'transfer-head';
+      const name = document.createElement('b');
+      name.className = 'transfer-name';
+      name.title = task.name || '';
+      name.textContent = task.name || '文件传输';
+      const direction = document.createElement('span');
+      direction.className = 'transfer-direction';
+      direction.textContent = task.direction === 'receive' ? '接收' : '发送';
+      head.append(name, direction);
+
+      const bar = document.createElement('div');
+      bar.className = 'transfer-bar';
+      const fill = document.createElement('span');
+      const percent = task.total > 0 ? Math.min(100, task.transferred / task.total * 100) : (task.status === 'completed' ? 100 : 0);
+      fill.style.width = percent + '%';
+      bar.append(fill);
+
+      const meta = document.createElement('div');
+      meta.className = 'transfer-meta';
+      const progress = document.createElement('span');
+      progress.textContent = `${formatBytes(task.transferred)} / ${formatBytes(task.total)}`;
+      const state = document.createElement('span');
+      const files = task.filesTotal ? ` · ${task.filesDone || 0}/${task.filesTotal} 个` : '';
+      state.textContent = statusText(task.status) + files;
+      meta.append(progress, state);
+      item.append(head, bar, meta);
+
+      if (task.error) {
+        const error = document.createElement('div');
+        error.className = 'transfer-error';
+        error.textContent = task.error;
+        item.append(error);
+      }
+      if (task.direction === 'send' && ['preparing', 'transferring'].includes(task.status)) {
+        const actions = document.createElement('div');
+        actions.className = 'transfer-actions';
+        const cancel = document.createElement('button');
+        cancel.className = 'transfer-action';
+        cancel.textContent = '取消';
+        cancel.addEventListener('click', async () => {
+          try { await invoke('cancel_file_transfer', { id: task.id }); } catch (_) {}
+        });
+        actions.append(cancel);
+        item.append(actions);
+      } else if (task.direction === 'send' && ['failed', 'cancelled'].includes(task.status)) {
+        const actions = document.createElement('div');
+        actions.className = 'transfer-actions';
+        const retry = document.createElement('button');
+        retry.className = 'transfer-action';
+        retry.textContent = '重试';
+        retry.addEventListener('click', async () => {
+          try { await invoke('retry_file_transfer', { id: task.id }); } catch (e) { $('fileStatus').textContent = '重试失败：' + e; }
+        });
+        actions.append(retry);
+        item.append(actions);
+      }
+      list.append(item);
+    });
+  }
+
+  function onTransferUpdate(payload) {
+    if (!payload || !payload.id) return;
+    const previous = transfers.get(payload.id) || {};
+    transfers.set(payload.id, { ...previous, ...payload });
+    while (transfers.size > 30) transfers.delete(transfers.keys().next().value);
+    renderTransfers();
   }
 
   function listenFileReceived() {
@@ -213,14 +314,19 @@
     if (t && t.event && typeof t.event.listen === 'function') {
       t.event.listen('file-received', (event) => {
         const p = event.payload || {};
-        logReceived(p.name || '文件', p.path || '');
+        $('fileStatus').textContent = `已收到 ${p.name || '文件'}`;
+        setTimeout(() => ($('fileStatus').textContent = ''), 2500);
       });
+      t.event.listen('file-transfer-update', (event) => onTransferUpdate(event.payload || {}));
     }
   }
 
   document.addEventListener('DOMContentLoaded', () => {
     $('saveBtn').addEventListener('click', save);
     $('pickFileBtn').addEventListener('click', pickAndSendFile);
+    $('pickFolderBtn').addEventListener('click', pickAndSendFolder);
+    $('pickReceiveDirBtn').addEventListener('click', pickReceiveDirectory);
+    $('clearReceiveDirBtn').addEventListener('click', () => { $('receiveDir').value = ''; });
     document.querySelectorAll('.shortcut-record').forEach((button) => {
       button.addEventListener('click', () => startRecording(button.dataset.binding));
     });

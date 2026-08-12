@@ -72,12 +72,21 @@
       <div class="divider"></div>
 
       <h2 class="section-title">跨屏文件传输</h2>
+      <label>
+        <span>接收文件保存位置</span>
+        <div class="directory-row">
+          <input id="receiveDir" type="text" placeholder="留空则保存到系统下载目录" readonly />
+          <button id="pickReceiveDirBtn" class="test-btn" type="button">选择</button>
+          <button id="clearReceiveDirBtn" class="test-btn secondary" type="button">默认</button>
+        </div>
+      </label>
       <div class="file-send">
-        <button id="pickFileBtn" class="test-btn">选择文件发送至对端</button>
+        <button id="pickFileBtn" class="test-btn">选择文件</button>
+        <button id="pickFolderBtn" class="test-btn">选择文件夹</button>
         <span id="fileStatus" class="status"></span>
       </div>
-      <ul id="fileLog" class="file-log"></ul>
-      <p class="hint small">复制或拖动文件到对端也会自动传输；收到的文件会放入下载目录并写入本机剪贴板。</p>
+      <div id="transferList" class="transfer-list"></div>
+      <p class="hint small">支持多文件、完整文件夹、复制后自动传输；完成后会把整批文件放入对端剪贴板。跨屏拖拽会在系统能够提供文件路径时自动触发传输。</p>
 
       <div class="actions">
         <button id="saveBtn">保存</button>

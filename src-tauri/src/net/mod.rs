@@ -81,6 +81,7 @@ struct NetStatusInner {
 pub struct NetHandle {
     ctrl: mpsc::UnboundedSender<Message>,
     out: mpsc::Sender<Message>,
+    file: mpsc::Sender<Message>,
     moves: mpsc::UnboundedSender<Payload>,
     status: Arc<NetStatusInner>,
 }
@@ -89,6 +90,17 @@ impl NetHandle {
     /// 发送可靠消息（TCP；断线时静默丢弃，重连后恢复）。
     pub fn send(&self, msg: Message) {
         let _ = self.out.try_send(msg);
+    }
+
+    /// 文件数据使用独立的小队列并等待背压，既不丢块，也不挤占键鼠/剪贴板事件队列。
+    pub async fn send_file(&self, msg: Message) -> Result<(), String> {
+        if !self.connected() {
+            return Err("网络连接已断开".to_string());
+        }
+        tokio::time::timeout(Duration::from_secs(3), self.file.send(msg))
+            .await
+            .map_err(|_| "文件发送队列等待超时".to_string())?
+            .map_err(|_| "网络连接已关闭".to_string())
     }
 
     /// 控制权消息走独立高优先级队列，不会被剪贴板/文件消息挤满或插队。
@@ -134,6 +146,8 @@ pub struct NetStart {
     pub handle: NetHandle,
     /// 对端消息接收端（路由任务消费）
     pub incoming: mpsc::Receiver<Message>,
+    /// 文件协议独立接收队列，避免磁盘写入挤压键鼠/控制事件。
+    pub file_incoming: mpsc::Receiver<Message>,
 }
 
 impl NetEngine {
@@ -141,7 +155,9 @@ impl NetEngine {
     pub async fn start(name: String, cfg: PeerConfig) -> Result<NetStart> {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Message>();
         let (out_tx, out_rx) = mpsc::channel::<Message>(256);
+        let (file_tx, file_rx) = mpsc::channel::<Message>(8);
         let (in_tx, incoming) = mpsc::channel::<Message>(256);
+        let (file_in_tx, file_incoming) = mpsc::channel::<Message>(16);
         // 指针帧不能因有界队列满而丢掉握手后的第一帧；写循环会主动合并积压，
         // 因此这里使用无界通道，既不阻塞系统输入回调，也不会积累大量 UDP 包。
         let (move_tx, move_rx) = mpsc::unbounded_channel::<Payload>();
@@ -181,7 +197,9 @@ impl NetEngine {
                 my_ip,
                 ctrl_rx,
                 out_rx,
+                file_rx,
                 incoming: in_tx,
+                file_incoming: file_in_tx,
                 status: status.clone(),
                 shutdown: shutdown.clone(),
             }
@@ -191,11 +209,12 @@ impl NetEngine {
         let handle = NetHandle {
             ctrl: ctrl_tx,
             out: out_tx,
+            file: file_tx,
             moves: move_tx,
             status: status.clone(),
         };
         let engine = NetEngine { handle: handle.clone(), shutdown, tasks };
-        Ok(NetStart { engine, handle, incoming })
+        Ok(NetStart { engine, handle, incoming, file_incoming })
     }
 
     pub fn handle(&self) -> NetHandle {
@@ -227,7 +246,9 @@ struct Connector {
     my_ip: IpAddr,
     ctrl_rx: mpsc::UnboundedReceiver<Message>,
     out_rx: mpsc::Receiver<Message>,
+    file_rx: mpsc::Receiver<Message>,
     incoming: mpsc::Sender<Message>,
+    file_incoming: mpsc::Sender<Message>,
     status: Arc<NetStatusInner>,
     shutdown: Arc<AtomicBool>,
 }
@@ -269,6 +290,7 @@ impl Connector {
         let (mut rd, mut wr) = stream.into_split();
         let (dead_tx, mut dead_rx) = tokio::sync::oneshot::channel();
         let incoming = self.incoming.clone();
+        let file_incoming = self.file_incoming.clone();
         let status = self.status.clone();
         let reader = tokio::spawn(async move {
             loop {
@@ -276,7 +298,27 @@ impl Connector {
                 match res {
                     Ok(Ok(msg)) => {
                         status.received.fetch_add(1, Ordering::Relaxed);
-                        if incoming.send(msg).await.is_err() {
+                        let is_file = matches!(
+                            &msg.payload,
+                            Payload::FileBatchStart { .. }
+                                | Payload::FileBatchReady { .. }
+                                | Payload::FileDirectory { .. }
+                                | Payload::FileStart { .. }
+                                | Payload::FileReady { .. }
+                                | Payload::FileChunk { .. }
+                                | Payload::FileEnd { .. }
+                                | Payload::FileCancel { .. }
+                                | Payload::FileBatchEnd { .. }
+                                | Payload::FileBatchCancel { .. }
+                                | Payload::FileResult { .. }
+                                | Payload::FileBatchResult { .. }
+                        );
+                        let closed = if is_file {
+                            file_incoming.send(msg).await.is_err()
+                        } else {
+                            incoming.send(msg).await.is_err()
+                        };
+                        if closed {
                             break; // 上层已关闭
                         }
                     }
@@ -310,6 +352,12 @@ impl Connector {
                     }
                     None => break, // 上层已关闭
                 },
+                msg = self.file_rx.recv() => match msg {
+                    Some(m) => {
+                        if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
+                    }
+                    None => break,
+                },
                 _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
                     seq += 1;
                     let m = Message::ctrl(&self.name, Payload::Heartbeat { seq });
@@ -321,6 +369,7 @@ impl Connector {
         // 连接代际结束后，旧控制/输入不能留到下次重连继续执行。
         while self.ctrl_rx.try_recv().is_ok() {}
         while self.out_rx.try_recv().is_ok() {}
+        while self.file_rx.try_recv().is_ok() {}
     }
 }
 

@@ -66,11 +66,22 @@ pub fn run() {
             spawn_tick_task(router.clone());
 
             // 文件接收器（监听对端 FileStart/Chunk/End，写下载目录 + 写剪贴板 + 通知前端）
-            let file_receiver = Arc::new(file_transfer::FileReceiver::new(app.handle().clone()));
+            let receive_dir = router.lock().unwrap().settings.receive_dir.clone();
+            let file_receiver = Arc::new(file_transfer::FileReceiver::new(
+                app.handle().clone(),
+                &receive_dir,
+            ));
             {
                 let mut r = router.lock().unwrap();
-                r.file_receiver = Some(file_receiver);
+                r.file_receiver = Some(file_receiver.clone());
             }
+            let cleanup_receiver = file_receiver.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    cleanup_receiver.cleanup_stale(Duration::from_secs(60));
+                }
+            });
 
             // 若已配置对端 IP，启动网络
             if !router.lock().unwrap().settings.peer_ip.trim().is_empty() {
@@ -90,6 +101,10 @@ pub fn run() {
             get_net_status,
             send_file,
             pick_and_send_file,
+            pick_and_send_folder,
+            pick_receive_directory,
+            cancel_file_transfer,
+            retry_file_transfer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ruiss");
@@ -542,7 +557,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 };
                 if has_text || has_image || has_files {
                     log::info!("拖拽跨屏：携带剪贴板内容 text={has_text} image={has_image} files={has_files}");
-                    net.send(Message::ctrl(&name, Payload::DragOffer {
+                    net.send_ctrl(Message::ctrl(&name, Payload::DragOffer {
                         drag: true, has_text, has_image, has_files,
                     }));
                     match content {
@@ -562,8 +577,12 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                                 r.file_sender.clone()
                             };
                             if let Some(sender) = sender {
-                                for p in paths {
-                                    sender.send_file(std::path::PathBuf::from(p));
+                                let paths = paths
+                                    .into_iter()
+                                    .map(std::path::PathBuf::from)
+                                    .collect();
+                                if let Err(e) = sender.send_paths(paths) {
+                                    log::error!("[FILE] 拖拽文件发送失败: {e}");
                                 }
                             }
                         }
@@ -852,18 +871,6 @@ async fn run_incoming_router(
             Payload::ClipboardText { .. } | Payload::ClipboardImage { .. } | Payload::ClipboardFiles { .. } => {
                 clipboard::handle_remote(&msg.payload);
             }
-            Payload::FileStart { .. } | Payload::FileChunk { .. } | Payload::FileEnd { .. } | Payload::FileCancel { .. } => {
-                let fr = {
-                    let r = match router.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    r.file_receiver.clone()
-                };
-                if let Some(fr) = fr {
-                    fr.handle(&msg.payload);
-                }
-            }
             Payload::DragOffer { drag, has_text, has_image, has_files: _ } => {
                 // 文字/图片拖拽：剪贴板内容随后到达写入，延迟注入粘贴
                 // 文件拖拽：文件传完路径已入剪贴板，用户手动 Ctrl+V（传输耗时不确定）
@@ -984,7 +991,11 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
         // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
         r.arbiter = if cross_enabled { Some(Arbiter::new(layout)) } else { None };
         // 文件发送器（剪贴板文件 + GUI 手动发送 + 拖拽，都用它）
-        let file_sender = file_transfer::FileSender::new(handle.clone(), name.clone());
+        let file_sender = file_transfer::FileSender::new(
+            handle.clone(),
+            name.clone(),
+            _app.clone(),
+        );
         r.file_sender = Some(file_sender.clone());
         // 剪贴板同步：监听本机剪贴板变化发对端，剪贴板开关关闭时不启动
         if clip_enabled {
@@ -992,9 +1003,9 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
                 name.clone(),
                 handle.clone(),
                 std::sync::Arc::new(move |paths: Vec<String>| {
-                    // 本机剪贴板出现文件路径 → 逐个发送
-                    for p in paths {
-                        file_sender.send_file(std::path::PathBuf::from(p));
+                    let paths = paths.into_iter().map(std::path::PathBuf::from).collect();
+                    if let Err(e) = file_sender.send_paths(paths) {
+                        log::error!("[FILE] 剪贴板文件发送失败: {e}");
                     }
                 }),
             );
@@ -1002,6 +1013,7 @@ async fn apply_link_config(router: &Arc<Mutex<RouterState>>, _app: &AppHandle) -
         }
     }
     tauri::async_runtime::spawn(run_incoming_router(start.incoming, router.clone(), injector));
+    tauri::async_runtime::spawn(run_file_router(start.file_incoming, router.clone()));
     log::info!(
         "网络已启动：对端 {peer_ip}（跨屏{}，剪贴板{}）",
         if cross_enabled { "开启" } else { "已关闭" },
@@ -1037,6 +1049,48 @@ struct Settings {
     mouse_forward_shortcut: Option<NativeShortcut>,
     #[serde(default = "default_mouse_middle_shortcut")]
     mouse_middle_shortcut: Option<NativeShortcut>,
+    /// 文件接收目录。空字符串表示系统下载目录。
+    #[serde(default)]
+    receive_dir: String,
+}
+
+async fn run_file_router(
+    mut incoming: tokio::sync::mpsc::Receiver<Message>,
+    router: Arc<Mutex<RouterState>>,
+) {
+    while let Some(msg) = incoming.recv().await {
+        let (receiver, sender, net, name) = {
+            let r = match router.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            (
+                r.file_receiver.clone(),
+                r.file_sender.clone(),
+                r.net.clone(),
+                r.settings.name.clone(),
+            )
+        };
+        match &msg.payload {
+            Payload::FileBatchReady { .. }
+            | Payload::FileReady { .. }
+            | Payload::FileResult { .. }
+            | Payload::FileBatchResult { .. } => {
+                if let Some(sender) = sender {
+                    sender.handle_result(&msg.payload);
+                }
+            }
+            _ => {
+                if let Some(receiver) = receiver {
+                    for response in receiver.handle(&msg.payload) {
+                        if let Some(net) = &net {
+                            net.send_ctrl(Message::clipboard(&name, response));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1077,6 +1131,7 @@ impl Default for Settings {
             mouse_back_shortcut: default_mouse_back_shortcut(),
             mouse_forward_shortcut: default_mouse_forward_shortcut(),
             mouse_middle_shortcut: default_mouse_middle_shortcut(),
+            receive_dir: String::new(),
         }
     }
 }
@@ -1112,6 +1167,14 @@ async fn save_settings(
     state: State<'_, Arc<Mutex<RouterState>>>,
     settings: Settings,
 ) -> Result<(), String> {
+    let needs_relink = {
+        let r = state.inner().lock().map_err(|e| e.to_string())?;
+        r.settings.peer_ip != settings.peer_ip
+            || r.settings.layout != settings.layout
+            || r.settings.name != settings.name
+            || r.settings.cross_screen_enabled != settings.cross_screen_enabled
+            || r.settings.clipboard_enabled != settings.clipboard_enabled
+    };
     let path = settings_path(&app)?;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("保存设置失败: {e}"))?;
@@ -1119,8 +1182,13 @@ async fn save_settings(
     {
         let mut r = state.inner().lock().map_err(|e| e.to_string())?;
         r.settings = settings.clone();
+        if let Some(receiver) = &r.file_receiver {
+            receiver.set_download_dir(&settings.receive_dir)?;
+        }
     }
-    apply_link_config(state.inner(), &app).await?;
+    if needs_relink {
+        apply_link_config(state.inner(), &app).await?;
+    }
     log::info!("设置已保存: {}", settings.peer_ip);
     Ok(())
 }
@@ -1182,8 +1250,7 @@ fn send_file(
         r.file_sender.clone()
     };
     let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
-    sender.send_file(std::path::PathBuf::from(path));
-    Ok(())
+    sender.send_paths(vec![std::path::PathBuf::from(path)]).map(|_| ())
 }
 
 /// 弹出文件选择框，选完即发送（用 tauri-plugin-dialog）。
@@ -1191,22 +1258,85 @@ fn send_file(
 async fn pick_and_send_file(
     app: AppHandle,
     state: State<'_, Arc<Mutex<RouterState>>>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let picked = app
         .dialog()
         .file()
         .add_filter("所有文件", &["*"])
-        .blocking_pick_file();
-    let Some(picked) = picked else { return Ok(()); };
-    let path = picked.into_path().map_err(|e| e.to_string())?;
+        .blocking_pick_files();
+    let Some(picked) = picked else { return Ok(None); };
+    let paths = picked
+        .into_iter()
+        .map(|path| path.into_path().map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
     let sender = {
         let r = state.inner().lock().map_err(|e| e.to_string())?;
         r.file_sender.clone()
     };
     let sender = sender.ok_or_else(|| "网络未连接，无法发送文件".to_string())?;
-    sender.send_file(path);
+    sender.send_paths(paths).map(Some)
+}
+
+#[tauri::command]
+async fn pick_and_send_folder(
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<RouterState>>>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let sender = state
+        .inner()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .file_sender
+        .clone()
+        .ok_or_else(|| "网络未连接，无法发送文件夹".to_string())?;
+    sender.send_paths(vec![path]).map(Some)
+}
+
+#[tauri::command]
+fn pick_receive_directory(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .map(|path| path.into_path().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string()))
+        .transpose()
+}
+
+#[tauri::command]
+fn cancel_file_transfer(
+    state: State<'_, Arc<Mutex<RouterState>>>,
+    id: String,
+) -> Result<(), String> {
+    let sender = state
+        .inner()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .file_sender
+        .clone()
+        .ok_or_else(|| "网络未连接".to_string())?;
+    sender.cancel(&id);
     Ok(())
+}
+
+#[tauri::command]
+fn retry_file_transfer(
+    state: State<'_, Arc<Mutex<RouterState>>>,
+    id: String,
+) -> Result<String, String> {
+    let sender = state
+        .inner()
+        .lock()
+        .map_err(|e| e.to_string())?
+        .file_sender
+        .clone()
+        .ok_or_else(|| "网络未连接".to_string())?;
+    sender.retry(&id)
 }
 
 #[cfg(test)]

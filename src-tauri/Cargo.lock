@@ -2777,6 +2777,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "core-foundation",
  "core-graphics",
  "dirs 5.0.1",
@@ -2786,6 +2787,7 @@ dependencies = [
  "png 0.17.16",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

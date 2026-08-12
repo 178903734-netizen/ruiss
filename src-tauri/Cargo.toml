@@ -31,6 +31,8 @@ png = "0.17"
 dirs = "5"
 # M3：文件传输唯一 id
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # ---- 平台依赖（M1 启用：Windows 低层钩子捕获 + SendInput 注入）----
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -54,7 +54,13 @@ impl ClipboardSync {
                 ClipboardContent::Files(paths) => {
                     let paths: Vec<String> = paths
                         .into_iter()
-                        .filter(|p| !p.is_empty() && std::path::Path::new(p).is_file())
+                        .filter(|p| {
+                            if p.is_empty() {
+                                return false;
+                            }
+                            let path = std::path::Path::new(p);
+                            path.is_file() || path.is_dir()
+                        })
                         .collect();
                     if !paths.is_empty() {
                         on_files_cb(paths);
