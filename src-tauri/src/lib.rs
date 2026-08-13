@@ -26,6 +26,8 @@ use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
 use crate::core::keys::{translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut};
 use crate::core::protocol::{Message, Payload};
 
+const CLIPBOARD_PROTOCOL_VERSION: u32 = 2;
+
 /// Tauri 入口。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -180,6 +182,8 @@ struct RouterState {
     rx_pointer_seq: u64,
     outgoing_drag: Option<String>,
     incoming_drag: Option<String>,
+    peer_app_version: Option<String>,
+    peer_protocol_version: Option<u32>,
 }
 
 impl RouterState {
@@ -202,6 +206,8 @@ impl RouterState {
             rx_pointer_seq: 0,
             outgoing_drag: None,
             incoming_drag: None,
+            peer_app_version: None,
+            peer_protocol_version: None,
         }
     }
 }
@@ -730,7 +736,15 @@ async fn run_incoming_router(
 ) {
     while let Some(msg) = incoming.recv().await {
         match &msg.payload {
-            Payload::Heartbeat { .. } => {} // 保活，无需处理
+            Payload::Heartbeat {
+                app_version,
+                protocol_version,
+                ..
+            } => {
+                let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                r.peer_app_version = app_version.clone();
+                r.peer_protocol_version = *protocol_version;
+            }
             Payload::TakeControl {
                 session,
                 x,
@@ -1099,6 +1113,8 @@ async fn apply_link_config(
         };
         r.engine = Some(start.engine);
         r.net = Some(handle.clone());
+        r.peer_app_version = None;
+        r.peer_protocol_version = None;
         // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
         r.arbiter = if cross_enabled {
             Some(Arbiter::new(layout))
@@ -1423,6 +1439,11 @@ struct NetStatusView {
     linked: bool,
     sent: u64,
     received: u64,
+    local_version: &'static str,
+    local_protocol_version: u32,
+    peer_version: Option<String>,
+    peer_protocol_version: Option<u32>,
+    versions_match: bool,
 }
 
 #[tauri::command]
@@ -1455,6 +1476,13 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
         linked,
         sent,
         received,
+        local_version: env!("CARGO_PKG_VERSION"),
+        local_protocol_version: CLIPBOARD_PROTOCOL_VERSION,
+        peer_version: r.peer_app_version.clone(),
+        peer_protocol_version: r.peer_protocol_version,
+        versions_match: connected
+            && r.peer_app_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+            && r.peer_protocol_version == Some(CLIPBOARD_PROTOCOL_VERSION),
     }
 }
 

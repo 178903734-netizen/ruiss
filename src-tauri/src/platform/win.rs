@@ -1174,6 +1174,10 @@ use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
 /// the user's next copy when clipboard notifications are delayed or coalesced.
 static LOCAL_CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+/// Several WM_CLIPBOARDUPDATE messages may describe one logical write. Handle the final
+/// sequence number once so a remote paste cannot become a second outgoing copy task.
+static LAST_HANDLED_CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 fn remember_local_clipboard_sequence() {
     let sequence = unsafe { GetClipboardSequenceNumber() };
@@ -2196,6 +2200,11 @@ unsafe extern "system" fn clip_wnd_proc(
 ) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
         let current = GetClipboardSequenceNumber();
+        if current != 0
+            && LAST_HANDLED_CLIPBOARD_SEQUENCE.swap(current, Ordering::AcqRel) == current
+        {
+            return LRESULT(0);
+        }
         if current != 0
             && LOCAL_CLIPBOARD_SEQUENCE
                 .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Acquire)

@@ -81,6 +81,9 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
   font-family: Consolas, "Courier New", monospace;
 }
 .stats.net { border: 1px solid #d8e0ee; }
+.stats.version { margin-top: 7px; border: 1px solid #d8e0ee; }
+.stats.version.synced { color: #18794e; background: #eaf8f0; border-color: #a8dfbd; }
+.stats.version.mismatch { color: #b42318; background: #fff1f0; border-color: #f2b8b5; }
 
 .test-btn {
   padding: 8px 12px;

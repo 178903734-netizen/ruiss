@@ -72,9 +72,15 @@ impl ClipboardSync {
                         return;
                     }
                     let id = uuid::Uuid::new_v4().to_string();
+                    // Both messages are understood by older peers. An empty ClipboardFiles is
+                    // a revision offer for new peers and a harmless no-op for old versions.
+                    net_cb.send_ctrl(Message::clipboard(&name_cb, Payload::ClipboardClear));
                     net_cb.send_ctrl(Message::clipboard(
                         &name_cb,
-                        Payload::ClipboardFileOffer { id: id.clone() },
+                        Payload::ClipboardFiles {
+                            id: id.clone(),
+                            paths: Vec::new(),
+                        },
                     ));
                     if let Err(error) = file_sender.send_clipboard_paths(id, paths) {
                         log::error!("[CLIPBOARD] unable to start file copy: {error}");
@@ -107,16 +113,22 @@ pub fn handle_remote(payload: &Payload, file_receiver: &FileReceiver) {
                 platform::clipboard_write_image(png);
             }
         }
+        Payload::ClipboardClear => {
+            file_receiver.invalidate_clipboard_revision();
+            platform::clipboard_clear();
+        }
         Payload::ClipboardFileOffer { id } => {
             if file_receiver.begin_clipboard_revision(id) {
                 platform::clipboard_clear();
             }
         }
-        Payload::ClipboardClear => {
-            file_receiver.invalidate_clipboard_revision();
-            platform::clipboard_clear();
-        }
         Payload::ClipboardFiles { id, paths } => {
+            if paths.is_empty() {
+                if !id.is_empty() {
+                    file_receiver.begin_clipboard_revision(id);
+                }
+                return;
+            }
             // 轻量场景：对端只发路径（共享盘/同机双实例）。写入本机剪贴板文件列表。
             if !paths.is_empty() && (id.is_empty() || file_receiver.begin_clipboard_revision(id)) {
                 if id.is_empty() {

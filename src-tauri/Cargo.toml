@@ -1,6 +1,6 @@
 [package]
 name = "ruiss"
-version = "0.1.0"
+version = "0.1.1"
 description = "双机键鼠共享：鼠标跨屏、键盘共享、剪贴板同步"
 edition = "2021"
 rust-version = "1.77"

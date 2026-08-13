@@ -171,6 +171,19 @@
     const s = await invoke('get_net_status');
     if (!s) return;
     const el = $('netStatus');
+    const version = $('versionStatus');
+    const peerVersion = s.peerVersion || '未知';
+    const peerProtocol = s.peerProtocolVersion ?? '未知';
+    version.classList.remove('synced', 'mismatch');
+    if (!s.connected) {
+      version.textContent = `版本：本机 v${s.localVersion} / 协议 ${s.localProtocolVersion} · 对端未连接`;
+    } else if (s.versionsMatch) {
+      version.textContent = `版本：本机 v${s.localVersion} / 对端 v${peerVersion} · 协议 ${s.localProtocolVersion} · 已同步`;
+      version.classList.add('synced');
+    } else {
+      version.textContent = `版本不一致：本机 v${s.localVersion} / 协议 ${s.localProtocolVersion} · 对端 v${peerVersion} / 协议 ${peerProtocol}`;
+      version.classList.add('mismatch');
+    }
     if (!s.captureOk) {
       el.textContent = '输入捕获不可用：Mac 请在“隐私与安全性 → 辅助功能”授权后重启';
       return;

@@ -106,8 +106,8 @@ pub enum Payload {
     /// Source clipboard changed to content that is not yet available lazily on the peer.
     /// Invalidate the previous synchronized value so paste cannot reuse stale content.
     ClipboardClear,
-    /// A file/folder copy started. Clear stale peer data and make this revision current
-    /// until its verified FileBatch finishes.
+    /// Kept for compatibility with Ruiss 0.1.0. New senders use an empty ClipboardFiles
+    /// offer, which older releases safely ignore.
     ClipboardFileOffer {
         id: String,
     },
@@ -121,6 +121,10 @@ pub enum Payload {
     /// 心跳（保活 + 角色仲裁）
     Heartbeat {
         seq: u64,
+        #[serde(default)]
+        app_version: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u32>,
     },
     /// 令牌：成为主控（对端进入 Sink），携带对端坐标系入口位置 (x, y)
     /// 及源端屏幕尺寸（对端注入入口时按比例映射）
@@ -275,8 +279,9 @@ mod file_protocol_tests {
     #[test]
     fn file_batch_messages_round_trip_json() {
         let messages = [
-            Payload::ClipboardFileOffer {
+            Payload::ClipboardFiles {
                 id: "clipboard".into(),
+                paths: Vec::new(),
             },
             Payload::FileBatchStart {
                 id: "batch".into(),
@@ -312,5 +317,19 @@ mod file_protocol_tests {
             let decoded: Payload = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, payload);
         }
+    }
+
+    #[test]
+    fn heartbeat_is_compatible_with_previous_version() {
+        let old = r#"{"type":"heartbeat","seq":7}"#;
+        let decoded: Payload = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            decoded,
+            Payload::Heartbeat {
+                seq: 7,
+                app_version: None,
+                protocol_version: None,
+            }
+        );
     }
 }
