@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 2026-08-13 — 远程拖拽带系统图标拖影 + 拖拽启动时序优化（Windows）；同步 mac 编译修复
+
+- **拖拽图标拖影（win.rs，新增 attach_drag_image）**：用
+  IDragSourceHelper::InitializeFromBitmap 给合成拖拽挂文件类型图标拖影——目标机
+  没有实体文件，用 SHGetFileInfoW + SHGFI_USEFILEATTRIBUTES 按扩展名从注册表
+  解析类型图标，DrawIconEx 画 32x32 位图，COLOR_WINDOW(5) 作透明 key 色；
+  失败只降级为系统默认光标，不影响拖拽本体。Cargo.toml 启用
+  Win32_Storage_FileSystem 特性。
+- **拖拽捕获窗口（win.rs，新增 create_drag_capture_window + SetCapture）**：
+  DoDragDrop 的模态循环从"本线程"消息队列取鼠标事件，而 SendInput 注入的
+  移动/松开默认投递到前台窗口线程 → 拖拽不跟手、松手不落。创建属于拖拽线程
+  的隐形捕获窗口并 SetCapture，把注入事件路由进本线程队列（等价真实拖拽时源
+  窗口 capture 鼠标），合成 LEFT_DOWN 也不会误点光标下的前台应用。
+- **修复编译错误（win.rs）**：`SetCapture(Some(capture_hwnd))` →
+  `SetCapture(capture_hwnd)`（Option<HWND> 不满足 Param<HWND, CopyType>）。
+- **拖拽启动时序（file_transfer/mod.rs）**：DragStart 不再等完整目录树遍历——
+  改为同步 build_roots 只 stat 顶层条目，立即把 DragStart 通告给对端，让对端
+  在光标进入瞬间就启动合成拖拽；完整发送计划（build_plan）推迟到对端真正
+  Drop（DragCommit → commit_drag）再构建，避免大文件夹遍历让对端拖拽起步过晚、
+  用户松手时落点错乱。build_roots 与 build_plan 用相同顺序的 unique_logical_name，
+  保证 DragStart 里的 root 名与后续 FileBatchStart 完全一致。
+- **mac.rs**：PENDING_DRAG_PATHS 有效期 2s→15s，drag_probe_updated 持续刷新
+  记录时间戳——用户在边缘犹豫/来回微移时路径不因有效期过期（跨屏触发那一刻
+  才采样）。
+- **同步远程 87686a2（修复 macOS 编译失败）**：移除 .cargo/config.toml 里的
+  Windows 专用 target-dir（改由环境变量 CARGO_TARGET_DIR 控制，见
+  scripts/set-ruiss-env.ps1）；修复 mac.rs RcBlock 非 Send、CGPoint Encode
+  缺失、NSPoint FFI 桥接。
+- 验证：Windows cargo check + build 通过（D:/ruiss-target/debug/ruiss.exe
+  09:42 生成）；mac.rs 改动需 Mac 端编译确认。
+
 ## 2026-08-12 — 修复跨屏拖拽消息被分流丢弃（拖文件过去对端无文件）
 
 现象：跨屏拖拽文件，对端完全没有文件。链路在"对端启动原生拖拽会话"处断开。

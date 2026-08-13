@@ -66,12 +66,21 @@ ruiss/
     注册表重载恢复（无条件执行，崩溃重启也能恢复）；Mac 用 NSCursor hide +
     tap 回调移动补藏（macOS 移动自动重显）对抗。lib.rs tick 每 100ms 调
     enforce_cursor_hidden()（Windows 已无需补藏，空实现）。
+  - 远程拖拽（Win 合成侧，2026-08-13）：attach_drag_image 用
+    IDragSourceHelper::InitializeFromBitmap 挂文件类型图标拖影（SHGetFileInfoW
+    按扩展名解析，目标机无实体文件）；create_drag_capture_window 建拖拽线程的
+    隐形捕获窗口 + SetCapture，把 SendInput 注入事件路由进 DoDragDrop 模态循环
+    所在线程（否则不跟手、松手不落）。
 - net/ — TCP（按键、剪贴板，可靠）+ UDP（鼠标高频移动）。二进制协议，粘包处理。
   读循环按 payload 分流：FileBatch*/File*/DragStart/DragCommit/DragCancel 进 file_incoming
   （run_file_router 处理），其余进普通 incoming（run_incoming_router）。新增协议消息时
   必须检查这里的分流名单，漏加会导致消息被普通路由丢弃。
 - clipboard/ — 监听系统剪贴板变化（Win: AddClipboardFormatListener；Mac: NSPasteboard changeCount 轮询），变化后经 TCP 发给对端；带标记位防回环（收到自己发的不再转发）。对端消息写本机剪贴板（文字/图片/文件路径）。
 - file_transfer/ — M3 文件分块传输：FileSender 把文件按 256KB 分块发 FileStart→Chunk*→FileEnd；FileReceiver 状态机写盘到下载目录（重名自动 (1)(2)），完成后路径写本机剪贴板 + emit file-received 通知前端。触发：本机剪贴板出现文件路径 / GUI 选文件 / 跨屏拖拽。
+  - 拖拽启动时序（2026-08-13）：DragStart 只同步 build_roots（stat 顶层条目）
+    立即发通告，对端光标进入瞬间即启动合成拖拽；完整目录树遍历推迟到 DragCommit
+    后 build_plan 再构建（大文件夹不让对端拖拽起步过晚）。build_roots 与
+    build_plan 同序 unique_logical_name，保证 root 名与 FileBatchStart 一致。
 
 ## 核心机制（想通这三点，代码就顺）
 
@@ -136,8 +145,9 @@ cargo tauri build --manifest-path src-tauri/Cargo.toml
   - 已实现（代码层）：协议扩展（文字/图片/文件/分块流/拖拽通告）；
     Win+Mac 平台剪贴板读写与监听（防回环）；剪贴板同步协调器；
     文件分块传输（发送/接收/写盘/入剪贴板/通知前端）；跨屏拖拽（带内容跨屏 + 光标处粘贴）；
-    前端文件传输区 + 传输记录；网络单帧上限 1MB→16MB。
-  - 验证状态：Windows 端 cargo check 通过（见 CHANGELOG M3 条目）；
+    前端文件传输区 + 传输记录；网络单帧上限 1MB→16MB；
+    Windows 远程拖拽系统图标拖影 + 拖拽捕获窗口（2026-08-13）。
+  - 验证状态：Windows 端 cargo check/build 通过（见 CHANGELOG M3 条目）；
     Mac 端 mac.rs 剪贴板/拖拽为首次编写，需 Mac 编译实测并迭代；
     双机实机联测（剪贴板同步、文件收发、拖拽粘贴）待做。
 - [ ] 打包分发（cargo tauri build）
