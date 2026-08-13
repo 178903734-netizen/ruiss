@@ -26,8 +26,6 @@ use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
 use crate::core::keys::{translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut};
 use crate::core::protocol::{Message, Payload};
 
-const CLIPBOARD_PROTOCOL_VERSION: u32 = 2;
-
 /// Tauri 入口。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,7 +34,6 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             setup_tray(app)?;
             // 启动兜底：恢复上次可能残留的光标状态（Ruiss 被强杀后光标计数可能仍为负）
@@ -183,7 +180,6 @@ struct RouterState {
     outgoing_drag: Option<String>,
     incoming_drag: Option<String>,
     peer_app_version: Option<String>,
-    peer_protocol_version: Option<u32>,
 }
 
 impl RouterState {
@@ -207,7 +203,6 @@ impl RouterState {
             outgoing_drag: None,
             incoming_drag: None,
             peer_app_version: None,
-            peer_protocol_version: None,
         }
     }
 }
@@ -738,12 +733,10 @@ async fn run_incoming_router(
         match &msg.payload {
             Payload::Heartbeat {
                 app_version,
-                protocol_version,
                 ..
             } => {
                 let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
                 r.peer_app_version = app_version.clone();
-                r.peer_protocol_version = *protocol_version;
             }
             Payload::TakeControl {
                 session,
@@ -938,19 +931,45 @@ async fn run_incoming_router(
             Payload::ClipboardText { .. }
             | Payload::ClipboardImage { .. }
             | Payload::ClipboardClear
-            | Payload::ClipboardFileOffer { .. }
             | Payload::ClipboardFiles { .. } => {
-                let (receiver, sender) = {
+                let (receiver, net, name) = {
                     let r = router.lock().unwrap_or_else(|e| e.into_inner());
-                    (r.file_receiver.clone(), r.file_sender.clone())
+                    (r.file_receiver.clone(), r.net.clone(), r.settings.name.clone())
                 };
-                // A newer clipboard value from the peer also cancels an older file-copy
-                // stream originating on this machine, avoiding wasted large transfers.
-                if let Some(sender) = sender {
-                    sender.cancel_clipboard_transfer();
-                }
+                // 懒粘贴桥接：平台层（WM_RENDERFORMAT / promise_write）在用户粘贴时
+                // 回调这里 → 回源端发 ClipboardFileRequest 并注册结果等待者。
+                let paste_cb: platform::ClipboardPasteCallback = {
+                    let receiver_cb = receiver.clone();
+                    let net_cb = net.clone();
+                    let name_cb = name.clone();
+                    std::sync::Arc::new(move |event| {
+                        let platform::ClipboardPasteEvent::Requested { id, ready } = event;
+                        if let Some(net) = &net_cb {
+                            net.send_ctrl(Message::ctrl(
+                                &name_cb,
+                                Payload::ClipboardFileRequest { id: id.clone() },
+                            ));
+                        }
+                        if let Some(receiver) = &receiver_cb {
+                            receiver.attach_clipboard_waiter(&id, ready);
+                        }
+                    })
+                };
                 if let Some(receiver) = receiver {
-                    clipboard::handle_remote(&msg.payload, &receiver);
+                    clipboard::handle_remote(&msg.payload, &receiver, &paste_cb);
+                }
+            }
+            Payload::ClipboardFileRequest { id } => {
+                // 本机是源端：对端粘贴了 offer，现在开始真正传输。
+                if let Some(sender) = router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file_sender
+                    .clone()
+                {
+                    if let Err(error) = sender.request_clipboard_files(id) {
+                        log::warn!("[CLIPBOARD] 懒粘贴请求已失效: {error}");
+                    }
                 }
             }
             Payload::DragOffer {
@@ -1114,7 +1133,6 @@ async fn apply_link_config(
         r.engine = Some(start.engine);
         r.net = Some(handle.clone());
         r.peer_app_version = None;
-        r.peer_protocol_version = None;
         // 跨屏开关关闭时不建仲裁器（事件不再触发跨屏），网络保持连接
         r.arbiter = if cross_enabled {
             Some(Arbiter::new(layout))
@@ -1440,9 +1458,7 @@ struct NetStatusView {
     sent: u64,
     received: u64,
     local_version: &'static str,
-    local_protocol_version: u32,
     peer_version: Option<String>,
-    peer_protocol_version: Option<u32>,
     versions_match: bool,
 }
 
@@ -1477,12 +1493,9 @@ fn get_net_status(state: State<'_, Arc<Mutex<RouterState>>>) -> NetStatusView {
         sent,
         received,
         local_version: env!("CARGO_PKG_VERSION"),
-        local_protocol_version: CLIPBOARD_PROTOCOL_VERSION,
         peer_version: r.peer_app_version.clone(),
-        peer_protocol_version: r.peer_protocol_version,
         versions_match: connected
-            && r.peer_app_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
-            && r.peer_protocol_version == Some(CLIPBOARD_PROTOCOL_VERSION),
+            && r.peer_app_version.as_deref() == Some(env!("CARGO_PKG_VERSION")),
     }
 }
 

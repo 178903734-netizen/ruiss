@@ -106,25 +106,26 @@ pub enum Payload {
     /// Source clipboard changed to content that is not yet available lazily on the peer.
     /// Invalidate the previous synchronized value so paste cannot reuse stale content.
     ClipboardClear,
-    /// Kept for compatibility with Ruiss 0.1.0. New senders use an empty ClipboardFiles
-    /// offer, which older releases safely ignore.
-    ClipboardFileOffer {
-        id: String,
-    },
-    /// 剪贴板文件（路径列表）。接收端把这些路径写入本机剪贴板的文件类型
-    /// （Win: CF_HDROP；Mac: NSFilenamesPboardType），用户可直接 Ctrl+V 粘贴文件。
+    /// 剪贴板文件。paths 为空表示"懒传 offer"：只带文件名清单，接收端在剪贴板
+    /// 挂虚拟文件，用户粘贴时才发 ClipboardFileRequest 回源端触发真正的传输。
+    /// paths 非空是旧版/轻量场景（共享盘等）直接携带路径写入剪贴板。
     ClipboardFiles {
         #[serde(default)]
         id: String,
         paths: Vec<String>,
+        /// 懒传 offer 的文件名清单（与 paths 同序）。
+        #[serde(default)]
+        names: Vec<String>,
+    },
+    /// 对端用户真的粘贴了懒传 offer：源端收到后把 offer 对应的文件真正传过去。
+    ClipboardFileRequest {
+        id: String,
     },
     /// 心跳（保活 + 角色仲裁）
     Heartbeat {
         seq: u64,
         #[serde(default)]
         app_version: Option<String>,
-        #[serde(default)]
-        protocol_version: Option<u32>,
     },
     /// 令牌：成为主控（对端进入 Sink），携带对端坐标系入口位置 (x, y)
     /// 及源端屏幕尺寸（对端注入入口时按比例映射）
@@ -282,6 +283,10 @@ mod file_protocol_tests {
             Payload::ClipboardFiles {
                 id: "clipboard".into(),
                 paths: Vec::new(),
+                names: vec!["图片.png".into(), "文档".into()],
+            },
+            Payload::ClipboardFileRequest {
+                id: "clipboard".into(),
             },
             Payload::FileBatchStart {
                 id: "batch".into(),
@@ -328,7 +333,20 @@ mod file_protocol_tests {
             Payload::Heartbeat {
                 seq: 7,
                 app_version: None,
-                protocol_version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn old_clipboard_files_without_names_is_compatible() {
+        let old = r#"{"type":"clipboard_files","id":"c","paths":["/a.txt"]}"#;
+        let decoded: Payload = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            decoded,
+            Payload::ClipboardFiles {
+                id: "c".into(),
+                paths: vec!["/a.txt".into()],
+                names: Vec::new(),
             }
         );
     }

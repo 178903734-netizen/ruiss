@@ -368,7 +368,6 @@ impl Connector {
                     let m = Message::ctrl(&self.name, Payload::Heartbeat {
                         seq,
                         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                        protocol_version: Some(crate::CLIPBOARD_PROTOCOL_VERSION),
                     });
                     if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
                 }

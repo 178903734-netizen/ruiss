@@ -23,8 +23,8 @@ use anyhow::{anyhow, Result};
 use windows::core::{implement, w, Error as WinError, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-    DV_E_FORMATETC, E_NOTIMPL, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED,
-    POINT, POINTL, S_OK, SIZE, WPARAM,
+    DV_E_FORMATETC, E_NOTIMPL, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT,
+    OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetSysColor, ReleaseDC,
@@ -72,9 +72,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DI_NORMAL, HCURSOR, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
     LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNA,
     SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_CLIPBOARDUPDATE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SETCURSOR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -1174,10 +1175,6 @@ use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
 /// the user's next copy when clipboard notifications are delayed or coalesced.
 static LOCAL_CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
-/// Several WM_CLIPBOARDUPDATE messages may describe one logical write. Handle the final
-/// sequence number once so a remote paste cannot become a second outgoing copy task.
-static LAST_HANDLED_CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
 
 fn remember_local_clipboard_sequence() {
     let sequence = unsafe { GetClipboardSequenceNumber() };
@@ -2111,6 +2108,8 @@ pub fn cancel_remote_file_drag(id: &str) {
 
 /// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，
 /// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（按精确 sequence 跳过本机写入）。
+/// 该窗口同时是懒粘贴剪贴板的所有者：SetClipboardData(NULL) 延迟渲染后，
+/// 粘贴时系统向它发 WM_RENDERFORMAT。
 pub fn start_clipboard_watcher(
     cb: Box<dyn Fn(ClipboardContent) + Send + 'static>,
 ) -> ClipboardWatcherHandle {
@@ -2158,6 +2157,7 @@ pub fn start_clipboard_watcher(
                     return;
                 }
             };
+            let _ = WATCHER_HWND.set(hwnd.0 as isize);
             let _ = AddClipboardFormatListener(hwnd);
             let _ = ready_tx.send(());
 
@@ -2191,7 +2191,103 @@ thread_local! {
     static CLIP_CB: RefCell<Option<Box<dyn Fn(ClipboardContent) + Send>>> = const { RefCell::new(None) };
 }
 
-/// 监听窗口过程：WM_CLIPBOARDUPDATE 触发读剪贴板 + 回调。
+/// 剪贴板监听窗口句柄：懒粘贴占位用它当剪贴板所有者（delay-render）。
+static WATCHER_HWND: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// 懒粘贴占位：剪贴板里挂着延迟渲染的 CF_HDROP，粘贴时才真正取文件。
+struct LazyHdrop {
+    id: String,
+    callback: crate::platform::ClipboardPasteCallback,
+}
+
+static PENDING_LAZY_HDROP: Mutex<Option<LazyHdrop>> = Mutex::new(None);
+
+/// 把对端复制的文件挂成剪贴板虚拟文件（懒传）：只写延迟渲染的 CF_HDROP，
+/// 用户粘贴时系统发 WM_RENDERFORMAT，届时才回源端请求传输。
+pub fn set_clipboard_file_promise(
+    id: String,
+    _names: Vec<String>,
+    callback: crate::platform::ClipboardPasteCallback,
+) {
+    *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = Some(LazyHdrop { id, callback });
+    unsafe {
+        let Some(&raw) = WATCHER_HWND.get() else {
+            log::error!("[CLIPBOARD] 剪贴板监听窗口未就绪，无法挂懒粘贴占位");
+            return;
+        };
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
+        if OpenClipboard(hwnd).is_err() {
+            log::error!("[CLIPBOARD] 打开剪贴板失败，无法挂懒粘贴占位");
+            *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return;
+        }
+        let _ = EmptyClipboard();
+        // CF_HDROP 传 NULL 句柄 → 延迟渲染：粘贴时向 WATCHER_HWND 发 WM_RENDERFORMAT
+        let _ = SetClipboardData(CF_HDROP.0 as u32, HANDLE::default());
+        // Preferred DropEffect = COPY，让资源管理器粘贴时光标显示"复制"
+        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, 4) {
+            let ptr = GlobalLock(hmem);
+            if !ptr.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    &1u32.to_le_bytes() as *const u8,
+                    ptr as *mut u8,
+                    4,
+                );
+                let _ = GlobalUnlock(hmem);
+                let _ = SetClipboardData(
+                    RegisterClipboardFormatW(w!("Preferred DropEffect")) as u32,
+                    HANDLE(hmem.0),
+                );
+            }
+        }
+        remember_local_clipboard_sequence();
+        let _ = CloseClipboard();
+    }
+}
+
+/// WM_RENDERFORMAT / WM_RENDERALLFORMATS：真正渲染延迟的 CF_HDROP。
+/// 阻塞等待对端把文件传完（目标应用在此期间等待剪贴板数据）。
+fn render_clipboard_hdrop() {
+    let offer = PENDING_LAZY_HDROP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(offer) = offer else {
+        return;
+    };
+    let ready = crate::platform::new_paste_ready();
+    (offer.callback)(crate::platform::ClipboardPasteEvent::Requested {
+        id: offer.id,
+        ready: ready.clone(),
+    });
+    let paths = match crate::platform::wait_paste_ready(&ready, Duration::from_secs(180)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::error!("[CLIPBOARD] 懒粘贴文件传输失败: {error}");
+            Vec::new()
+        }
+    };
+    unsafe {
+        let Some(&raw) = WATCHER_HWND.get() else {
+            return;
+        };
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
+        // 渲染期间剪贴板可能被其他进程短暂占用，重试几次。
+        for _ in 0..3 {
+            if OpenClipboard(hwnd).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Ok(hmem) = RemoteDragDataObject::hdrop(&paths) {
+            let _ = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0));
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// 监听窗口过程：WM_CLIPBOARDUPDATE 触发读剪贴板 + 回调；
+/// WM_RENDERFORMAT/RENDERALLFORMATS 渲染懒粘贴的 CF_HDROP。
 unsafe extern "system" fn clip_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -2200,11 +2296,6 @@ unsafe extern "system" fn clip_wnd_proc(
 ) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
         let current = GetClipboardSequenceNumber();
-        if current != 0
-            && LAST_HANDLED_CLIPBOARD_SEQUENCE.swap(current, Ordering::AcqRel) == current
-        {
-            return LRESULT(0);
-        }
         if current != 0
             && LOCAL_CLIPBOARD_SEQUENCE
                 .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -2220,6 +2311,15 @@ unsafe extern "system" fn clip_wnd_proc(
                 }
             });
         }
+        return LRESULT(0);
+    }
+    if msg == WM_RENDERFORMAT || msg == WM_RENDERALLFORMATS {
+        render_clipboard_hdrop();
+        return LRESULT(0);
+    }
+    if msg == WM_DESTROYCLIPBOARD {
+        // 剪贴板被其他进程抢占，懒占位随之失效。
+        *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)

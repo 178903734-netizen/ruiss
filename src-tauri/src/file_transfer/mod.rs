@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::core::protocol::{Message, Payload, TransferRoot};
@@ -15,7 +14,6 @@ use crate::platform;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const RESULT_TIMEOUT: Duration = Duration::from_secs(120);
-const LARGE_TRANSFER_NOTICE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct FileSender {
@@ -30,7 +28,8 @@ struct SenderInner {
     cancelled: Mutex<HashSet<String>>,
     retries: Mutex<HashMap<String, Vec<PathBuf>>>,
     pending_drags: Mutex<HashMap<String, Vec<PathBuf>>>,
-    active_clipboard: Mutex<Option<(String, String)>>,
+    /// 懒传剪贴板 offer：粘贴请求到达前路径只存不传。新复制作废旧 offer。
+    pending_offers: Mutex<HashMap<String, Vec<PathBuf>>>,
     gate: Semaphore,
 }
 
@@ -58,7 +57,7 @@ impl FileSender {
                 cancelled: Mutex::new(HashSet::new()),
                 retries: Mutex::new(HashMap::new()),
                 pending_drags: Mutex::new(HashMap::new()),
-                active_clipboard: Mutex::new(None),
+                pending_offers: Mutex::new(HashMap::new()),
                 gate: Semaphore::new(1),
             }),
         }
@@ -68,36 +67,39 @@ impl FileSender {
         self.enqueue_paths(paths, false, None, None)
     }
 
-    pub fn send_clipboard_paths(
-        &self,
-        clipboard_id: String,
-        paths: Vec<PathBuf>,
-    ) -> Result<String, String> {
-        let batch_id = self.enqueue_paths(paths, false, None, Some(clipboard_id.clone()))?;
-        let previous = self
+    /// 本机复制了文件：只登记为懒传 offer，不传输。返回 offer id。
+    pub fn offer_clipboard_paths(&self, paths: Vec<PathBuf>) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut pending = self
             .inner
-            .active_clipboard
+            .pending_offers
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace((clipboard_id, batch_id.clone()));
-        if let Some((_, previous_batch)) = previous {
-            if previous_batch != batch_id {
-                self.cancel(&previous_batch);
-            }
-        }
-        Ok(batch_id)
+            .unwrap_or_else(|e| e.into_inner());
+        // 剪贴板只有"当前"一个值：新复制作废上一个 offer。
+        pending.clear();
+        pending.insert(id.clone(), paths);
+        id
     }
 
-    pub fn cancel_clipboard_transfer(&self) {
-        let previous = self
+    /// 对端粘贴了 offer：开始真正传输。offer 失效则返回错误。
+    pub fn request_clipboard_files(&self, id: &str) -> Result<String, String> {
+        let paths = self
             .inner
-            .active_clipboard
+            .pending_offers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some((_, batch_id)) = previous {
-            self.cancel(&batch_id);
-        }
+            .remove(id)
+            .ok_or_else(|| "剪贴板 offer 已失效".to_string())?;
+        self.enqueue_paths(paths, false, None, Some(id.to_string()))
+    }
+
+    /// 本机剪贴板变成了非文件内容：旧 offer 失效。
+    pub fn clear_pending_offers(&self) {
+        self.inner
+            .pending_offers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn send_drag_session(
@@ -192,7 +194,6 @@ impl FileSender {
         );
         let sender = self.clone();
         let task_id = id.clone();
-        let is_clipboard_copy = clipboard_id.is_some();
         tauri::async_runtime::spawn(async move {
             if let Err(error) = sender
                 .run_batch(
@@ -229,9 +230,6 @@ impl FileSender {
                     Some(error.clone()),
                     None,
                 );
-                if is_clipboard_copy && status == "failed" {
-                    notify_transfer(&sender.inner.app, "Ruiss 文件复制失败", &error);
-                }
             }
             sender
                 .inner
@@ -245,14 +243,6 @@ impl FileSender {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|_, waiter| !waiter.is_closed());
-            let mut active = sender
-                .inner
-                .active_clipboard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if active.as_ref().is_some_and(|(_, id)| id == &task_id) {
-                *active = None;
-            }
         });
         Ok(id)
     }
@@ -340,15 +330,6 @@ impl FileSender {
             .collect::<Vec<_>>()
             .join("、");
         let total_files = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
-        let show_large_notice =
-            clipboard_id.is_some() && plan.total_bytes >= LARGE_TRANSFER_NOTICE_BYTES;
-        if show_large_notice {
-            notify_transfer(
-                &self.inner.app,
-                "Ruiss 正在发送",
-                &format!("{title}（{}）", format_bytes(plan.total_bytes)),
-            );
-        }
 
         let ready = self.register_waiter(&batch_id);
         self.send_payload(Payload::FileBatchStart {
@@ -471,13 +452,6 @@ impl FileSender {
             None,
             None,
         );
-        if show_large_notice {
-            notify_transfer(
-                &self.inner.app,
-                "Ruiss 发送完成",
-                &format!("{title}（{}）", format_bytes(plan.total_bytes)),
-            );
-        }
         self.inner
             .cancelled
             .lock()
@@ -714,6 +688,8 @@ struct ReceiverState {
     batches: HashMap<String, ReceiveBatch>,
     clipboard_revision: Option<String>,
     superseded_clipboards: VecDeque<String>,
+    /// 懒粘贴等待者：粘贴请求的传输结果在此交付给平台回调线程。
+    clipboard_waiters: HashMap<String, platform::PasteReady>,
 }
 
 pub struct FileReceiver {
@@ -788,6 +764,28 @@ impl FileReceiver {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.clipboard_revision.as_deref() == Some(id) {
             state.clipboard_revision = None;
+        }
+    }
+
+    /// 注册懒粘贴等待者：平台层在用户粘贴时调用，然后阻塞等待传输结果。
+    pub fn attach_clipboard_waiter(&self, id: &str, ready: platform::PasteReady) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clipboard_waiters
+            .insert(id.to_string(), ready);
+    }
+
+    /// 交付传输结果给等待中的平台回调线程（无等待者则忽略）。
+    fn complete_clipboard_waiter(&self, id: &str, result: Result<Vec<String>, String>) {
+        let ready = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clipboard_waiters
+            .remove(id);
+        if let Some(ready) = ready {
+            platform::complete_paste_ready(&ready, result);
         }
     }
 
@@ -899,6 +897,10 @@ impl FileReceiver {
     ) -> Result<(), String> {
         if let Some(clipboard_id) = &clipboard_id {
             if !self.begin_clipboard_revision(clipboard_id) {
+                self.complete_clipboard_waiter(
+                    clipboard_id,
+                    Err("剪贴板复制已被更新的内容取代".to_string()),
+                );
                 return Err("clipboard copy was superseded".into());
             }
         }
@@ -996,23 +998,16 @@ impl FileReceiver {
                 .batches
                 .remove(id);
             if let Some(batch) = batch {
+                if let Some(clipboard_id) = &batch.clipboard_id {
+                    self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
+                }
                 cleanup_paths(&batch.root_paths);
                 if let Some(stage) = &batch.drag_stage_dir {
                     let _ = std::fs::remove_dir_all(stage);
                 }
             }
-            if bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-                notify_transfer(&self.app, "Ruiss 传输失败", &format!("{title}：{error}"));
-            }
             Err(error)
         } else {
-            if bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-                notify_transfer(
-                    &self.app,
-                    "Ruiss 正在接收",
-                    &format!("{title}（{}）", format_bytes(bytes)),
-                );
-            }
             Ok(())
         }
     }
@@ -1192,16 +1187,12 @@ impl FileReceiver {
                 Some(error.clone()),
                 None,
             );
+            if let Some(clipboard_id) = &batch.clipboard_id {
+                self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
+            }
             cleanup_paths(&batch.root_paths);
             if let Some(stage) = &batch.drag_stage_dir {
                 let _ = std::fs::remove_dir_all(stage);
-            }
-            if batch.total_bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-                notify_transfer(
-                    &self.app,
-                    "Ruiss 传输失败",
-                    &format!("{}：{error}", batch.title),
-                );
             }
             return (result, drop_at_cursor);
         }
@@ -1221,14 +1212,8 @@ impl FileReceiver {
                     Some(error.clone()),
                     None,
                 );
+                self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
                 cleanup_paths(&batch.root_paths);
-                if batch.total_bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-                    notify_transfer(
-                        &self.app,
-                        "Ruiss 传输已取消",
-                        &format!("{}：{error}", batch.title),
-                    );
-                }
                 return (Err(error), drop_at_cursor);
             }
         }
@@ -1239,8 +1224,21 @@ impl FileReceiver {
             .collect::<Vec<_>>();
         if let Some(drag_id) = &batch.drag_id {
             platform::complete_remote_file_drag(drag_id, &paths, None);
-        } else if batch.clipboard_id.is_some() {
-            platform::clipboard_write_files(&paths);
+        } else if let Some(clipboard_id) = &batch.clipboard_id {
+            // 懒传：有人粘贴了才传输，文件直接交给等待中的平台回调
+            // （WM_RENDERFORMAT / promise_write），不写剪贴板。
+            let ready = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clipboard_waiters
+                .remove(clipboard_id);
+            if let Some(ready) = ready {
+                platform::complete_paste_ready(&ready, Ok(paths.clone()));
+            } else {
+                // 旧版对端 eager 直传（无粘贴等待者）：维持写剪贴板。
+                platform::clipboard_write_files(&paths);
+            }
         } else {
             platform::clipboard_write_files(&paths);
         }
@@ -1269,22 +1267,6 @@ impl FileReceiver {
                 "paths": paths,
             }),
         );
-        if batch.total_bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-            let completion = if batch.drag_id.is_some() {
-                format!(
-                    "{}（{}）拖放内容已准备完成",
-                    batch.title,
-                    format_bytes(batch.total_bytes)
-                )
-            } else {
-                format!(
-                    "{}（{}）现在可以粘贴",
-                    batch.title,
-                    format_bytes(batch.total_bytes)
-                )
-            };
-            notify_transfer(&self.app, "Ruiss 接收完成", &completion);
-        }
         if let Some(stage) = batch.drag_stage_dir {
             std::thread::spawn(move || {
                 // The OS drop target may still be copying a very large staged file
@@ -1388,6 +1370,13 @@ impl FileReceiver {
                 let _ = std::fs::remove_file(file.temp_path);
             }
         }
+        let waiter = {
+            let clipboard_id = state
+                .batches
+                .get(id)
+                .and_then(|batch| batch.clipboard_id.clone());
+            clipboard_id.and_then(|clipboard_id| state.clipboard_waiters.remove(&clipboard_id))
+        };
         if let Some(batch) = state.batches.remove(id) {
             if let Some(drag_id) = &batch.drag_id {
                 platform::complete_remote_file_drag(drag_id, &[], Some(reason.to_string()));
@@ -1409,13 +1398,10 @@ impl FileReceiver {
             if let Some(stage) = &batch.drag_stage_dir {
                 let _ = std::fs::remove_dir_all(stage);
             }
-            if batch.total_bytes >= LARGE_TRANSFER_NOTICE_BYTES {
-                notify_transfer(
-                    &self.app,
-                    "Ruiss 传输已取消",
-                    &format!("{}：{reason}", batch.title),
-                );
-            }
+        }
+        drop(state);
+        if let Some(waiter) = waiter {
+            platform::complete_paste_ready(&waiter, Err(reason.to_string()));
         }
     }
 
@@ -1536,22 +1522,6 @@ fn remember_superseded(revisions: &mut VecDeque<String>, id: String) {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", bytes as f64 / GIB)
-    } else {
-        format!("{:.1} MB", bytes as f64 / MIB)
-    }
-}
-
-fn notify_transfer(app: &AppHandle, title: &str, body: &str) {
-    if let Err(error) = app.notification().builder().title(title).body(body).show() {
-        log::warn!("[FILE] unable to show system notification: {error}");
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_update(
     app: &AppHandle,
@@ -1637,11 +1607,5 @@ mod tests {
         assert_eq!(revisions.len(), 64);
         assert_eq!(revisions.back().map(String::as_str), Some("revision-69"));
         assert!(!revisions.iter().any(|id| id == "old"));
-    }
-
-    #[test]
-    fn transfer_size_format_is_human_readable() {
-        assert_eq!(format_bytes(20 * 1024 * 1024), "20.0 MB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 }

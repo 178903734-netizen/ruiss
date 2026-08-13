@@ -1354,11 +1354,22 @@ extern "C" fn promise_write(
         let Some(id) = ns_utf8_string(id_obj) else {
             return;
         };
+        let name_obj = *this.get_ivar::<*mut Object>("fileName");
+        let file_name = ns_utf8_string(name_obj);
         let destination_path: *mut Object = msg_send![destination, path];
         let Some(destination_path) = ns_utf8_string(destination_path) else {
             return;
         };
-        remote_drag_callback(&id, super::RemoteFileDragEvent::DataRequested(id.clone()));
+        // 区分来源：跨屏拖拽会话（REMOTE_DRAG_CALLBACKS 里有 id）走既有
+        // DataRequested/结果轮询；懒粘贴剪贴板走 CLIP_PASTE_CB + PasteReady。
+        let is_drag = REMOTE_DRAG_CALLBACKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&id);
+        if is_drag {
+            remote_drag_callback(&id, super::RemoteFileDragEvent::DataRequested(id.clone()));
+        }
         let completion = block::RcBlock::<(*mut Object,), ()>::copy(
             completion as *mut block::Block<(*mut Object,), ()>,
         );
@@ -1369,37 +1380,41 @@ extern "C" fn promise_write(
             let completion = unsafe {
                 Box::from_raw(completion_raw as *mut block::RcBlock<(*mut Object,), ()>)
             };
-            let result = loop {
-                if let Some(result) = REMOTE_DRAG_RESULTS
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id)
-                {
-                    break result;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            };
-            let result = result.and_then(|paths| {
-                let destination = std::path::PathBuf::from(destination_path);
-                let destination_dir = destination
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or(destination);
-                for source in paths {
-                    let source = std::path::PathBuf::from(source);
-                    let name = source
-                        .file_name()
-                        .ok_or_else(|| "remote drag has an invalid file name".to_string())?;
-                    let target = destination_dir.join(name);
-                    if source.is_dir() {
-                        copy_directory_tree(&source, &target)?;
-                    } else {
-                        std::fs::copy(&source, &target).map_err(|e| e.to_string())?;
+            let result = if is_drag {
+                let result = loop {
+                    if let Some(result) = REMOTE_DRAG_RESULTS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id)
+                    {
+                        break result;
                     }
-                }
-                Ok(())
-            });
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                result.and_then(|paths| {
+                    let destination = std::path::PathBuf::from(&destination_path);
+                    let destination_dir = destination
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or(destination);
+                    for source in paths {
+                        let source = std::path::PathBuf::from(source);
+                        let name = source
+                            .file_name()
+                            .ok_or_else(|| "remote drag has an invalid file name".to_string())?;
+                        let target = destination_dir.join(name);
+                        if source.is_dir() {
+                            copy_directory_tree(&source, &target)?;
+                        } else {
+                            std::fs::copy(&source, &target).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    Ok(())
+                })
+            } else {
+                copy_promised_file(&id, file_name, &destination_path)
+            };
             unsafe { completion.call((std::ptr::null_mut(),)); }
             if let Err(error) = result {
                 log::error!("[DRAG] macOS file promise failed: {error}");
@@ -1752,6 +1767,126 @@ pub fn clipboard_write_files(paths: &[String]) {
         let _: bool = msg_send![pb, writeObjects: arr];
         remember_local_clipboard_change(pb);
     }
+}
+
+/// 懒粘贴剪贴板回调：粘贴时 promise_write 用它请求源端传输。
+static CLIP_PASTE_CB: OnceLock<Mutex<Option<crate::platform::ClipboardPasteCallback>>> =
+    OnceLock::new();
+/// offer id → 已下载的本地路径缓存。同一 offer 的多个文件 promise 或重复粘贴
+/// 只触发一次传输，其余从缓存 copy。
+static CLIP_PASTE_CACHE: OnceLock<Mutex<HashMap<String, Result<Vec<String>, String>>>> =
+    OnceLock::new();
+
+/// 把对端复制的文件挂成剪贴板虚拟文件（懒传）：剪贴板写入 NSFilePromiseProvider，
+/// 用户粘贴时系统回调 promise_write，届时才回源端请求传输。
+pub fn set_clipboard_file_promise(
+    id: String,
+    names: Vec<String>,
+    callback: crate::platform::ClipboardPasteCallback,
+) {
+    unsafe {
+        // 新 offer 覆盖旧占位与旧下载缓存。
+        CLIP_PASTE_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let cb_slot = CLIP_PASTE_CB.get_or_init(Default::default);
+        *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+        let pb = general_pasteboard();
+        if pb.is_null() {
+            return;
+        }
+        let _: () = msg_send![pb, clearContents];
+        let mut items: Vec<*mut Object> = Vec::with_capacity(names.len());
+        for name in &names {
+            let id_ns = string_to_nsstring(&id);
+            let name_ns = string_to_nsstring(name);
+            let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
+            (*delegate).set_ivar("dragId", id_ns);
+            (*delegate).set_ivar("fileName", name_ns);
+            let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
+            let provider: *mut Object = msg_send![
+                provider,
+                initWithFileType: string_to_nsstring("public.data")
+                delegate: delegate
+            ];
+            items.push(provider);
+        }
+        let arr: *mut Object = msg_send![
+            class!(NSArray),
+            arrayWithObjects: items.as_ptr()
+            count: items.len()
+        ];
+        let _: bool = msg_send![pb, writeObjects: arr];
+        remember_local_clipboard_change(pb);
+    }
+}
+
+/// 懒粘贴：取（或请求）offer 对应的本地文件，把本 promise 对应的那一个
+/// copy 进粘贴目标目录。
+fn copy_promised_file(
+    id: &str,
+    file_name: Option<String>,
+    destination_path: &str,
+) -> Result<(), String> {
+    let cache = CLIP_PASTE_CACHE.get_or_init(Default::default);
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned();
+    let paths = match cached {
+        Some(result) => result?,
+        None => {
+            let paste_cb = CLIP_PASTE_CB
+                .get()
+                .and_then(|slot| {
+                    slot.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .ok_or_else(|| "剪贴板懒粘贴 offer 不存在".to_string())?;
+            let ready = crate::platform::new_paste_ready();
+            paste_cb(crate::platform::ClipboardPasteEvent::Requested {
+                id: id.to_string(),
+                ready: ready.clone(),
+            });
+            let result = crate::platform::wait_paste_ready(&ready, Duration::from_secs(180));
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), result.clone());
+            result?
+        }
+    };
+    let destination = std::path::PathBuf::from(destination_path);
+    let destination_dir = destination
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(destination);
+    for source in paths {
+        let source_path = std::path::PathBuf::from(source);
+        let Some(source_name) = source_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        // 多文件 offer 时每个 promise 只 copy 自己对应的那个文件。
+        if let Some(expected) = &file_name {
+            if source_name != *expected {
+                continue;
+            }
+        }
+        let target = destination_dir.join(&source_name);
+        if source_path.is_dir() {
+            copy_directory_tree(&source_path, &target)?;
+        } else {
+            std::fs::copy(&source_path, &target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// 鼠标左键是否按下（拖拽跨屏检测用）。NSEvent pressedMouseButtons 位掩码 bit0=左键。

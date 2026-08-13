@@ -173,15 +173,14 @@
     const el = $('netStatus');
     const version = $('versionStatus');
     const peerVersion = s.peerVersion || '未知';
-    const peerProtocol = s.peerProtocolVersion ?? '未知';
     version.classList.remove('synced', 'mismatch');
     if (!s.connected) {
-      version.textContent = `版本：本机 v${s.localVersion} / 协议 ${s.localProtocolVersion} · 对端未连接`;
+      version.textContent = `版本：本机 v${s.localVersion} · 对端未连接`;
     } else if (s.versionsMatch) {
-      version.textContent = `版本：本机 v${s.localVersion} / 对端 v${peerVersion} · 协议 ${s.localProtocolVersion} · 已同步`;
+      version.textContent = `版本：本机 v${s.localVersion} / 对端 v${peerVersion} · 已同步`;
       version.classList.add('synced');
     } else {
-      version.textContent = `版本不一致：本机 v${s.localVersion} / 协议 ${s.localProtocolVersion} · 对端 v${peerVersion} / 协议 ${peerProtocol}`;
+      version.textContent = `版本不一致：本机 v${s.localVersion} · 对端 v${peerVersion}`;
       version.classList.add('mismatch');
     }
     if (!s.captureOk) {
