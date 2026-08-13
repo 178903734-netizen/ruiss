@@ -1525,12 +1525,15 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let paths = data.and_then(read_data_object_files).unwrap_or_default();
+        let has_paths = !paths.is_empty();
+        *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
+            has_paths.then(|| (Instant::now(), paths));
+        // The edge window is a hand-off target, not an error target. Returning NONE here
+        // makes Explorer replace the normal file drag cursor with the prohibited cursor
+        // during the 150 ms crossover dwell. Advertise COPY while a real CF_HDROP payload
+        // is present; Ruiss still cancels the source OLE session before any local Drop.
         unsafe {
-            *effect = DROPEFFECT_NONE;
-        }
-        if !paths.is_empty() {
-            *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some((Instant::now(), paths));
+            *effect = edge_probe_effect(has_paths);
         }
         Ok(())
     }
@@ -1543,18 +1546,25 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
     ) -> windows::core::Result<()> {
         // 光标停在探针上时持续刷新记录时间戳：用户在边缘犹豫/来回微移时，
         // 路径不因有效期窗口而过期（跨屏触发那一刻才采样）。
-        if let Ok(mut pending) = PENDING_DRAG_PATHS.lock() {
+        let has_paths = if let Ok(mut pending) = PENDING_DRAG_PATHS.lock() {
             if let Some(entry) = pending.as_mut() {
                 entry.0 = Instant::now();
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         unsafe {
-            *effect = DROPEFFECT_NONE;
+            *effect = edge_probe_effect(has_paths);
         }
         Ok(())
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        // Do not let a later ordinary left-button crossover reuse an earlier drag's paths.
+        *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
     }
 
@@ -1569,6 +1579,14 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
             *effect = DROPEFFECT_NONE;
         }
         Ok(())
+    }
+}
+
+fn edge_probe_effect(has_file_paths: bool) -> DROPEFFECT {
+    if has_file_paths {
+        DROPEFFECT_COPY
+    } else {
+        DROPEFFECT_NONE
     }
 }
 
@@ -2204,5 +2222,11 @@ mod tests {
         assert_eq!(xbutton_id_from_mouse_data(1 << 16), Some(3));
         assert_eq!(xbutton_id_from_mouse_data(2 << 16), Some(4));
         assert_eq!(xbutton_id_from_mouse_data(0), None);
+    }
+
+    #[test]
+    fn edge_probe_advertises_copy_only_for_captured_files() {
+        assert_eq!(edge_probe_effect(true), DROPEFFECT_COPY);
+        assert_eq!(edge_probe_effect(false), DROPEFFECT_NONE);
     }
 }
