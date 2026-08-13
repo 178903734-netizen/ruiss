@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-08-13 — 修复打包产物输出位置：固定到 D:/ruiss-target
+
+- **现象**：每次 `cargo build` 产物都跑到 `src-tauri/target`，而不是预期的 `D:/ruiss-target/debug`。
+- **根因**：`scripts/set-ruiss-env.ps1` 虽写了 `CARGO_TARGET_DIR=D:\ruiss-target`，但该脚本未成功执行过
+  （用户级环境变量为空），cargo 找不到该变量便退回默认目录 `src-tauri/target`。
+- **修复**：打包命令显式指定 `env CARGO_TARGET_DIR=D:/ruiss-target cargo build`，不再依赖环境变量。
+  已在 PROJECT.md「常用命令 → 打包」段落固化该用法。
+- 验证：`env CARGO_TARGET_DIR=D:/ruiss-target cargo build` 成功，产物 `D:/ruiss-target/debug/ruiss.exe`
+  （21:37 生成）；`src-tauri/target/debug/ruiss.exe` 不存在（确认未跑错位置）。
+
 ## 2026-08-13 — 远程拖拽带系统图标拖影 + 拖拽启动时序优化（Windows）；同步 mac 编译修复
 
 - **拖拽图标拖影（win.rs，新增 attach_drag_image）**：用

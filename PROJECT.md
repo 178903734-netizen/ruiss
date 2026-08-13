@@ -127,8 +127,13 @@ cargo run --manifest-path src-tauri/Cargo.toml
 # 编译检查
 cargo check --manifest-path src-tauri/Cargo.toml
 
-# 打包（M3 里程碑再做）
-cargo tauri build --manifest-path src-tauri/Cargo.toml
+# 打包（Windows 产物固定输出到 D:/ruiss-target）
+# 注意：必须显式指定 CARGO_TARGET_DIR=D:/ruiss-target（不要依赖环境变量，
+# 它当前未生效——scripts/set-ruiss-env.ps1 未成功执行过，否则会退回默认
+# src-tauri/target，造成"每次都打包到别处"）
+cd src-tauri
+env CARGO_TARGET_DIR=D:/ruiss-target cargo build          # debug → D:/ruiss-target/debug/ruiss.exe
+# env CARGO_TARGET_DIR=D:/ruiss-target cargo build --release # release → D:/ruiss-target/release/ruiss.exe
 ```
 
 ## 当前进度
