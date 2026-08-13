@@ -34,6 +34,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             setup_tray(app)?;
             // 启动兜底：恢复上次可能残留的光标状态（Ruiss 被强杀后光标计数可能仍为负）
@@ -602,11 +603,20 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                         platform::ClipboardContent::Text(t) => {
                             net.send(Message::clipboard(
                                 &name,
-                                Payload::ClipboardText { text: t },
+                                Payload::ClipboardText {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    text: t,
+                                },
                             ));
                         }
                         platform::ClipboardContent::Image(png) => {
-                            net.send(Message::clipboard(&name, Payload::ClipboardImage { png }));
+                            net.send(Message::clipboard(
+                                &name,
+                                Payload::ClipboardImage {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    png,
+                                },
+                            ));
                         }
                         platform::ClipboardContent::Files(_) => {}
                         platform::ClipboardContent::Empty => {}
@@ -914,8 +924,20 @@ async fn run_incoming_router(
             Payload::ClipboardText { .. }
             | Payload::ClipboardImage { .. }
             | Payload::ClipboardClear
+            | Payload::ClipboardFileOffer { .. }
             | Payload::ClipboardFiles { .. } => {
-                clipboard::handle_remote(&msg.payload);
+                let (receiver, sender) = {
+                    let r = router.lock().unwrap_or_else(|e| e.into_inner());
+                    (r.file_receiver.clone(), r.file_sender.clone())
+                };
+                // A newer clipboard value from the peer also cancels an older file-copy
+                // stream originating on this machine, avoiding wasted large transfers.
+                if let Some(sender) = sender {
+                    sender.cancel_clipboard_transfer();
+                }
+                if let Some(receiver) = receiver {
+                    clipboard::handle_remote(&msg.payload, &receiver);
+                }
             }
             Payload::DragOffer {
                 drag,
@@ -1089,7 +1111,16 @@ async fn apply_link_config(
         r.file_sender = Some(file_sender.clone());
         // 剪贴板同步：监听本机剪贴板变化发对端，剪贴板开关关闭时不启动
         if clip_enabled {
-            let clip = clipboard::ClipboardSync::start(name.clone(), handle.clone());
+            let receiver = r
+                .file_receiver
+                .clone()
+                .expect("file receiver must exist before clipboard sync");
+            let clip = clipboard::ClipboardSync::start(
+                name.clone(),
+                handle.clone(),
+                file_sender.clone(),
+                receiver,
+            );
             r.clipboard = Some(clip);
         }
     }

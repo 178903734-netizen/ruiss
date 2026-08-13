@@ -93,18 +93,29 @@ pub enum Payload {
     },
     /// 剪贴板文本
     ClipboardText {
+        #[serde(default)]
+        id: String,
         text: String,
     },
     /// 剪贴板图片（PNG 字节）
     ClipboardImage {
+        #[serde(default)]
+        id: String,
         png: Vec<u8>,
     },
     /// Source clipboard changed to content that is not yet available lazily on the peer.
     /// Invalidate the previous synchronized value so paste cannot reuse stale content.
     ClipboardClear,
+    /// A file/folder copy started. Clear stale peer data and make this revision current
+    /// until its verified FileBatch finishes.
+    ClipboardFileOffer {
+        id: String,
+    },
     /// 剪贴板文件（路径列表）。接收端把这些路径写入本机剪贴板的文件类型
     /// （Win: CF_HDROP；Mac: NSFilenamesPboardType），用户可直接 Ctrl+V 粘贴文件。
     ClipboardFiles {
+        #[serde(default)]
+        id: String,
         paths: Vec<String>,
     },
     /// 心跳（保活 + 角色仲裁）
@@ -144,6 +155,9 @@ pub enum Payload {
         /// payload for the OS drag provider instead of pasting it into the active app.
         #[serde(default)]
         drag_id: Option<String>,
+        /// Clipboard copy revision. Only the newest revision may own the target clipboard.
+        #[serde(default)]
+        clipboard_id: Option<String>,
     },
     FileBatchReady {
         id: String,
@@ -261,7 +275,9 @@ mod file_protocol_tests {
     #[test]
     fn file_batch_messages_round_trip_json() {
         let messages = [
-            Payload::ClipboardClear,
+            Payload::ClipboardFileOffer {
+                id: "clipboard".into(),
+            },
             Payload::FileBatchStart {
                 id: "batch".into(),
                 roots: vec![TransferRoot {
@@ -272,6 +288,7 @@ mod file_protocol_tests {
                 total_bytes: 5,
                 drop_at_cursor: false,
                 drag_id: None,
+                clipboard_id: Some("clipboard".into()),
             },
             Payload::FileStart {
                 id: "file".into(),

@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 arboard = "3"
 # M3：文件传输下载目录 + 文件选择对话框
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 # M3：剪贴板图片 PNG 编解码 + 文件传输下载目录
 png = "0.17"
 dirs = "5"

@@ -16,8 +16,11 @@
 // 注意：剪贴板读写都在平台层，本模块只做协调，不直接碰 arboard/Win32。
 
 use crate::core::protocol::{Message, Payload};
+use crate::file_transfer::{FileReceiver, FileSender};
 use crate::net::NetHandle;
 use crate::platform::{self, ClipboardContent, ClipboardWatcherHandle};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 剪贴板同步器。Drop 时停止监听。
 pub struct ClipboardSync {
@@ -28,28 +31,54 @@ impl ClipboardSync {
     /// 启动剪贴板同步。
     /// - name：本机名（消息 from 字段）
     /// - net：网络发送句柄
-    pub fn start(name: String, net: NetHandle) -> Self {
+    pub fn start(
+        name: String,
+        net: NetHandle,
+        file_sender: FileSender,
+        file_receiver: Arc<FileReceiver>,
+    ) -> Self {
         let net_cb = net.clone();
         let name_cb = name.clone();
         let watcher = platform::start_clipboard_watcher(Box::new(move |content| {
+            // A physical copy on this machine wins over an unfinished incoming copy.
+            file_receiver.invalidate_clipboard_revision();
+            file_sender.cancel_clipboard_transfer();
             match content {
                 ClipboardContent::Text(text) => {
                     if !text.is_empty() {
-                        net_cb.send(Message::clipboard(&name_cb, Payload::ClipboardText { text }));
+                        let id = uuid::Uuid::new_v4().to_string();
+                        net_cb.send_ctrl(Message::clipboard(
+                            &name_cb,
+                            Payload::ClipboardText { id, text },
+                        ));
                     }
                 }
                 ClipboardContent::Image(png) => {
                     if !png.is_empty() {
-                        net_cb.send(Message::clipboard(&name_cb, Payload::ClipboardImage { png }));
+                        let id = uuid::Uuid::new_v4().to_string();
+                        net_cb.send_ctrl(Message::clipboard(
+                            &name_cb,
+                            Payload::ClipboardImage { id, png },
+                        ));
                     }
                 }
-                ClipboardContent::Files(_) => {
-                    // A file copy is only an offer, not permission to transfer its bytes.
-                    // Proper cross-machine file paste needs a lazy virtual-file provider so
-                    // transmission starts when the peer actually pastes. Until that provider
-                    // exists, ignore file clipboard changes instead of downloading immediately.
-                    net_cb.send(Message::clipboard(&name_cb, Payload::ClipboardClear));
-                    log::debug!("[CLIPBOARD] 文件复制不自动传输，已让对端废弃旧剪贴板");
+                ClipboardContent::Files(paths) => {
+                    let paths = paths
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .filter(|path| path.exists())
+                        .collect::<Vec<_>>();
+                    if paths.is_empty() {
+                        return;
+                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    net_cb.send_ctrl(Message::clipboard(
+                        &name_cb,
+                        Payload::ClipboardFileOffer { id: id.clone() },
+                    ));
+                    if let Err(error) = file_sender.send_clipboard_paths(id, paths) {
+                        log::error!("[CLIPBOARD] unable to start file copy: {error}");
+                    }
                 }
                 ClipboardContent::Empty => {}
             }
@@ -60,20 +89,39 @@ impl ClipboardSync {
 
 /// 处理对端发来的剪贴板消息（文字/图片），写入本机剪贴板。
 /// 文件传输消息（FileStart/Chunk/End）不经过这里，由 file_transfer 模块处理。
-pub fn handle_remote(payload: &Payload) {
+pub fn handle_remote(payload: &Payload, file_receiver: &FileReceiver) {
     match payload {
-        Payload::ClipboardText { text } => {
-            platform::clipboard_write_text(text);
+        Payload::ClipboardText { id, text } => {
+            if id.is_empty() {
+                file_receiver.invalidate_clipboard_revision();
+                platform::clipboard_write_text(text);
+            } else if file_receiver.begin_clipboard_revision(id) {
+                platform::clipboard_write_text(text);
+            }
         }
-        Payload::ClipboardImage { png } => {
-            platform::clipboard_write_image(png);
+        Payload::ClipboardImage { id, png } => {
+            if id.is_empty() {
+                file_receiver.invalidate_clipboard_revision();
+                platform::clipboard_write_image(png);
+            } else if file_receiver.begin_clipboard_revision(id) {
+                platform::clipboard_write_image(png);
+            }
+        }
+        Payload::ClipboardFileOffer { id } => {
+            if file_receiver.begin_clipboard_revision(id) {
+                platform::clipboard_clear();
+            }
         }
         Payload::ClipboardClear => {
+            file_receiver.invalidate_clipboard_revision();
             platform::clipboard_clear();
         }
-        Payload::ClipboardFiles { paths } => {
+        Payload::ClipboardFiles { id, paths } => {
             // 轻量场景：对端只发路径（共享盘/同机双实例）。写入本机剪贴板文件列表。
-            if !paths.is_empty() {
+            if !paths.is_empty() && (id.is_empty() || file_receiver.begin_clipboard_revision(id)) {
+                if id.is_empty() {
+                    file_receiver.invalidate_clipboard_revision();
+                }
                 platform::clipboard_write_files(paths);
             }
         }
