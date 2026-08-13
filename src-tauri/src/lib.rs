@@ -913,6 +913,7 @@ async fn run_incoming_router(
             }
             Payload::ClipboardText { .. }
             | Payload::ClipboardImage { .. }
+            | Payload::ClipboardClear
             | Payload::ClipboardFiles { .. } => {
                 clipboard::handle_remote(&msg.payload);
             }

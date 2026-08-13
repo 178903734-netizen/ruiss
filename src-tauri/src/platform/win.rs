@@ -35,8 +35,9 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
-    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -1169,8 +1170,15 @@ pub fn warp_cursor_cross(_x: i32, _y: i32) {}
 
 use crate::platform::{ClipboardContent, ClipboardWatcherHandle};
 
-/// 本机写入标志：本机主动写剪贴板时置 true，监听器见此标志跳过本次变化（防回环）。
-static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
+/// Exact Windows clipboard revision produced by Ruiss. A boolean can accidentally suppress
+/// the user's next copy when clipboard notifications are delayed or coalesced.
+static LOCAL_CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn remember_local_clipboard_sequence() {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    LOCAL_CLIPBOARD_SEQUENCE.store(sequence, Ordering::Release);
+}
 
 /// 读当前剪贴板内容（优先级 files > image > text）。读不出返回 Empty。
 pub fn clipboard_read() -> ClipboardContent {
@@ -1345,10 +1353,8 @@ fn dib_bytes_to_png(data: &[u8]) -> Option<Vec<u8>> {
 
 /// 写文本到剪贴板。
 pub fn clipboard_write_text(text: &str) {
-    LOCAL_WRITE.store(true, Ordering::Relaxed);
     unsafe {
         if OpenClipboard(None).is_err() {
-            LOCAL_WRITE.store(false, Ordering::Relaxed);
             return;
         }
         let _ = EmptyClipboard();
@@ -1366,16 +1372,15 @@ pub fn clipboard_write_text(text: &str) {
                 );
             }
         }
+        remember_local_clipboard_sequence();
         let _ = CloseClipboard();
     }
 }
 
 /// 写 PNG 图片到剪贴板（写入 CF_DIB + CF_PNG，兼容性最好）。
 pub fn clipboard_write_image(png_bytes: &[u8]) {
-    LOCAL_WRITE.store(true, Ordering::Relaxed);
     unsafe {
         if OpenClipboard(None).is_err() {
-            LOCAL_WRITE.store(false, Ordering::Relaxed);
             return;
         }
         let _ = EmptyClipboard();
@@ -1409,6 +1414,18 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
                 }
             }
         }
+        remember_local_clipboard_sequence();
+        let _ = CloseClipboard();
+    }
+}
+
+pub fn clipboard_clear() {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        remember_local_clipboard_sequence();
         let _ = CloseClipboard();
     }
 }
@@ -1471,10 +1488,8 @@ pub fn clipboard_write_files(paths: &[String]) {
     let dropfiles_size = 20usize; // sizeof(DROPFILES) = 20
     let total = dropfiles_size + payload.len() * 2;
 
-    LOCAL_WRITE.store(true, Ordering::Relaxed);
     unsafe {
         if OpenClipboard(None).is_err() {
-            LOCAL_WRITE.store(false, Ordering::Relaxed);
             return;
         }
         let _ = EmptyClipboard();
@@ -1497,6 +1512,7 @@ pub fn clipboard_write_files(paths: &[String]) {
                 );
             }
         }
+        remember_local_clipboard_sequence();
         let _ = CloseClipboard();
     }
 }
@@ -2090,7 +2106,7 @@ pub fn cancel_remote_file_drag(id: &str) {
 }
 
 /// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，
-/// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（本机写入触发的变化跳过防回环）。
+/// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（按精确 sequence 跳过本机写入）。
 pub fn start_clipboard_watcher(
     cb: Box<dyn Fn(ClipboardContent) + Send + 'static>,
 ) -> ClipboardWatcherHandle {
@@ -2179,10 +2195,11 @@ unsafe extern "system" fn clip_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
-        // 本机写入触发的变化跳过（防回环）
-        if LOCAL_WRITE
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+        let current = GetClipboardSequenceNumber();
+        if current != 0
+            && LOCAL_CLIPBOARD_SEQUENCE
+                .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
             return LRESULT(0);
         }

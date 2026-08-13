@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -1292,8 +1292,14 @@ use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::{class, msg_send};
 
-/// 本机写入标志：本机主动写剪贴板时置 true，监听器跳过本次变化（防回环）。
-static LOCAL_WRITE: AtomicBool = AtomicBool::new(false);
+/// Exact NSPasteboard revision produced by Ruiss. A boolean can remain set until after the
+/// user's next copy and suppress that real clipboard change.
+static LOCAL_CLIPBOARD_CHANGE: AtomicIsize = AtomicIsize::new(-1);
+
+unsafe fn remember_local_clipboard_change(pb: *mut Object) {
+    let change: isize = msg_send![pb, changeCount];
+    LOCAL_CLIPBOARD_CHANGE.store(change, Ordering::Release);
+}
 static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
 static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 type RemoteDragCallback = std::sync::Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>;
@@ -1653,19 +1659,18 @@ unsafe fn read_files(pb: *mut Object) -> Option<Vec<String>> {
 
 /// 写文本到剪贴板。
 pub fn clipboard_write_text(text: &str) {
-    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
         let nsstr = string_to_nsstring(text);
         let t = ns_type("public.utf8-plain-text");
         let _: () = msg_send![pb, setString: nsstr forType: t];
+        remember_local_clipboard_change(pb);
     }
 }
 
 /// 写 PNG 图片到剪贴板（同时写 PNG 和 TIFF 类型，兼容性最好）。
 pub fn clipboard_write_image(png_bytes: &[u8]) {
-    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
@@ -1686,6 +1691,18 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             ];
             let _: () = msg_send![pb, setData: tdata forType: t2];
         }
+        remember_local_clipboard_change(pb);
+    }
+}
+
+pub fn clipboard_clear() {
+    unsafe {
+        let pb = general_pasteboard();
+        if pb.is_null() {
+            return;
+        }
+        let _: () = msg_send![pb, clearContents];
+        remember_local_clipboard_change(pb);
     }
 }
 
@@ -1713,7 +1730,6 @@ pub fn clipboard_write_files(paths: &[String]) {
     if paths.is_empty() {
         return;
     }
-    LOCAL_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
@@ -1734,6 +1750,7 @@ pub fn clipboard_write_files(paths: &[String]) {
             count: n
         ];
         let _: bool = msg_send![pb, writeObjects: arr];
+        remember_local_clipboard_change(pb);
     }
 }
 
@@ -1997,14 +2014,8 @@ pub fn start_clipboard_watcher(
                 continue;
             }
             last = cur;
-            // 本机写入触发跳过（防回环）
-            if LOCAL_WRITE
-                .compare_exchange(
-                    true,
-                    false,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
+            if LOCAL_CLIPBOARD_CHANGE
+                .compare_exchange(cur, -1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 continue;

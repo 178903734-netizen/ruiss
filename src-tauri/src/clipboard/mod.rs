@@ -10,7 +10,7 @@
 //      （文件传输只由手动发送或原生拖放提交触发）
 //
 // 防回环：
-//   - 本机写入时 platform 层置 LOCAL_WRITE 标志，监听器跳过本次变化
+//   - platform 层记录本机写入后的精确剪贴板版本，只跳过该版本
 //   - 双重保险：对端消息携带 from，与本地 name 比对（lib.rs 路由层已过滤）
 //
 // 注意：剪贴板读写都在平台层，本模块只做协调，不直接碰 arboard/Win32。
@@ -48,7 +48,8 @@ impl ClipboardSync {
                     // Proper cross-machine file paste needs a lazy virtual-file provider so
                     // transmission starts when the peer actually pastes. Until that provider
                     // exists, ignore file clipboard changes instead of downloading immediately.
-                    log::debug!("[CLIPBOARD] 文件复制已记录但不自动传输");
+                    net_cb.send(Message::clipboard(&name_cb, Payload::ClipboardClear));
+                    log::debug!("[CLIPBOARD] 文件复制不自动传输，已让对端废弃旧剪贴板");
                 }
                 ClipboardContent::Empty => {}
             }
@@ -66,6 +67,9 @@ pub fn handle_remote(payload: &Payload) {
         }
         Payload::ClipboardImage { png } => {
             platform::clipboard_write_image(png);
+        }
+        Payload::ClipboardClear => {
+            platform::clipboard_clear();
         }
         Payload::ClipboardFiles { paths } => {
             // 轻量场景：对端只发路径（共享盘/同机双实例）。写入本机剪贴板文件列表。

@@ -99,6 +99,9 @@ pub enum Payload {
     ClipboardImage {
         png: Vec<u8>,
     },
+    /// Source clipboard changed to content that is not yet available lazily on the peer.
+    /// Invalidate the previous synchronized value so paste cannot reuse stale content.
+    ClipboardClear,
     /// 剪贴板文件（路径列表）。接收端把这些路径写入本机剪贴板的文件类型
     /// （Win: CF_HDROP；Mac: NSFilenamesPboardType），用户可直接 Ctrl+V 粘贴文件。
     ClipboardFiles {
@@ -258,6 +261,7 @@ mod file_protocol_tests {
     #[test]
     fn file_batch_messages_round_trip_json() {
         let messages = [
+            Payload::ClipboardClear,
             Payload::FileBatchStart {
                 id: "batch".into(),
                 roots: vec![TransferRoot {
