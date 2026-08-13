@@ -1342,6 +1342,18 @@ extern "C" fn promise_filename(
     unsafe { *this.get_ivar::<*mut Object>("fileName") }
 }
 
+/// 剪贴板粘贴路径的系统回调：粘贴（NSFilePromiseReceiver）不带目标目录，
+/// 走 fileNameForType: 问文件名。拖拽则走 promiseFilenameForDestination:。
+/// 缺这个方法时返回 nil，Finder 粘贴列表里就看不到这个文件。
+extern "C" fn promise_file_name_for_type(
+    this: &Object,
+    _cmd: Sel,
+    _provider: *mut Object,
+    _file_type: *mut Object,
+) -> *mut Object {
+    unsafe { *this.get_ivar::<*mut Object>("fileName") }
+}
+
 extern "C" fn promise_write(
     this: &Object,
     _cmd: Sel,
@@ -1485,6 +1497,10 @@ fn remote_promise_delegate_class() -> &'static Class {
             sel!(filePromiseProvider:promiseFilenameForDestination:),
             promise_filename
                 as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
+        );
+        decl.add_method(
+            sel!(filePromiseProvider:fileNameForType:),
+            promise_file_name_for_type as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
         );
         decl.add_method(
             sel!(filePromiseProvider:writePromiseToURL:completionHandler:),
@@ -1861,10 +1877,6 @@ fn copy_promised_file(
         }
     };
     let destination = std::path::PathBuf::from(destination_path);
-    let destination_dir = destination
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or(destination);
     for source in paths {
         let source_path = std::path::PathBuf::from(source);
         let Some(source_name) = source_path
@@ -1879,7 +1891,13 @@ fn copy_promised_file(
                 continue;
             }
         }
-        let target = destination_dir.join(&source_name);
+        // 剪贴板粘贴时系统给的是最终文件 URL，直接写到那里；
+        // 若给的是已存在的目录（个别场景），退回拼接文件名。
+        let target = if destination.is_dir() {
+            destination.join(&source_name)
+        } else {
+            destination.clone()
+        };
         if source_path.is_dir() {
             copy_directory_tree(&source_path, &target)?;
         } else {
