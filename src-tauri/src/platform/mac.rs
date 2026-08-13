@@ -1801,6 +1801,9 @@ pub fn set_clipboard_file_promise(
     callback: crate::platform::ClipboardPasteCallback,
 ) {
     unsafe {
+        log::info!(
+            "[CLIPBOARD-MAC] 挂文件承诺 offer id={id} names={names:?}"
+        );
         // 新 offer 覆盖旧占位与旧下载缓存。
         CLIP_PASTE_CACHE
             .get_or_init(Default::default)
@@ -1811,6 +1814,7 @@ pub fn set_clipboard_file_promise(
         *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
         let pb = general_pasteboard();
         if pb.is_null() {
+            log::error!("[CLIPBOARD-MAC] generalPasteboard 返回 null，无法挂文件承诺");
             return;
         }
         let _: () = msg_send![pb, clearContents];
@@ -1834,7 +1838,10 @@ pub fn set_clipboard_file_promise(
             arrayWithObjects: items.as_ptr()
             count: items.len()
         ];
-        let _: bool = msg_send![pb, writeObjects: arr];
+        let wrote: bool = msg_send![pb, writeObjects: arr];
+        log::info!(
+            "[CLIPBOARD-MAC] writeObjects 结果: {wrote}（false=写剪贴板失败，Finder 将没有粘贴选项）"
+        );
         remember_local_clipboard_change(pb);
     }
 }

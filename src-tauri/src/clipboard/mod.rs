@@ -118,6 +118,9 @@ impl ClipboardSync {
                         })
                         .collect::<Vec<_>>();
                     let id = file_sender.offer_clipboard_paths(paths);
+                    log::info!(
+                        "[CLIPBOARD] 本机复制文件 → 发出懒传 offer id={id} names={names:?}"
+                    );
                     net_cb.send_ctrl(Message::clipboard(
                         &name_cb,
                         Payload::ClipboardFiles {
@@ -166,8 +169,13 @@ pub fn handle_remote(
         Payload::ClipboardFiles { id, paths, names } => {
             if paths.is_empty() && !id.is_empty() && !names.is_empty() {
                 // 懒传 offer：剪贴板挂虚拟文件，粘贴时才请求传输。
+                log::info!(
+                    "[CLIPBOARD] 收到懒传文件 offer id={id} names={names:?} → 挂剪贴板承诺"
+                );
                 if file_receiver.begin_clipboard_revision(id) {
                     platform::set_clipboard_file_promise(id.clone(), names.clone(), paste_cb.clone());
+                } else {
+                    log::warn!("[CLIPBOARD] offer id={id} 已被更新的剪贴板内容取代，忽略");
                 }
                 return;
             }

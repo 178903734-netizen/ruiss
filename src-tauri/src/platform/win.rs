@@ -2245,9 +2245,9 @@ pub fn set_clipboard_file_promise(
     }
 }
 
-/// WM_RENDERFORMAT / WM_RENDERALLFORMATS：真正渲染延迟的 CF_HDROP。
+/// WM_RENDERFORMAT：真正渲染延迟的 CF_HDROP。
 /// 阻塞等待对端把文件传完（目标应用在此期间等待剪贴板数据）。
-fn render_clipboard_hdrop() {
+fn render_clipboard_hdrop(format: u32) {
     let offer = PENDING_LAZY_HDROP
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2255,6 +2255,10 @@ fn render_clipboard_hdrop() {
     let Some(offer) = offer else {
         return;
     };
+    // 只渲染我们持有的 CF_HDROP；其他格式请求直接忽略。
+    if format != CF_HDROP.0 as u32 {
+        return;
+    }
     let ready = crate::platform::new_paste_ready();
     (offer.callback)(crate::platform::ClipboardPasteEvent::Requested {
         id: offer.id,
@@ -2267,22 +2271,19 @@ fn render_clipboard_hdrop() {
             Vec::new()
         }
     };
+    if paths.is_empty() {
+        // 传输失败/超时：不写入空文件列表，避免粘贴出空结果。
+        log::error!("[CLIPBOARD] 懒粘贴渲染跳过：无可用路径");
+        return;
+    }
     unsafe {
-        let Some(&raw) = WATCHER_HWND.get() else {
-            return;
-        };
-        let hwnd = HWND(raw as *mut std::ffi::c_void);
-        // 渲染期间剪贴板可能被其他进程短暂占用，重试几次。
-        for _ in 0..3 {
-            if OpenClipboard(hwnd).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // WM_RENDERFORMAT 期间系统已为剪贴板所有者打开剪贴板，直接
+        // SetClipboardData 即可；再调 OpenClipboard 必然失败（err=5，
+        // 剪贴板已被系统/请求方打开），导致数据永远写不进去、粘贴拿 NULL。
+        // （2026-08-14 实测确认：删除 OpenClipboard 后渲染成功、粘贴可拿到数据）
         if let Ok(hmem) = RemoteDragDataObject::hdrop(&paths) {
             let _ = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0));
         }
-        let _ = CloseClipboard();
     }
 }
 
@@ -2313,8 +2314,14 @@ unsafe extern "system" fn clip_wnd_proc(
         }
         return LRESULT(0);
     }
-    if msg == WM_RENDERFORMAT || msg == WM_RENDERALLFORMATS {
-        render_clipboard_hdrop();
+    if msg == WM_RENDERFORMAT {
+        // wParam = 请求方要的剪贴板格式（CF_HDROP=15）。
+        render_clipboard_hdrop(wparam.0 as u32);
+        return LRESULT(0);
+    }
+    if msg == WM_RENDERALLFORMATS {
+        // 应用退出/监听窗口销毁：文件懒传无法继续，清占位即可（不渲染）。
+        *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return LRESULT(0);
     }
     if msg == WM_DESTROYCLIPBOARD {
