@@ -1433,6 +1433,7 @@ extern "C" fn promise_drag_ended(
     _point: NSPointFFI,
     operation: usize,
 ) {
+    HELD_BUTTON.store(-1, Ordering::Relaxed);
     unsafe {
         let id_obj = *this.get_ivar::<*mut Object>("dragId");
         if let Some(id) = ns_utf8_string(id_obj) {
@@ -1916,6 +1917,11 @@ pub fn start_remote_file_drag(
             return Err(anyhow!("no AppKit window for remote drag"));
         }
         let view: *mut Object = msg_send![window, contentView];
+        // The source machine's original left-down happened before takeover and therefore is
+        // not present in this Mac's injector state. Seed it before the native drag session so
+        // subsequent remote movement is posted as LeftMouseDragged instead of MouseMoved.
+        // The real source-side mouse-up is forwarded normally and clears this state.
+        HELD_BUTTON.store(0, Ordering::Relaxed);
         let id_ns = string_to_nsstring(&id);
         let name_ns = string_to_nsstring(&root.name);
         let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
@@ -1937,10 +1943,14 @@ pub fn start_remote_file_drag(
         let items: *mut Object = msg_send![class!(NSArray), arrayWithObject: item];
         // 先单独取 windowNumber 并显式标注类型，msg_send! 嵌套无法自动推断返回类型。
         let window_number: isize = msg_send![window, windowNumber];
-        let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 6usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: window_number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
+        // NSEventTypeLeftMouseDown = 1. beginDraggingSession requires the initiating
+        // mouse-down event; type 6 is LeftMouseDragged and causes a synthetic session to end
+        // on the next run-loop turn (the one-frame drag image seen during crossover).
+        let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 1usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: window_number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
         let session: *mut Object =
             msg_send![view, beginDraggingSessionWithItems: items event: event source: delegate];
         if session.is_null() {
+            HELD_BUTTON.store(-1, Ordering::Relaxed);
             REMOTE_DRAG_CALLBACKS
                 .get_or_init(Default::default)
                 .lock()
@@ -1964,6 +1974,7 @@ pub fn complete_remote_file_drag(id: &str, paths: &[String], error: Option<Strin
 }
 
 pub fn cancel_remote_file_drag(id: &str) {
+    HELD_BUTTON.store(-1, Ordering::Relaxed);
     complete_remote_file_drag(id, &[], Some("drag cancelled".into()));
 }
 

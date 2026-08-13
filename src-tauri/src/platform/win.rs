@@ -113,6 +113,10 @@ static SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SHIELD_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
 static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+/// Set after the edge probe hands captured paths to the cross-screen coordinator. The
+/// following synthetic left-up completes Explorer's OLE loop as a successful COPY into
+/// the hand-off target instead of cancelling it with Esc (which flashes a prohibited icon).
+static EDGE_DROP_HANDOFF: AtomicBool = AtomicBool::new(false);
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
@@ -1508,7 +1512,10 @@ pub fn is_left_button_down() -> bool {
 pub fn take_drag_paths() -> Vec<String> {
     let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     match pending.take() {
-        Some((at, paths)) if at.elapsed() <= Duration::from_secs(15) => paths,
+        Some((at, paths)) if at.elapsed() <= Duration::from_secs(15) => {
+            EDGE_DROP_HANDOFF.store(true, Ordering::Release);
+            paths
+        }
         _ => Vec::new(),
     }
 }
@@ -1563,8 +1570,10 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
-        // Do not let a later ordinary left-button crossover reuse an earlier drag's paths.
-        *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if !EDGE_DROP_HANDOFF.load(Ordering::Acquire) {
+            // Do not let a later ordinary left-button crossover reuse an earlier drag's paths.
+            *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         Ok(())
     }
 
@@ -1575,8 +1584,9 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         _point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        let handed_off = EDGE_DROP_HANDOFF.swap(false, Ordering::AcqRel);
         unsafe {
-            *effect = DROPEFFECT_NONE;
+            *effect = edge_probe_effect(handed_off);
         }
         Ok(())
     }
@@ -1695,12 +1705,21 @@ pub fn start_drag_path_probe() {
 }
 
 pub fn cancel_local_drag() {
-    let mut inputs = key_inputs(Key::Esc, 0, false, true);
-    inputs.extend(key_inputs(Key::Esc, 0, false, false));
-    if !inputs.is_empty() {
-        unsafe {
-            SendInput(&inputs, size_of::<INPUT>() as i32);
-        }
+    // Complete Explorer's source-side OLE loop at the edge probe. Esc cancels the loop and
+    // makes Windows show the prohibited cursor/return animation during hand-off. The target's
+    // Drop method consumes this synthetic up as COPY; the real physical up is still forwarded
+    // later to the peer and ends its native drag session.
+    let input = [INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dwFlags: MOUSEEVENTF_LEFTUP,
+                ..Default::default()
+            },
+        },
+    }];
+    unsafe {
+        SendInput(&input, size_of::<INPUT>() as i32);
     }
 }
 

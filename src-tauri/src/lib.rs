@@ -1082,22 +1082,13 @@ async fn apply_link_config(
         } else {
             None
         };
-        // 文件发送器（剪贴板文件 + GUI 手动发送 + 拖拽，都用它）
+        // 文件发送器（GUI 手动发送 + 拖拽使用；复制文件不会立即传输）
         let file_sender =
             file_transfer::FileSender::new(handle.clone(), name.clone(), _app.clone());
         r.file_sender = Some(file_sender.clone());
         // 剪贴板同步：监听本机剪贴板变化发对端，剪贴板开关关闭时不启动
         if clip_enabled {
-            let clip = clipboard::ClipboardSync::start(
-                name.clone(),
-                handle.clone(),
-                std::sync::Arc::new(move |paths: Vec<String>| {
-                    let paths = paths.into_iter().map(std::path::PathBuf::from).collect();
-                    if let Err(e) = file_sender.send_paths(paths) {
-                        log::error!("[FILE] 剪贴板文件发送失败: {e}");
-                    }
-                }),
-            );
+            let clip = clipboard::ClipboardSync::start(name.clone(), handle.clone());
             r.clipboard = Some(clip);
         }
     }
