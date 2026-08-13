@@ -1747,7 +1747,7 @@ pub fn is_left_button_down() -> bool {
 pub fn take_drag_paths() -> Vec<String> {
     let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     match pending.take() {
-        Some((at, paths)) if at.elapsed() <= Duration::from_secs(2) => paths,
+        Some((at, paths)) if at.elapsed() <= Duration::from_secs(15) => paths,
         _ => Vec::new(),
     }
 }
@@ -1766,6 +1766,13 @@ extern "C" fn drag_probe_entered(_this: &Object, _cmd: Sel, sender: *mut Object)
 }
 
 extern "C" fn drag_probe_updated(_this: &Object, _cmd: Sel, _sender: *mut Object) -> usize {
+    // 光标停在探针上时持续刷新记录时间戳：用户在边缘犹豫/来回微移时，
+    // 路径不因有效期窗口而过期（跨屏触发那一刻才采样）。
+    if let Ok(mut pending) = PENDING_DRAG_PATHS.lock() {
+        if let Some(entry) = pending.as_mut() {
+            entry.0 = Instant::now();
+        }
+    }
     0
 }
 

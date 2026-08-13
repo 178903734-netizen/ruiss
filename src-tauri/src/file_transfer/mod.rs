@@ -77,35 +77,29 @@ impl FileSender {
             return Err("no connected file drag".into());
         }
         let id = uuid::Uuid::new_v4().to_string();
+        // 时序关键：只 stat 顶层条目，立即把 DragStart 通告给对端，让对端在
+        // 光标进入的瞬间就启动合成拖拽。完整发送计划（目录树遍历）推迟到
+        // 对端真正 Drop 时（DragCommit → commit_drag）再构建——否则大文件夹
+        // 遍历会让对端拖拽起步过晚，用户松手时拖拽还没起来，落点错乱。
+        let roots = match build_roots(&paths) {
+            Ok(roots) => roots,
+            Err(error) => {
+                log::error!("[DRAG] unable to prepare drag offer: {error}");
+                return Err(error);
+            }
+        };
         self.inner
             .pending_drags
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), paths.clone());
-        let sender = self.clone();
-        let task_id = id.clone();
-        tauri::async_runtime::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || build_plan(paths)).await;
-            match result {
-                Ok(Ok(plan)) => {
-                    sender.inner.net.send_ctrl(Message::ctrl(
-                        &sender.inner.name,
-                        Payload::DragStart {
-                            id: task_id.clone(),
-                            roots: plan.roots,
-                        },
-                    ));
-                }
-                Ok(Err(error)) => {
-                    log::error!("[DRAG] unable to prepare drag {task_id}: {error}");
-                    sender.cancel_drag(&task_id);
-                }
-                Err(error) => {
-                    log::error!("[DRAG] drag preparation task failed {task_id}: {error}");
-                    sender.cancel_drag(&task_id);
-                }
-            }
-        });
+            .insert(id.clone(), paths);
+        self.inner.net.send_ctrl(Message::ctrl(
+            &self.inner.name,
+            Payload::DragStart {
+                id: id.clone(),
+                roots,
+            },
+        ));
         Ok(id)
     }
 
@@ -485,6 +479,37 @@ impl FileSender {
             }
         }
     }
+}
+
+/// 轻量发送计划：只 stat 顶层条目，构建对端启动合成拖拽所需的 roots。
+/// 不遍历目录树——目录树遍历推迟到 build_plan（DragCommit 后真正发送时）。
+/// 与 build_plan 使用相同顺序的 unique_logical_name，保证 DragStart 里的
+/// root 名与后续 FileBatchStart 的 root 名完全一致（对端 staging 按名预留路径）。
+fn build_roots(paths: &[PathBuf]) -> Result<Vec<TransferRoot>, String> {
+    let mut roots = Vec::with_capacity(paths.len());
+    let mut used = HashSet::new();
+    for source in paths {
+        let metadata = std::fs::symlink_metadata(source)
+            .map_err(|e| format!("无法读取 {}: {e}", source.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("暂不传输符号链接: {}", source.display()));
+        }
+        let original = source
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("无效路径: {}", source.display()))?;
+        let root_name = unique_logical_name(original, &mut used);
+        if metadata.is_dir() || metadata.is_file() {
+            roots.push(TransferRoot {
+                name: root_name,
+                is_dir: metadata.is_dir(),
+            });
+        } else {
+            return Err("只支持普通文件和文件夹".into());
+        }
+    }
+    Ok(roots)
 }
 
 fn build_plan(paths: Vec<PathBuf>) -> Result<SendPlan, String> {

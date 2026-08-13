@@ -20,16 +20,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use windows::core::{implement, w, Error as WinError, HRESULT, PCWSTR};
+use windows::core::{implement, w, Error as WinError, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
     DV_E_FORMATETC, E_NOTIMPL, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED,
-    POINT, POINTL, S_OK, WPARAM,
+    POINT, POINTL, S_OK, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetSysColor, ReleaseDC,
+    SelectObject, HBRUSH, HGDIOBJ, SYS_COLOR_INDEX,
+};
 use windows::Win32::System::Com::{
-    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, DVASPECT_CONTENT,
-    FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    CoCreateInstance, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+    CLSCTX_INPROC_SERVER, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
@@ -46,29 +49,33 @@ use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-    VIRTUAL_KEY,
+    ReleaseCapture, SendInput, SetCapture, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
-use windows::Win32::UI::Shell::DragQueryFileW;
+use windows::Win32::UI::Shell::{
+    DragQueryFileW, IDragSourceHelper, SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON,
+    SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, CLSID_DragDropHelper, SHDRAGIMAGE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, PostThreadMessageW, RegisterClassW, SetCursorPos,
-    SetLayeredWindowAttributes, SetSystemCursor, SetWindowsHookExW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HCURSOR, HICON,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, LWA_ALPHA, MSG,
-    MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNA, SYSTEM_CURSOR_ID,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_CLIPBOARDUPDATE, WM_INPUT,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
+    DispatchMessageW, DrawIconEx, GetCursorPos, GetMessageW, GetSystemMetrics, PostThreadMessageW,
+    RegisterClassW, SetCursorPos, SetLayeredWindowAttributes, SetSystemCursor, SetWindowsHookExW,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
+    DI_NORMAL, HCURSOR, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
+    LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNA,
+    SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_CLIPBOARDUPDATE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::core::keys::{
@@ -1496,10 +1503,12 @@ pub fn is_left_button_down() -> bool {
 }
 
 /// 取走最近一次 OLE 文件拖拽进入跨屏边缘时捕获的路径。
+/// 有效期 15 秒：跨屏触发在边缘停留 150ms 后立即发生，15 秒覆盖用户在边缘
+/// 犹豫、来回微移等场景；DragOver 期间时间戳会持续刷新，不会过期。
 pub fn take_drag_paths() -> Vec<String> {
     let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     match pending.take() {
-        Some((at, paths)) if at.elapsed() <= Duration::from_secs(2) => paths,
+        Some((at, paths)) if at.elapsed() <= Duration::from_secs(15) => paths,
         _ => Vec::new(),
     }
 }
@@ -1532,6 +1541,13 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for EdgeDropTarget_Impl {
         _point: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
+        // 光标停在探针上时持续刷新记录时间戳：用户在边缘犹豫/来回微移时，
+        // 路径不因有效期窗口而过期（跨屏触发那一刻才采样）。
+        if let Ok(mut pending) = PENDING_DRAG_PATHS.lock() {
+            if let Some(entry) = pending.as_mut() {
+                entry.0 = Instant::now();
+            }
+        }
         unsafe {
             *effect = DROPEFFECT_NONE;
         }
@@ -1819,9 +1835,117 @@ impl IDropSource_Impl for RemoteDropSource_Impl {
     }
 }
 
+/// 创建属于当前线程的 1x1 隐形捕获窗口（把注入鼠标事件路由进本线程队列）。
+/// 窗口类进程级注册，重复注册失败可忽略（类已存在时窗口仍可创建）。
+unsafe fn create_drag_capture_window() -> HWND {
+    let class = w!("RuissDragCapture");
+    let Some(hinst) = GetModuleHandleW(None).ok().map(HINSTANCE::from) else {
+        return HWND::default();
+    };
+    unsafe extern "system" fn drag_capture_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(drag_capture_wnd_proc),
+        hInstance: hinst,
+        lpszClassName: class,
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wc);
+    match CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        class,
+        w!("RuissDragCapture"),
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        None,
+        None,
+        hinst,
+        None,
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            log::warn!("[DRAG] 创建拖拽捕获窗口失败: {error}");
+            HWND::default()
+        }
+    }
+}
+
+/// 给合成拖拽挂一个文件类型图标拖影（IDragSourceHelper::InitializeFromBitmap）。
+/// 失败只降级为系统默认光标，不影响拖拽本体。
+unsafe fn attach_drag_image(data: &IDataObject, first_name: Option<&str>) {
+    let Some(name) = first_name else {
+        return;
+    };
+    // 目标机没有实体文件；SHGFI_USEFILEATTRIBUTES 让 SHGetFileInfoW 按扩展名
+    // 从注册表解析类型图标。
+    let pseudo_path = format!(".\\{name}");
+    let mut shfi = SHFILEINFOW::default();
+    let ok = SHGetFileInfoW(
+        &HSTRING::from(pseudo_path),
+        Default::default(),
+        Some(&mut shfi),
+        size_of::<SHFILEINFOW>() as u32,
+        SHGFI_FLAGS(SHGFI_ICON.0 | SHGFI_LARGEICON.0 | SHGFI_USEFILEATTRIBUTES.0),
+    );
+    if ok == 0 || shfi.hIcon.is_invalid() {
+        log::debug!("[DRAG] 无法获取拖拽图标: {name}");
+        return;
+    }
+    let hdc_screen = GetDC(None);
+    if hdc_screen.is_invalid() {
+        log::warn!("[DRAG] 获取屏幕 DC 失败");
+        return;
+    }
+    let hdc_mem = CreateCompatibleDC(hdc_screen);
+    if hdc_mem.is_invalid() {
+        log::warn!("[DRAG] 创建内存 DC 失败");
+        ReleaseDC(None, hdc_screen);
+        return;
+    }
+    let bitmap = CreateCompatibleBitmap(hdc_screen, 32, 32);
+    if bitmap.is_invalid() {
+        log::warn!("[DRAG] 创建拖拽图像位图失败");
+        DeleteDC(hdc_mem);
+        ReleaseDC(None, hdc_screen);
+        return;
+    }
+    let old = SelectObject(hdc_mem, HGDIOBJ(bitmap.0));
+    let _ = DrawIconEx(hdc_mem, 0, 0, shfi.hIcon, 32, 32, 0, None, DI_NORMAL);
+    SelectObject(hdc_mem, old);
+    DeleteDC(hdc_mem);
+    ReleaseDC(None, hdc_screen);
+    let _ = DestroyIcon(shfi.hIcon);
+    // COLOR_WINDOW(5) 作透明 key 色：与系统窗口底色一致的像素被透明打洞。
+    let mut image = SHDRAGIMAGE::default();
+    image.sizeDragImage = SIZE { cx: 32, cy: 32 };
+    image.ptOffset = POINT { x: 16, y: 16 };
+    image.hbmpDragImage = bitmap;
+    image.crColorKey = COLORREF(GetSysColor(SYS_COLOR_INDEX(5)));
+    let helper: IDragSourceHelper =
+        match CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) {
+            Ok(helper) => helper,
+            Err(error) => {
+                log::warn!("[DRAG] 创建 IDragSourceHelper 失败: {error}");
+                return;
+            }
+        };
+    if let Err(error) = helper.InitializeFromBitmap(&image, data) {
+        log::warn!("[DRAG] 初始化拖拽图像失败: {error}");
+    }
+}
+
 pub fn start_remote_file_drag(
     id: String,
-    _roots: Vec<crate::core::protocol::TransferRoot>,
+    roots: Vec<crate::core::protocol::TransferRoot>,
     callback: Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
 ) -> Result<()> {
     let ready = Arc::new((
@@ -1848,6 +1972,17 @@ pub fn start_remote_file_drag(
                 .remove(&id);
             return;
         }
+        // DoDragDrop 的模态循环从"本线程"的消息队列取鼠标事件。SendInput 注入的
+        // 移动/松开默认投递到前台窗口线程，本线程收不到 → 拖拽不跟手、松手不落。
+        // 创建属于本线程的隐形捕获窗口并 SetCapture，把注入事件路由进本线程队列
+        // （等价于真实拖拽时源窗口 capture 鼠标的状态），且合成 LEFT_DOWN 也不会
+        // 误点到光标下的前台应用。
+        let capture_hwnd = create_drag_capture_window();
+        if capture_hwnd.0.is_null() {
+            log::warn!("[DRAG] 无法创建拖拽捕获窗口，合成拖拽可能不跟随注入输入");
+        } else {
+            let _ = SetCapture(capture_hwnd);
+        }
         let input = [INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
@@ -1864,11 +1999,17 @@ pub fn start_remote_file_drag(
             callback: callback.clone(),
         }
         .into();
+        // 拖影：按第一个根条目的扩展名取系统类型图标（目标机无实体文件，仅视觉）。
+        attach_drag_image(&data, roots.first().map(|r| r.name.as_str()));
         let source: IDropSource = RemoteDropSource.into();
         let mut effect = DROPEFFECT_NONE;
         let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
         if result != DRAGDROP_S_DROP {
             callback(super::RemoteFileDragEvent::Cancelled(id.clone()));
+        }
+        if !capture_hwnd.0.is_null() {
+            let _ = ReleaseCapture();
+            let _ = DestroyWindow(capture_hwnd);
         }
         REMOTE_DRAGS
             .get_or_init(Default::default)
