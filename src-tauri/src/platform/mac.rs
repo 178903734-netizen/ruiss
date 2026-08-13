@@ -1356,7 +1356,13 @@ extern "C" fn promise_write(
         let completion = block::RcBlock::<(*mut Object,), ()>::copy(
             completion as *mut block::Block<(*mut Object,), ()>,
         );
+        // RcBlock 内含 Block 裸指针，不是 Send，不能直接移入线程；
+        // 转成 usize 裸地址传入，线程内 Box::from_raw 还原并持有到调用完成。
+        let completion_raw = Box::into_raw(Box::new(completion)) as usize;
         std::thread::spawn(move || {
+            let completion = unsafe {
+                Box::from_raw(completion_raw as *mut block::RcBlock<(*mut Object,), ()>)
+            };
             let result = loop {
                 if let Some(result) = REMOTE_DRAG_RESULTS
                     .get_or_init(Default::default)
@@ -1405,11 +1411,26 @@ extern "C" fn promise_source_mask(
     1
 }
 
+/// NSPoint/CGPoint 的 FFI 等价类型：repr(C) 布局（两个 f64）与 CGPoint 完全一致，
+/// 并实现 objc::Encode 以满足 add_method 的参数编码要求（CGPoint 自身未实现该 trait）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSPointFFI {
+    x: f64,
+    y: f64,
+}
+
+unsafe impl objc::Encode for NSPointFFI {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
+    }
+}
+
 extern "C" fn promise_drag_ended(
     this: &Object,
     _cmd: Sel,
     _session: *mut Object,
-    _point: CGPoint,
+    _point: NSPointFFI,
     operation: usize,
 ) {
     unsafe {
@@ -1453,7 +1474,7 @@ fn remote_promise_delegate_class() -> &'static Class {
         );
         decl.add_method(
             sel!(draggingSession:endedAtPoint:operation:),
-            promise_drag_ended as extern "C" fn(&Object, Sel, *mut Object, CGPoint, usize),
+            promise_drag_ended as extern "C" fn(&Object, Sel, *mut Object, NSPointFFI, usize),
         );
         decl.register() as *const Class as usize
     });
@@ -1907,7 +1928,9 @@ pub fn start_remote_file_drag(
             msg_send![workspace, iconForFileType: string_to_nsstring("public.data")];
         let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
         let items: *mut Object = msg_send![class!(NSArray), arrayWithObject: item];
-        let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 6usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: msg_send![window, windowNumber] context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
+        // 先单独取 windowNumber 并显式标注类型，msg_send! 嵌套无法自动推断返回类型。
+        let window_number: isize = msg_send![window, windowNumber];
+        let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 6usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: window_number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
         let session: *mut Object =
             msg_send![view, beginDraggingSessionWithItems: items event: event source: delegate];
         if session.is_null() {
