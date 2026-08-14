@@ -18,8 +18,13 @@ gui/dist/
 .DS_Store
 Thumbs.db
 
-# 工具备份
+# 工具备份与本地 AI 工具数据（勿提交，含个人环境信息）
 .mini-code-backups/
+.workbuddy/
+.zcode/
+.claude/
+.codex-login/
+.cargo/
 
 # 打包残留
 src-tauri.zip
