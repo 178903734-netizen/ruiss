@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-08-14 — 开源准备：README + MIT LICENSE + 仓库清理（已推送 GitHub）
+
+- 新增 README.md：项目介绍、功能特性、技术栈、构建方式、使用说明、目录结构
+- 新增 LICENSE：MIT 协议
+- package.json 移除 `private: true`，正式开源
+- .gitignore 排除本地 AI 工具数据（.workbuddy/.zcode/.claude/.codex-login/.cargo），并从 git 跟踪移除
+- 远程仓库清理：删除 19 个 backup 备份分支，仅保留 master
+- master 已推送至 https://github.com/178903734-netizen/ruiss（经 127.0.0.1:7890 代理）
+
 ## 2026-08-14 — 修复安装包缺 WebView2Loader.dll（安装后报"找不到 DLL"）
 
 - **现象**：用户实测安装后运行报错「由于找不到 WebView2Loader.dll，无法继续执行代码」。
