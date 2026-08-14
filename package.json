@@ -1,0 +1,12 @@
+{
+  "name": "ruiss",
+  "private": true,
+  "version": "0.2.0",
+  "description": "双机键鼠共享：鼠标跨屏、键盘共享、剪贴板同步",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

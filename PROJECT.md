@@ -43,6 +43,7 @@ ruiss/
 │       └── file_transfer/   # M3：文件分块传输（发送/接收状态机）
 │           └── mod.rs
 ├── gui/                     # 前端：设置窗口（index.html + js + css）
+├── package.json             # 打包工具链（本地 devDep：@tauri-apps/cli，npx tauri build）
 ├── scripts/
 │   └── gen-icon.mjs         # 生成托盘图标 PNG（node 脚本）
 ├── PROJECT.md               # 本文件：项目地图 + 规划存档
@@ -134,6 +135,10 @@ cargo check --manifest-path src-tauri/Cargo.toml
 cd src-tauri
 env CARGO_TARGET_DIR=D:/ruiss-target cargo build          # debug → D:/ruiss-target/debug/ruiss.exe
 # env CARGO_TARGET_DIR=D:/ruiss-target cargo build --release # release → D:/ruiss-target/release/ruiss.exe
+
+# 正式打包安装程序（Windows 出 NSIS 安装 exe + MSI + 免安装 exe）
+# 根目录 package.json 已配好 @tauri-apps/cli，直接：
+npx tauri build             # 产物：src-tauri/target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
 ```
 
 ## 当前进度

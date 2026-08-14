@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2026-08-14 — 接入 Tauri 打包工具链，支持打 Windows 安装 exe
+
+- 新增根目录 package.json（private），本地安装 @tauri-apps/cli 2.11.4（未用全局，避免改系统环境）。
+- 打包命令：`npx tauri build` → 产出 `src-tauri/target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe`
+  （NSIS 安装程序）+ MSI + 免安装 exe；安装程序会把 GNU 运行时 DLL（libgcc_s_seh-1.dll /
+  libstdc++-6.dll / libwinpthread-1.dll）一并装进 Program Files，用户装完即用，无需手动带 DLL。
+- 注意：图标暂沿用 `src-tauri/icons/icon.ico`（仅 641B 占位图），正式上线前应替换多尺寸正式图标。
+
 ## 2026-08-13 — 修复打包产物输出位置：固定到 D:/ruiss-target
 
 - **现象**：每次 `cargo build` 产物都跑到 `src-tauri/target`，而不是预期的 `D:/ruiss-target/debug`。
