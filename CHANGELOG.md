@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 2026-08-14 — 修复安装包缺 WebView2Loader.dll（安装后报"找不到 DLL"）
+
+- **现象**：用户实测安装后运行报错「由于找不到 WebView2Loader.dll，无法继续执行代码」。
+- **根因**：w64devkit GNU 工具链编译的 exe 动态依赖 WebView2Loader.dll（静态链接不可用），
+  而打包器未把它自动打进 NSIS 安装包（build3.log 中 makensis 无任何 .dll 的 File 行）。
+- **修复**：`src-tauri/tauri.conf.json` bundle 段新增 `resources`，把
+  `target/release/WebView2Loader.dll` 显式映射进安装包根目录；同时 `targets` 从 `all` 改为
+  `nsis`（跳过 MSI/wix 下载，避免再次卡网络）。
+- 验证状态：待新打包完成（build4.log）后确认 makensis 日志含 WebView2Loader.dll 的 File 行。
+
 ## 2026-08-14 — 接入 Tauri 打包工具链，支持打 Windows 安装 exe
 
 - 新增根目录 package.json（private），本地安装 @tauri-apps/cli 2.11.4（未用全局，避免改系统环境）。

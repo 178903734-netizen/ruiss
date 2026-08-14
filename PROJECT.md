@@ -136,9 +136,11 @@ cd src-tauri
 env CARGO_TARGET_DIR=D:/ruiss-target cargo build          # debug → D:/ruiss-target/debug/ruiss.exe
 # env CARGO_TARGET_DIR=D:/ruiss-target cargo build --release # release → D:/ruiss-target/release/ruiss.exe
 
-# 正式打包安装程序（Windows 出 NSIS 安装 exe + MSI + 免安装 exe）
+# 正式打包安装程序（Windows 出 NSIS 安装 exe）
 # 根目录 package.json 已配好 @tauri-apps/cli，直接：
-npx tauri build             # 产物：src-tauri/target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
+npx tauri build --bundles nsis   # 产物：src-tauri/target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
+# 注意：tauri.conf.json 已配 bundle.resources 把 target/release/WebView2Loader.dll 打进安装包
+#（GNU 工具链 exe 动态依赖该 DLL，打包器不会自动带，必须显式配置）
 ```
 
 ## 当前进度
