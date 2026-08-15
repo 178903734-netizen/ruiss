@@ -8,6 +8,7 @@
   指向当前 exe，值带引号防空格路径被拆开；用系统自带 reg.exe，不新增依赖）
 - macOS：写/删 ~/Library/LaunchAgents/com.ruiss.app.plist（RunAtLoad）
 - save_settings 检测 autostart 变化时应用（失败不落盘）；启动时对齐一次（防升级/移机后失效）
+- 已重新打包：D:/ruiss-target/release/bundle/nsis/Ruiss_0.2.0_x64-setup.exe（2026-08-15 22:46，含本修复）
 
 ## 2026-08-14 — 开源准备：README + MIT LICENSE + 仓库清理（已推送 GitHub）
 
