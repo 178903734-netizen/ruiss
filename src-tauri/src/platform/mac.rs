@@ -2207,8 +2207,80 @@ pub fn start_clipboard_watcher(
 
 // ===== 开机自启（写/删 ~/Library/LaunchAgents/com.ruiss.app.plist）=====
 
-/// 设置开机自启。enabled=true 写 LaunchAgent plist（RunAtLoad 指向当前 exe）；
-/// false 删除该 plist。LaunchAgent 方案无需新增依赖，所有 macOS 版本通用。
+const AUTOSTART_LABEL: &str = "com.ruiss.app";
+
+/// XML 转义 plist 字符串值（防路径含 & < > 等字符破坏 plist）
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn current_uid() -> Result<String, String> {
+    let out = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|e| format!("获取当前用户 uid 失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "获取当前用户 uid 失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 注册到当前会话。LaunchAgents 目录要等下次登录才被 launchd 自动扫描，
+/// 这里手动 bootstrap 让本次登录立即生效（bootstrap 只注册不启动，不会双开）。
+fn launchctl_register(plist_path: &std::path::Path) -> Result<(), String> {
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let plist = plist_path.to_str().ok_or("plist 路径非法")?;
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, plist])
+        .output()
+        .map_err(|e| format!("launchctl bootstrap 失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // bootstrap 对已注册的 job 会报错，此时用 print 确认是否已在系统里
+    let check = std::process::Command::new("launchctl")
+        .args(["print", &format!("{domain}/{AUTOSTART_LABEL}")])
+        .output()
+        .map_err(|e| format!("launchctl print 失败: {e}"))?;
+    if check.status.success() {
+        log::info!("开机自启 job 已注册（当前会话生效）");
+        return Ok(());
+    }
+    Err(format!(
+        "launchctl bootstrap 失败: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// 从当前会话注销（job 未注册时忽略错误）
+fn launchctl_unregister() -> Result<(), String> {
+    let uid = current_uid()?;
+    let target = format!("gui/{uid}/{AUTOSTART_LABEL}");
+    let out = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
+        .output()
+        .map_err(|e| format!("launchctl bootout 失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // 未注册时 bootout 报 No such process / Could not find，属正常
+    if stderr.contains("No such process") || stderr.contains("Could not find") {
+        return Ok(());
+    }
+    Err(format!("launchctl bootout 失败: {}", stderr.trim()))
+}
+
+/// 设置开机自启。enabled=true 写 LaunchAgent plist（RunAtLoad 指向当前 exe）
+/// 并注册到当前会话；false 注销并删除该 plist。LaunchAgent 方案无需新增依赖，所有 macOS 版本通用。
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
     let agents_dir = home.join("Library").join("LaunchAgents");
@@ -2234,11 +2306,13 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 </dict>
 </plist>
 "#,
-            exe = exe.to_string_lossy()
+            exe = xml_escape(&exe.to_string_lossy())
         );
         std::fs::write(&plist_path, content).map_err(|e| format!("写入 LaunchAgent plist 失败: {e}"))?;
+        launchctl_register(&plist_path)?;
         log::info!("开机自启已启用: {}", exe.to_string_lossy());
     } else {
+        launchctl_unregister()?;
         match std::fs::remove_file(&plist_path) {
             Ok(()) => log::info!("开机自启已关闭"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
