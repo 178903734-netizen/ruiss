@@ -47,6 +47,13 @@ pub fn run() {
 
             app.manage(router.clone());
 
+            // 开机自启对齐：设置里开了就确保系统已注册（防升级/移动程序后注册失效）
+            if router.lock().unwrap().settings.autostart {
+                if let Err(e) = platform::set_autostart(true) {
+                    log::error!("开机自启注册失败: {e}");
+                }
+            }
+
             // 常驻捕获（自测/跨屏都要用；失败则 app 照常可用，仅无输入功能）
             match start_capturer(router.clone()) {
                 Ok(c) => {
@@ -1424,6 +1431,14 @@ async fn save_settings(
             || r.settings.cross_screen_enabled != settings.cross_screen_enabled
             || r.settings.clipboard_enabled != settings.clipboard_enabled
     };
+    let autostart_changed = {
+        let r = state.inner().lock().map_err(|e| e.to_string())?;
+        r.settings.autostart != settings.autostart
+    };
+    // 先应用开机自启注册（失败则不落盘，保证设置与系统状态一致）
+    if autostart_changed {
+        platform::set_autostart(settings.autostart)?;
+    }
     let path = settings_path(&app)?;
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("保存设置失败: {e}"))?;

@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-08-15 — 修复开机自启不生效（mac/win 都只存了设置、从未真正注册系统）
+根因：Settings 有 autostart 字段并持久化，但全项目没有任何代码调用操作系统注册自启
+（无 tauri-plugin-autostart 依赖、无注册表 Run 键写入、无 LaunchAgent）。
+修复：platform 层新增 set_autostart ——
+- Windows：写/删 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 键（值名 Ruiss，
+  指向当前 exe，值带引号防空格路径被拆开；用系统自带 reg.exe，不新增依赖）
+- macOS：写/删 ~/Library/LaunchAgents/com.ruiss.app.plist（RunAtLoad）
+- save_settings 检测 autostart 变化时应用（失败不落盘）；启动时对齐一次（防升级/移机后失效）
+
 ## 2026-08-14 — 开源准备：README + MIT LICENSE + 仓库清理（已推送 GitHub）
 
 - 新增 README.md：项目介绍、功能特性、技术栈、构建方式、使用说明、目录结构

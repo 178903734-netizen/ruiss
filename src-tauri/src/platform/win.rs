@@ -2382,3 +2382,38 @@ mod tests {
         assert_eq!(edge_probe_effect(false), DROPEFFECT_NONE);
     }
 }
+
+// ===== 开机自启（写/删 HKCU\...\CurrentVersion\Run 注册表 Run 键）=====
+
+/// 设置开机自启。enabled=true 写入 Run 键（值名 Ruiss，指向当前 exe）；
+/// false 删除该键。用系统自带 reg.exe，不新增依赖（w64devkit 工具链下
+/// windows crate 注册表 API 需要额外 feature，风险高）。
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    use std::process::Command;
+    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let exe = std::env::current_exe().map_err(|e| format!("获取当前 exe 路径失败: {e}"))?;
+    let exe_str = exe.to_string_lossy().into_owned();
+
+    if enabled {
+        // 值带引号包裹：路径含空格时 Windows 也能正确启动
+        let value = format!("\"{exe_str}\"");
+        let status = Command::new("reg")
+            .args(["add", run_key, "/v", "Ruiss", "/t", "REG_SZ", "/d", &value, "/f"])
+            .status()
+            .map_err(|e| format!("调用 reg.exe 失败: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "写入注册表开机自启失败（reg add 退出码 {:?}）",
+                status.code()
+            ));
+        }
+        log::info!("开机自启已启用: {exe_str}");
+    } else {
+        // 键不存在时 reg delete 返回非 0，属正常情况，忽略
+        let _ = Command::new("reg")
+            .args(["delete", run_key, "/v", "Ruiss", "/f"])
+            .status();
+        log::info!("开机自启已关闭");
+    }
+    Ok(())
+}

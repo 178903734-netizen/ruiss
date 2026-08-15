@@ -2204,3 +2204,46 @@ pub fn start_clipboard_watcher(
         })),
     }
 }
+
+// ===== 开机自启（写/删 ~/Library/LaunchAgents/com.ruiss.app.plist）=====
+
+/// 设置开机自启。enabled=true 写 LaunchAgent plist（RunAtLoad 指向当前 exe）；
+/// false 删除该 plist。LaunchAgent 方案无需新增依赖，所有 macOS 版本通用。
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+    let agents_dir = home.join("Library").join("LaunchAgents");
+    let plist_path = agents_dir.join("com.ruiss.app.plist");
+
+    if enabled {
+        std::fs::create_dir_all(&agents_dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("获取当前 exe 路径失败: {e}"))?;
+        // 打包后 current_exe 指向 Ruiss.app/Contents/MacOS/ruiss，直接作为启动命令即可
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ruiss.app</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+            exe = exe.to_string_lossy()
+        );
+        std::fs::write(&plist_path, content).map_err(|e| format!("写入 LaunchAgent plist 失败: {e}"))?;
+        log::info!("开机自启已启用: {}", exe.to_string_lossy());
+    } else {
+        match std::fs::remove_file(&plist_path) {
+            Ok(()) => log::info!("开机自启已关闭"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("删除 LaunchAgent plist 失败: {e}")),
+        }
+    }
+    Ok(())
+}
