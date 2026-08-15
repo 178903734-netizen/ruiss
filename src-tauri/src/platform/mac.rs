@@ -909,19 +909,31 @@ impl InputInjector {
                     };
                     if *down {
                         let now = Instant::now();
-                        let same_spot = (st.last_pos.0 - x).abs() <= DOUBLE_CLICK_DISTANCE
-                            && (st.last_pos.1 - y).abs() <= DOUBLE_CLICK_DISTANCE;
-                        st.count = if now.duration_since(st.last_time) <= DOUBLE_CLICK_WINDOW
-                            && same_spot
-                        {
-                            st.count + 1
+                        // 双击/三击识别只对左键有意义（Finder 双击打开、三击选段）。
+                        // 右键/中键必须始终是 clickState=1：系统把"第二击"语义的右键
+                        // 事件交给应用时，应用不会弹出上下文菜单 → 跨屏右键"失效"
+                        // （2026-08-14 根因：计数跨按钮共享，左键点击把紧随其后的
+                        // 右键计成 clickState=2，macOS 认为缺少首击而忽略右键菜单）。
+                        // 同时非左键按下要刷新序列状态：真实系统里插入其他按钮会
+                        // 重置左键双击计数，这里保持一致（也防止右键反污染左键序列）。
+                        if *button == 0 {
+                            let same_spot = (st.last_pos.0 - x).abs() <= DOUBLE_CLICK_DISTANCE
+                                && (st.last_pos.1 - y).abs() <= DOUBLE_CLICK_DISTANCE;
+                            st.count = if now.duration_since(st.last_time) <= DOUBLE_CLICK_WINDOW
+                                && same_spot
+                            {
+                                st.count + 1
+                            } else {
+                                1
+                            };
                         } else {
-                            1
-                        };
+                            st.count = 1;
+                        }
                         st.last_time = now;
                         st.last_pos = (x, y);
                     }
-                    // down 计算/更新计数，up 沿用当前计数（不重置、不再判定）
+                    // down 计算/更新计数，up 沿用当前计数（不重置、不再判定）。
+                    // 右键/中键在此恒为 1，up 同样携带 1，保持单次右键语义。
                     ev.set_integer_value_field(
                         EventField::MOUSE_EVENT_CLICK_STATE,
                         st.count as i64,
