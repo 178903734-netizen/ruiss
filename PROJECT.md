@@ -161,6 +161,10 @@ npx tauri build --bundles nsis   # 产物：src-tauri/target/release/bundle/nsis
   - 已自动化验证：注入生效（GetAsyncKeyState 校验）、跨进程事件被钩子捕获
     （探针 + RUISS_NO_SUPPRESS）、正常模式防回环生效。
 - [x] M2 双机打通（网络层 + 跨屏判定 + 键位映射）：键鼠跨屏已完成并实机联测。
+- [x] M2.5 跨屏稳定性（2026-08-16）：握手看门狗——TakeControl 发出后 3 秒未收到
+  ControlReady（对端崩溃/卡死/双方抢控）自动回滚：恢复光标 + 解除输入屏蔽 +
+  通知对端 ReleaseControl + 清理本机拖拽。防"对端不确认 → 本机光标永久隐藏、
+  输入永久屏蔽、只能重启"。实现：lib.rs RouterState.tx_take_at + tick 循环检查。
 - [~] M3 剪贴板 + 文件 + 跨屏拖拽 + 托盘 UI：
   - 已实现（代码层）：协议扩展（文字/图片/文件/分块流/拖拽通告）；
     Win+Mac 平台剪贴板读写与监听（防回环）；剪贴板同步协调器；

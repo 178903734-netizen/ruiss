@@ -179,6 +179,9 @@ struct RouterState {
     /// 本机作为 Source 时的跨屏轮次。收到同轮次 ControlReady 前只缓存移动。
     tx_pointer_session: u64,
     tx_pointer_ready: bool,
+    /// 发起 TakeControl 的时刻。看门狗据此判断对端是否在超时内确认接手
+    /// （ControlReady 未到 = 对端没接住，需自动回滚，否则光标/输入永久卡死）。
+    tx_take_at: Option<Instant>,
     tx_pointer_seq: u64,
     pending_pointer_move: Option<Payload>,
     /// 本机作为 Sink 时当前接受的跨屏轮次及最后 UDP 序号。
@@ -203,6 +206,7 @@ impl RouterState {
             file_receiver: None,
             tx_pointer_session: 0,
             tx_pointer_ready: false,
+            tx_take_at: None,
             tx_pointer_seq: 0,
             pending_pointer_move: None,
             rx_pointer_session: 0,
@@ -473,6 +477,63 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                         }
                     }
                 }
+                // ===== 看门狗：跨屏握手超时自动回滚（只在网络正常时检查）=====
+                // 发起 TakeControl 后对端迟迟不确认（ControlReady 未到），说明对端
+                // 没接住（崩溃/卡死/双方抢控）。此时本机光标已隐藏、输入已屏蔽，
+                // 若放任不管会永久卡死（只能重启）。超时后自动恢复本机状态并通知
+                // 对端释放，保证任何情况下都能自己解锁。断线场景走上面的复位逻辑。
+                if connected {
+                    const TAKE_TIMEOUT: Duration = Duration::from_secs(3);
+                    let now = Instant::now();
+                    let watchdog_fired = r.tx_pointer_session != 0
+                        && !r.tx_pointer_ready
+                        && r
+                            .tx_take_at
+                            .is_some_and(|at| now.duration_since(at) >= TAKE_TIMEOUT);
+                    if watchdog_fired {
+                        log::warn!(
+                            "[WATCHDOG] 跨屏握手超时 {:.0}s：对端未确认 TakeControl，自动回滚",
+                            TAKE_TIMEOUT.as_secs_f32()
+                        );
+                        let session = r.tx_pointer_session;
+                        let (name, net) = (r.settings.name.clone(), r.net.clone());
+                        // 恢复本机输入状态（与断线复位一致）
+                        r.injector.reset_keyboard_state();
+                        platform::show_cursor();
+                        platform::set_local_input_blocked(false);
+                        platform::set_sink_active(false);
+                        if let Some(a) = r.arbiter.as_mut() {
+                            a.on_peer_release();
+                        }
+                        r.tx_pointer_session = 0;
+                        r.tx_pointer_ready = false;
+                        r.tx_take_at = None;
+                        r.tx_pointer_seq = 0;
+                        r.pending_pointer_move = None;
+                        r.rx_pointer_session = 0;
+                        r.rx_pointer_seq = 0;
+                        // 清理本机发起的拖拽会话（如有）
+                        if let Some(id) = r.outgoing_drag.take() {
+                            if let Some(sender) = &r.file_sender {
+                                sender.cancel_drag(&id);
+                            }
+                            if let Some(net) = &net {
+                                net.send_ctrl(Message::ctrl(
+                                    &name,
+                                    Payload::DragCancel { id },
+                                ));
+                            }
+                        }
+                        // 通知对端也复位（对端若已进入 Sink，收到后恢复自主）
+                        if let Some(net) = net {
+                            net.send_ctrl(Message::ctrl(
+                                &name,
+                                Payload::ReleaseControl { session },
+                            ));
+                        }
+                        continue; // 本 tick 已回滚，不再产生其他动作
+                    }
+                }
                 if let Some(a) = r.arbiter.as_mut() {
                     let (w, h) = platform::screen_size();
                     if !connected {
@@ -488,6 +549,7 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
                         }
                         r.tx_pointer_session = 0;
                         r.tx_pointer_ready = false;
+                        r.tx_take_at = None;
                         r.tx_pointer_seq = 0;
                         r.pending_pointer_move = None;
                         r.rx_pointer_session = 0;
@@ -557,6 +619,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 let was_sink = r.rx_pointer_session != 0;
                 r.tx_pointer_session = session;
                 r.tx_pointer_ready = false;
+                r.tx_take_at = Some(Instant::now());
                 r.tx_pointer_seq = 0;
                 r.pending_pointer_move = None;
                 // 从 Sink 反向夺回时，旧接收轮次立即作废。
@@ -668,6 +731,7 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 };
                 r.tx_pointer_session = 0;
                 r.tx_pointer_ready = false;
+                r.tx_take_at = None;
                 r.tx_pointer_seq = 0;
                 r.pending_pointer_move = None;
                 r.rx_pointer_session = 0;
@@ -767,6 +831,7 @@ async fn run_incoming_router(
                     // 新轮次生效时，任何旧 Source/UDP 状态立即作废。
                     r.tx_pointer_session = 0;
                     r.tx_pointer_ready = false;
+                    r.tx_take_at = None;
                     r.tx_pointer_seq = 0;
                     r.pending_pointer_move = None;
                     r.rx_pointer_session = *session;
@@ -803,6 +868,7 @@ async fn run_incoming_router(
                     };
                     if r.tx_pointer_session == *session {
                         log::info!("对端已准备好 session={session}，开始发送 UDP 指针帧");
+                        r.tx_take_at = None;
                         // 必须先把确认前缓存的帧排进 UDP 队列，再开放新帧；否则
                         // 捕获线程可能抢先发送 seq=1，随后旧缓存以 seq=2 覆盖新位置。
                         if let Some(pending) = r.pending_pointer_move.take() {
@@ -829,6 +895,7 @@ async fn run_incoming_router(
                     if accepted {
                         r.tx_pointer_session = 0;
                         r.tx_pointer_ready = false;
+                        r.tx_take_at = None;
                         r.tx_pointer_seq = 0;
                         r.pending_pointer_move = None;
                         r.rx_pointer_session = 0;
@@ -1100,6 +1167,7 @@ async fn apply_link_config(
         r.file_sender = None;
         r.tx_pointer_session = 0;
         r.tx_pointer_ready = false;
+        r.tx_take_at = None;
         r.tx_pointer_seq = 0;
         r.pending_pointer_move = None;
         r.rx_pointer_session = 0;
