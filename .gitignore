@@ -30,3 +30,6 @@ Thumbs.db
 src-tauri.zip
 src-tauri/src.rar
 *.rar
+
+# win 侧构建误产生的目录（D:/ 在 mac 上是普通字符，会生成 src-tauri/D:/ 残留）
+src-tauri/D:/
