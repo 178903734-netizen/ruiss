@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-08-17 — 修复跨屏剪贴板懒传文件夹/压缩包粘贴失效
+
+- 现象：跨屏复制粘贴文字/图片正常，但文件夹、压缩包等文件类型粘贴无反应。
+- 根因（platform/win.rs clip_wnd_proc）：`set_clipboard_file_promise` 中
+  `EmptyClipboard()` + 多次 `SetClipboardData()` 产生多条 `WM_CLIPBOARDUPDATE`，
+  但 `LOCAL_CLIPBOARD_SEQUENCE` 的 `compare_exchange` 去重只能吞掉一条。剩余通知
+  走进 `clipboard_read()` → `GetClipboardData(CF_HDROP)` 触发 `WM_RENDERFORMAT`
+  向自己的窗口发消息 → `render_clipboard_hdrop` 被提前执行 → `PENDING_LAZY_HDROP`
+  被消费 → 文件在后台静默传输完毕。用户真正粘贴时 offer 已空，粘贴无内容。
+  文字/图片走内联传输（payload 直接携带数据），不经延迟渲染，不受影响。
+- 修复（win.rs clip_wnd_proc WM_CLIPBOARDUPDATE 分支）：CAS 去重失败后，
+  检测 `PENDING_LAZY_HDROP` 是否存在——若有，说明当前通知来自本机
+  `set_clipboard_file_promise` 的写入，跳过本次读取，避免提前触发渲染。
+- 验证：cargo check 通过。
+
 ## 2026-08-17 — README 增加交流群二维码与微信号
 
 - 新增 docs/IMG_6373.jpeg（桌面 IMG_6373.jpeg 复制入库）。
