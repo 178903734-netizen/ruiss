@@ -2304,6 +2304,18 @@ unsafe extern "system" fn clip_wnd_proc(
         {
             return LRESULT(0);
         }
+        // set_clipboard_file_promise 里 EmptyClipboard + 多次 SetClipboardData
+        // 会产生多条 WM_CLIPBOARDUPDATE，CAS 只能吞掉一条。剩余通知若走进
+        // clipboard_read() 会触发 WM_RENDERFORMAT 提前消费懒传 offer，导致
+        // 用户真正粘贴时 offer 已空。此处检测：若有未消费的懒粘贴占位，
+        // 说明通知来自本机写入，跳过。
+        if PENDING_LAZY_HDROP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return LRESULT(0);
+        }
         let content = clipboard_read();
         if !content.is_empty() {
             CLIP_CB.with(|c| {

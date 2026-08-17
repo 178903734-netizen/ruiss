@@ -88,3 +88,11 @@ ruiss/
 - [BUILD.md](BUILD.md) — 环境安装、编译、双机联调指南
 - [CHANGELOG.md](CHANGELOG.md) — 变更记录
 - [AGENTS.md](AGENTS.md) — 协作规范（面向 AI 辅助开发）
+
+---
+
+## 交流群
+
+对 Ruiss 感兴趣？欢迎扫码添加微信（微信号：hu1562）进群交流：
+
+![交流群二维码](docs/IMG_6373.jpeg)

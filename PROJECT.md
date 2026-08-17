@@ -45,6 +45,7 @@ ruiss/
 ├── gui/                     # 前端：设置窗口（index.html + js + css）
 ├── docs/
 │   └── video-scripts.md     # 三平台视频文案（B站/抖音/YouTube）
+│ │   └── IMG_6373.jpeg        # README 交流群二维码
 ├── README.md                # 项目介绍（GitHub 仓库主页）
 ├── LICENSE                  # 开源协议（MIT）
 ├── package.json             # 打包工具链（本地 devDep：@tauri-apps/cli，npx tauri build）
