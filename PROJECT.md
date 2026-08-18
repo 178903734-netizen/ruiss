@@ -152,6 +152,31 @@ npx tauri build --bundles nsis   # 产物：src-tauri/target/release/bundle/nsis
 #（GNU 工具链 exe 动态依赖该 DLL，打包器不会自动带，必须显式配置）
 ```
 
+## 分支工作流与 CI（2026-08-18 起）
+
+```
+master          ← 稳定版，两边都验证过的代码才合进来，外部用户看到的
+  └─ dev        ← 日常开发分支，可能有问题也没关系
+```
+
+**日常开发流程**：
+1. 在 `dev` 上写代码、commit、push
+2. push 后 GitHub Actions 自动在 Windows + Mac 上编译（见 `.github/workflows/build.yml`）
+3. 去 GitHub 仓库 → Actions 页面下载编译产物（exe / dmg）测试
+4. 测试通过后合并到 `master`：`git checkout master && git merge dev && git push`
+
+**GitHub Actions**：
+- 触发条件：push 到 `dev` 或 `master`，或 PR 到 `master`
+- Windows job：`npx tauri build` → 产出 NSIS 安装包（`Ruiss-Windows-x64` artifact）
+- Mac job：`npx tauri build -- --target x86_64-apple-darwin` → 产出 DMG（`Ruiss-Mac-x64` artifact）
+- 产物下载：GitHub 仓库 → Actions → 点击对应构建记录 → Artifacts 区下载
+- 免费，公开仓库不限次数
+
+**注意事项**：
+- Mac 是 Intel（x86_64），不是 Apple Silicon
+- 推送 GitHub 需要代理（127.0.0.1:7890），不开代理 push 会超时失败
+- `master` 分支应保持可编译可运行，不要往 master 推未经验证的代码
+
 ## 当前进度
 
 - [x] M0 骨架：目录结构、Cargo.toml、Tauri 配置、托盘 + 设置窗口、模块占位、文档

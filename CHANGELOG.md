@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 2026-08-18 — 新增 dev 分支 + GitHub Actions 自动编译（Windows + Mac Intel）
+
+- 背景：开源后每次测试需要 Windows 和 Mac 两边手动打包，代码通过 GitHub 同步但不确定准确性。
+- 新增 `dev` 分支：日常开发在此分支，push 后自动编译，验证通过再合到 `master`。
+- 新增 `.github/workflows/build.yml`：push 到 dev/master 自动触发两个 job：
+  - Windows：`npx tauri build` → NSIS 安装包（artifact 名 `Ruiss-Windows-x64`）
+  - Mac Intel：`npx tauri build -- --target x86_64-apple-darwin` → DMG（artifact 名 `Ruiss-Mac-x64`）
+  - 产物在 GitHub Actions 页面 Artifacts 区下载，免费不限次数。
+- PROJECT.md 新增「分支工作流与 CI」段落，记录完整开发流程。
+- 注意：Mac 为 Intel（x86_64），非 Apple Silicon；推送 GitHub 需代理。
+
 ## 2026-08-18 — 修复应用随机崩溃（Mutex 中毒级联 panic）
 
 - 现象：Windows 上无提示直接退出，Mac 上弹崩溃对话框。无固定触发时机，使用中随机发生。
