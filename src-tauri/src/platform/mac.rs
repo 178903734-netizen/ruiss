@@ -48,6 +48,19 @@ extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRunLoopStop(rl: *const c_void);
+    /// CFArray 元素数量 / 取元素（跨屏按键转换遍历窗口列表用）。
+    fn CFArrayGetCount(theArray: core_foundation::array::CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(
+        theArray: core_foundation::array::CFArrayRef,
+        idx: isize,
+    ) -> *const c_void;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    /// 系统窗口列表（跨屏按键转换时判断前台浏览器是否全屏）。
+    /// option: kCGWindowListOptionOnScreenOnly = 1；relativeToWindow: kCGNullWindowID = 0。
+    fn CGWindowListCopyWindowInfo(option: u32, relativeToWindow: u32) -> core_foundation::base::CFTypeRef;
 }
 
 // 系统级光标隐藏（CoreGraphics）：与 Windows 的 SetSystemCursor 对称。
@@ -1146,6 +1159,139 @@ pub fn screen_size() -> (i32, i32) {
         }
         let frame: core_graphics::geometry::CGRect = objc::msg_send![screen, frame];
         (frame.size.width as i32, frame.size.height as i32)
+    }
+}
+
+/// 前台应用是否为浏览器且处于全屏。
+/// 跨屏按键转换用：Mac 浏览器全屏时认罗技注入的切标签/关标签信号，
+/// 非全屏时把 Ctrl+Tab / Ctrl+W 转成用户设置的后退/前进快捷键。
+pub fn frontmost_browser_fullscreen() -> bool {
+    let Some(bundle_id) = frontmost_bundle_id() else {
+        return false;
+    };
+    if !is_browser_bundle_id(&bundle_id) {
+        return false;
+    }
+    let Some(pid) = frontmost_pid() else {
+        return false;
+    };
+    frontmost_window_covers_screen(pid)
+}
+
+/// 前台应用 bundle id（NSWorkspace.frontmostApplication.bundleIdentifier）。
+fn frontmost_bundle_id() -> Option<String> {
+    unsafe {
+        let cls = objc::runtime::Class::get("NSWorkspace")?;
+        let workspace: *mut objc::runtime::Object = msg_send![cls, sharedWorkspace];
+        let app: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            return None;
+        }
+        let bundle: *mut objc::runtime::Object = msg_send![app, bundleIdentifier];
+        if bundle.is_null() {
+            return None;
+        }
+        let cf = core_foundation::string::CFString::wrap_under_get_rule(
+            bundle as core_foundation::string::CFStringRef,
+        );
+        Some(cf.to_string())
+    }
+}
+
+/// 前台应用 pid（NSWorkspace.frontmostApplication.processIdentifier）。
+fn frontmost_pid() -> Option<i32> {
+    unsafe {
+        let cls = objc::runtime::Class::get("NSWorkspace")?;
+        let workspace: *mut objc::runtime::Object = msg_send![cls, sharedWorkspace];
+        let app: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            return None;
+        }
+        let pid: i32 = msg_send![app, processIdentifier];
+        Some(pid)
+    }
+}
+
+fn is_browser_bundle_id(id: &str) -> bool {
+    matches!(
+        id,
+        "com.apple.Safari"
+            | "com.google.Chrome"
+            | "com.microsoft.edgemac"
+            | "org.mozilla.firefox"
+            | "com.brave.Browser"
+            | "com.operasoftware.Opera"
+            | "com.vivaldi.Vivaldi"
+            | "com.arc.Arc"
+    )
+}
+
+/// 前台应用的任意普通窗口是否覆盖整个主屏（全屏判定，允许 2px 容差）。
+fn frontmost_window_covers_screen(pid: i32) -> bool {
+    unsafe {
+        use core_foundation::base::TCFType;
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+
+        let list = CGWindowListCopyWindowInfo(1, 0); // kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+        if list.is_null() {
+            return false;
+        }
+        let arr = list as core_foundation::array::CFArrayRef;
+        let count = CFArrayGetCount(arr);
+        let (sw, sh) = screen_size();
+        let owner_key = CFString::new("kCGWindowOwnerPID");
+        let layer_key = CFString::new("kCGWindowLayer");
+        let bounds_key = CFString::new("kCGWindowBounds");
+        for i in 0..count {
+            let value = CFArrayGetValueAtIndex(arr, i);
+            if value.is_null() {
+                continue;
+            }
+            let dict: core_foundation::dictionary::CFDictionary<*const c_void, *const c_void> =
+                CFDictionary::wrap_under_get_rule(
+                    value as core_foundation::dictionary::CFDictionaryRef,
+                );
+            let Some(owner) = dict.find(owner_key.as_CFTypeRef()) else {
+                continue;
+            };
+            let owner_cf = core_foundation::base::CFType::wrap_under_get_rule(*owner);
+            let Some(num) = owner_cf.downcast::<CFNumber>() else {
+                continue;
+            };
+            if num.to_i64().unwrap_or(-1) as i32 != pid {
+                continue;
+            }
+            // 只看普通窗口层，忽略菜单栏/通知/面板等
+            if let Some(layer) = dict.find(layer_key.as_CFTypeRef()) {
+                let layer_cf = core_foundation::base::CFType::wrap_under_get_rule(*layer);
+                if let Some(num) = layer_cf.downcast::<CFNumber>() {
+                    if num.to_i64().unwrap_or(-1) != 0 {
+                        continue;
+                    }
+                }
+            }
+            let Some(bounds) = dict.find(bounds_key.as_CFTypeRef()) else {
+                continue;
+            };
+            let bounds_cf = core_foundation::base::CFType::wrap_under_get_rule(*bounds);
+            let Some(data) = bounds_cf.downcast::<CFData>() else {
+                continue;
+            };
+            let bytes = data.bytes();
+            if bytes.len() < 32 {
+                continue;
+            }
+            // CGRect：x, y, width, height（64 位下 CGFloat = f64）
+            let w = f64::from_le_bytes(bytes[16..24].try_into().unwrap());
+            let h = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
+            if (w - sw as f64).abs() <= 2.0 && (h - sh as f64).abs() <= 2.0 {
+                return true;
+            }
+        }
+        false
     }
 }
 

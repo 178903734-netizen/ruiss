@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::core::arbiter::{Action, Arbiter, Layout, Mode};
 use crate::core::keys::{translate_windows_shortcut_to_mac, Key, ModifierState, NativeShortcut};
@@ -799,7 +799,12 @@ async fn run_incoming_router(
     mut incoming: tokio::sync::mpsc::Receiver<Message>,
     router: Arc<Mutex<RouterState>>,
     injector: Arc<platform::InputInjector>,
+    app: tauri::AppHandle,
 ) {
+    // 罗技注入键转换状态（Mac 被控端）：Ctrl/Shift 是否待定按下、是否正在吞后续事件
+    let mut ctrl_held = false;
+    let mut shift_held = false;
+    let mut swallow_until_ctrl_up = false;
     while let Some(msg) = incoming.recv().await {
         match &msg.payload {
             Payload::Heartbeat {
@@ -1079,7 +1084,26 @@ async fn run_incoming_router(
                         .unwrap_or(false)
                 };
                 if sink {
-                    injector.inject(msg.payload.clone());
+                    // 调试显示：把对端发来的按键/快捷键实时推给 GUI（排查罗技等软件重映射）
+                    if let Some(text) = debug_payload_text(&msg.payload) {
+                        log::info!("[DEBUG-INPUT] {text}");
+                        let _ = app.emit("debug-input", serde_json::json!({ "text": text }));
+                    }
+                    // 罗技注入键转换（Mac 被控端）：浏览器非全屏时 Ctrl+Tab→后退、Ctrl+W→前进
+                    #[cfg(target_os = "macos")]
+                    let handled = handle_sink_key_conversion(
+                        &msg.payload,
+                        &router,
+                        &injector,
+                        &mut ctrl_held,
+                        &mut shift_held,
+                        &mut swallow_until_ctrl_up,
+                    );
+                    #[cfg(not(target_os = "macos"))]
+                    let handled = false;
+                    if !handled {
+                        injector.inject(msg.payload.clone());
+                    }
                 } else {
                     log::debug!("忽略对端事件（本机 Source）: {:?}", msg.payload);
                 }
@@ -1087,6 +1111,198 @@ async fn run_incoming_router(
         }
     }
     log::info!("网络路由任务结束");
+}
+
+/// 把对端发来的按键类事件转成可读文本（GUI 调试面板显示用）。
+fn debug_payload_text(p: &Payload) -> Option<String> {
+    match p {
+        Payload::Key { key, down, .. } => Some(format!(
+            "按键 {} {}",
+            key_display(*key),
+            if *down { "按下" } else { "抬起" }
+        )),
+        Payload::Shortcut { shortcut } => Some(format!("快捷键 {}", shortcut_display(shortcut))),
+        Payload::MouseButton { button, down } => Some(format!(
+            "鼠标按钮 {} {}",
+            button,
+            if *down { "按下" } else { "抬起" }
+        )),
+        _ => None,
+    }
+}
+
+/// Key → 可读名（Digit1 → "1"，其余用枚举名）。
+fn key_display(key: Key) -> String {
+    let name = format!("{:?}", key);
+    name.strip_prefix("Digit").map(str::to_string).unwrap_or(name)
+}
+
+/// NativeShortcut → "Cmd+1" 形式的可读文本。
+fn shortcut_display(s: &NativeShortcut) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if s.modifiers.super_key {
+        parts.push("Cmd".into());
+    }
+    if s.modifiers.ctrl {
+        parts.push("Ctrl".into());
+    }
+    if s.modifiers.alt {
+        parts.push("Alt".into());
+    }
+    if s.modifiers.shift {
+        parts.push("Shift".into());
+    }
+    parts.push(key_display(s.key));
+    parts.join("+")
+}
+
+/// Mac 被控端收到罗技注入的 Ctrl+Tab / Ctrl+W 组合时的转换：
+/// - 浏览器非全屏：转成用户设置的后退/前进快捷键（罗技把侧键重映射成了切标签/关标签）
+/// - 浏览器全屏：认罗技信号，原样注入
+/// 返回 true 表示已处理（吞掉或已注入），false 表示调用方应正常注入。
+#[cfg(target_os = "macos")]
+fn handle_sink_key_conversion(
+    payload: &Payload,
+    router: &Arc<Mutex<RouterState>>,
+    injector: &platform::InputInjector,
+    ctrl_held: &mut bool,
+    shift_held: &mut bool,
+    swallow_until_ctrl_up: &mut bool,
+) -> bool {
+    let Payload::Key { key, down, .. } = payload else {
+        return false;
+    };
+
+    // 转换后：吞掉 Tab up / Ctrl up，直到 Ctrl 抬起
+    if *swallow_until_ctrl_up {
+        if *key == Key::Ctrl && !*down {
+            *swallow_until_ctrl_up = false;
+        }
+        return true;
+    }
+
+    match key {
+        // Ctrl 按下：先缓存，等下一个键决定是组合还是普通
+        Key::Ctrl if *down => {
+            *ctrl_held = true;
+            true // 吞掉 Ctrl down（稍后补或丢弃）
+        }
+        // Ctrl 抬起：若之前缓存了 Ctrl down 但没转换（单独 Ctrl），吞掉；否则正常
+        Key::Ctrl if !*down => {
+            if *ctrl_held {
+                *ctrl_held = false;
+                return true; // down 没注入，up 也吞，避免 Mac 上 Ctrl 卡住
+            }
+            false
+        }
+        // Shift 按下：缓存，等组合判定（Ctrl+Shift+Tab → 切换桌面）
+        Key::Shift if *down => {
+            *shift_held = true;
+            true
+        }
+        // Shift 抬起：若之前缓存了 Shift down，吞掉（与 down 配对）
+        Key::Shift if !*down => {
+            if *shift_held {
+                *shift_held = false;
+                return true;
+            }
+            false
+        }
+        Key::Tab | Key::W if *down && *ctrl_held => {
+            *ctrl_held = false;
+            let desktop_switch = *key == Key::Tab && *shift_held;
+            *shift_held = false;
+            if !platform::frontmost_browser_fullscreen() {
+                if *key == Key::Tab {
+                    // 滚轮/标签键两个方向 → 切换桌面：
+                    // Ctrl+Tab（无 Shift）→ Control+→（下一个桌面）
+                    // Ctrl+Shift+Tab → Control+←（上一个桌面）
+                    let arrow = if desktop_switch { Key::ArrowLeft } else { Key::ArrowRight };
+                    let combo = if desktop_switch { "Ctrl+Shift+Tab" } else { "Ctrl+Tab" };
+                    let target = if desktop_switch { "Control+←" } else { "Control+→" };
+                    let shortcut = NativeShortcut {
+                        key: arrow,
+                        modifiers: ModifierState {
+                            ctrl: true,
+                            ..Default::default()
+                        },
+                    };
+                    log::info!("[DEBUG-INPUT] 转换 {combo} → {target}（切换桌面）");
+                    injector.inject(Payload::Shortcut { shortcut });
+                    *swallow_until_ctrl_up = true;
+                    return true;
+                }
+                // 非全屏：Ctrl+W → 用户设置的前进快捷键
+                let r = router.lock().unwrap_or_else(|e| e.into_inner());
+                let source = r.settings.mouse_forward_shortcut;
+                if let Some(src) = source {
+                    let target = translate_windows_shortcut_to_mac(src.modifiers, src.key);
+                    let shortcut = NativeShortcut {
+                        key: target.key,
+                        modifiers: target.modifiers,
+                    };
+                    log::info!(
+                        "[DEBUG-INPUT] 转换 Ctrl+{} → {}",
+                        if *key == Key::Tab { "Tab" } else { "W" },
+                        shortcut_display(&shortcut)
+                    );
+                    injector.inject(Payload::Shortcut { shortcut });
+                }
+                *swallow_until_ctrl_up = true;
+                true // 吞掉 Tab/W down
+            } else {
+                // 全屏：认罗技信号，补注入缓存的 Ctrl（+Shift）再原样注入当前键
+                injector.inject(Payload::Key {
+                    key: Key::Ctrl,
+                    scan: 0,
+                    extended: false,
+                    down: true,
+                });
+                if desktop_switch {
+                    injector.inject(Payload::Key {
+                        key: Key::Shift,
+                        scan: 0,
+                        extended: false,
+                        down: true,
+                    });
+                }
+                false // 当前 Tab/W 交给调用方注入
+            }
+        }
+        // 其他键：若是 Ctrl 组合的后续键（如 Ctrl+C），补注入 Ctrl（+Shift）再正常注入
+        _ if *down && *ctrl_held => {
+            *ctrl_held = false;
+            injector.inject(Payload::Key {
+                key: Key::Ctrl,
+                scan: 0,
+                extended: false,
+                down: true,
+            });
+            if *shift_held {
+                *shift_held = false;
+                injector.inject(Payload::Key {
+                    key: Key::Shift,
+                    scan: 0,
+                    extended: false,
+                    down: true,
+                });
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handle_sink_key_conversion(
+    _payload: &Payload,
+    _router: &Arc<Mutex<RouterState>>,
+    _injector: &platform::InputInjector,
+    _ctrl_held: &mut bool,
+    _shift_held: &mut bool,
+    _swallow_until_ctrl_up: &mut bool,
+) -> bool {
+    false
 }
 
 /// 注入"粘贴"组合键：本机是 Mac 用 Command+V，Windows 用 Ctrl+V。
@@ -1237,6 +1453,7 @@ async fn apply_link_config(
         start.incoming,
         router.clone(),
         injector,
+        _app.clone(),
     ));
     tauri::async_runtime::spawn(run_file_router(start.file_incoming, router.clone()));
     log::info!(
