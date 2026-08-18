@@ -48,7 +48,7 @@ pub fn run() {
             app.manage(router.clone());
 
             // 开机自启对齐：设置里开了就确保系统已注册（防升级/移动程序后注册失效）
-            if router.lock().unwrap().settings.autostart {
+            if router.lock().unwrap_or_else(|e| e.into_inner()).settings.autostart {
                 if let Err(e) = platform::set_autostart(true) {
                     log::error!("开机自启注册失败: {e}");
                 }
@@ -57,7 +57,7 @@ pub fn run() {
             // 常驻捕获（自测/跨屏都要用；失败则 app 照常可用，仅无输入功能）
             match start_capturer(router.clone()) {
                 Ok(c) => {
-                    router.lock().unwrap().capture_ok = true;
+                    router.lock().unwrap_or_else(|e| e.into_inner()).capture_ok = true;
                     app.manage(CapturerHandle(c));
                 }
                 Err(e) => {
@@ -74,13 +74,13 @@ pub fn run() {
             platform::start_drag_path_probe();
 
             // 文件接收器（监听对端 FileStart/Chunk/End，写下载目录 + 写剪贴板 + 通知前端）
-            let receive_dir = router.lock().unwrap().settings.receive_dir.clone();
+            let receive_dir = router.lock().unwrap_or_else(|e| e.into_inner()).settings.receive_dir.clone();
             let file_receiver = Arc::new(file_transfer::FileReceiver::new(
                 app.handle().clone(),
                 &receive_dir,
             ));
             {
-                let mut r = router.lock().unwrap();
+                let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
                 r.file_receiver = Some(file_receiver.clone());
             }
             let cleanup_receiver = file_receiver.clone();
@@ -92,7 +92,7 @@ pub fn run() {
             });
 
             // 若已配置对端 IP，启动网络
-            if !router.lock().unwrap().settings.peer_ip.trim().is_empty() {
+            if !router.lock().unwrap_or_else(|e| e.into_inner()).settings.peer_ip.trim().is_empty() {
                 let r = router.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
