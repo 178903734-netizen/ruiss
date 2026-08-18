@@ -30,3 +30,6 @@ Thumbs.db
 src-tauri.zip
 src-tauri/src.rar
 *.rar
+
+# 调试打包产物（勿提交）
+dist-debug-test/
