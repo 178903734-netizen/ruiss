@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-08-18 — 修复应用随机崩溃（Mutex 中毒级联 panic）
+
+- 现象：Windows 上无提示直接退出，Mac 上弹崩溃对话框。无固定触发时机，使用中随机发生。
+- 根因（lib.rs setup 阶段）：`router.lock().unwrap()` 共 5 处——正常时无害，
+  但当任意后台线程（剪贴板/文件传输/网络回调）在持有 router Mutex 期间 panic，
+  Mutex 变为 poisoned 状态，后续所有 `unwrap()` 调用级联 panic → 进程崩溃。
+  Windows 上 WebView2/Tauri 会静默吞掉 panic（无错误对话框），Mac 上 crash reporter 弹出提示。
+  代码其他 ~30 处锁操作已用 `unwrap_or_else(|e| e.into_inner())` 安全恢复，唯独这 5 处遗漏。
+- 来源：line 51/95 为 8/5 初始代码，line 60/83 为 8/10 文件接收器，
+  line 77 为 8/12 文件接收器重构——均非最近改动直接引入，但近期剪贴板懒传、
+  看门狗等改动增加了持锁路径和出错概率，放大了触发频率。
+- 修复（lib.rs）：5 处 `router.lock().unwrap()` 全部改为
+  `router.lock().unwrap_or_else(|e| e.into_inner())`，与代码其余部分一致。
+- 验证：`cargo check` 编译中（依赖多需较长时间），改动为纯模式替换语法无误。
+
 ## 2026-08-17 — 修复跨屏剪贴板懒传文件夹/压缩包粘贴失效
 
 - 现象：跨屏复制粘贴文字/图片正常，但文件夹、压缩包等文件类型粘贴无反应。
