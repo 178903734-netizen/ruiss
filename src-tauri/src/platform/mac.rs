@@ -1921,6 +1921,15 @@ unsafe fn read_files(pb: *mut Object) -> Option<Vec<String>> {
     let mut files = Vec::with_capacity(count);
     for i in 0..count {
         let url: *mut Object = msg_send![urls, objectAtIndex: i];
+        // 只认文件 URL。这里的 options 没传 NSPasteboardURLReadingFileURLsOnlyKey，
+        // 所以 readObjectsForClasses 会把 http(s):// 这类普通 URL 也读出来
+        // （复制"带链接的文本"时就会命中）；对普通 URL 取 -path 会得到 "/" 之类的
+        // 伪路径，于是把一次文本复制误判成"复制文件"→ 走文件通道 → 对端粘贴没有东西，
+        // 本机还会弹出"文件传过来了"的提示音。用 -isFileURL 过滤掉非文件 URL。
+        let is_file: bool = msg_send![url, isFileURL];
+        if !is_file {
+            continue;
+        }
         let path: *mut Object = msg_send![url, path];
         if let Some(s) = nsstring_to_string(path) {
             files.push(s);
