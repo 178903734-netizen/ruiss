@@ -867,9 +867,13 @@ async fn run_incoming_router(
     injector: Arc<platform::InputInjector>,
     app: tauri::AppHandle,
 ) {
-    // 罗技注入键转换状态（Mac 被控端）：Ctrl/Shift 是否待定按下、是否正在吞后续事件
+    // 罗技注入键转换状态（Mac 被控端）：Ctrl/Shift 是否待定按下、是否正在吞后续事件。
+    // 只在 macOS 分支使用，非 macOS 构建连声明都不生成（否则会报未使用/不必要 mut 警告）。
+    #[cfg(target_os = "macos")]
     let mut ctrl_held = false;
+    #[cfg(target_os = "macos")]
     let mut shift_held = false;
+    #[cfg(target_os = "macos")]
     let mut swallow_until_ctrl_up = false;
     while let Some(msg) = incoming.recv().await {
         match &msg.payload {
@@ -1360,18 +1364,6 @@ fn handle_sink_key_conversion(
         }
         _ => false,
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn handle_sink_key_conversion(
-    _payload: &Payload,
-    _router: &Arc<Mutex<RouterState>>,
-    _injector: &platform::InputInjector,
-    _ctrl_held: &mut bool,
-    _shift_held: &mut bool,
-    _swallow_until_ctrl_up: &mut bool,
-) -> bool {
-    false
 }
 
 /// 注入"粘贴"组合键：本机是 Mac 用 Command+V，Windows 用 Ctrl+V。

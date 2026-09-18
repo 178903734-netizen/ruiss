@@ -1206,7 +1206,15 @@ pub fn screen_size() -> (i32, i32) {
 /// 前台应用是否为浏览器且处于全屏。
 /// 跨屏按键转换用：Mac 浏览器全屏时认罗技注入的切标签/关标签信号，
 /// 非全屏时把 Ctrl+Tab / Ctrl+W 转成用户设置的后退/前进快捷键。
+///
+/// 调用方是 tokio 网络路由任务（后台线程），而这里要读 NSWorkspace（AppKit）：
+/// 后台线程访问 AppKit 正是 macOS 随机 EXC_BAD_ACCESS 的来源，所以统一回主线程
+/// 执行（CGWindowList 部分在主线程跑同样没有副作用）。
 pub fn frontmost_browser_fullscreen() -> bool {
+    run_on_main_thread(frontmost_browser_fullscreen_on_main)
+}
+
+fn frontmost_browser_fullscreen_on_main() -> bool {
     let Some(bundle_id) = frontmost_bundle_id() else {
         return false;
     };
