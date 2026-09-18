@@ -162,6 +162,33 @@ pub fn set_sink_active(active: bool) {
     }
 }
 
+/// 紧急解锁热键是否被按下（Control+Option+Shift+R，与 Windows 的 Ctrl+Alt+Shift+R 对应）。
+/// 跨屏期间本机点击/键盘都被 tap 吞掉、光标又被系统隐藏，用户看不见鼠标也点不到
+/// 任何窗口（菜单栏图标同样点不到）。这个组合由事件 tap 在"吞事件之前"识别，
+/// 是唯一不依赖鼠标的自救入口。lib.rs 的 tick 循环轮询它。
+static FORCE_RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 供上层（lib.rs tick 循环）取用并清除紧急解锁请求。
+pub fn take_force_release_request() -> bool {
+    FORCE_RELEASE_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// 判定这次按键是否是紧急解锁组合（Control+Option+Shift+R）。
+/// kVK_ANSI_R 的键码经 cg_to_key 映射为 Key::R，修饰键直接读事件 flags。
+fn is_emergency_release_hotkey(event_type: CGEventType, event: &CGEvent) -> bool {
+    if !matches!(event_type, CGEventType::KeyDown) {
+        return false;
+    }
+    let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    if cg_to_key(code) != Key::R {
+        return false;
+    }
+    let flags = event.get_flags();
+    flags.contains(CGEventFlags::CGEventFlagControl)
+        && flags.contains(CGEventFlags::CGEventFlagAlternate)
+        && flags.contains(CGEventFlags::CGEventFlagShift)
+}
+
 /// 注入侧当前按住的鼠标按钮（-1 = 未按住）。
 /// macOS 拖选/拖拽要求按住按钮期间的移动事件类型为 *MouseDragged
 /// （MouseMoved 不会更新选区）；注入移动时按此状态选择事件类型。
@@ -306,6 +333,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     return CallbackResult::Drop;
                 }
 
+                // 紧急解锁热键：必须在下面"跨屏吞事件"之前识别，
+                // 否则本机键盘被整体吞掉时用户没有任何自救入口。
+                if is_emergency_release_hotkey(event_type, event) {
+                    FORCE_RELEASE_REQUESTED.store(true, Ordering::SeqCst);
+                    log::warn!("[EMERGENCY] 检测到紧急解锁热键 Control+Option+Shift+R");
+                }
+
                 let is_move = matches!(
                     event_type,
                     CGEventType::MouseMoved
@@ -431,6 +465,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                     }
                     log::warn!("[MAC-TAP] 事件 tap 被系统禁用，已自动重新启用: {event_type:?}");
                     return CallbackResult::Drop;
+                }
+
+                // 紧急解锁热键：必须在下面"跨屏吞事件"之前识别，
+                // 否则本机键盘被整体吞掉时用户没有任何自救入口。
+                if is_emergency_release_hotkey(event_type, event) {
+                    FORCE_RELEASE_REQUESTED.store(true, Ordering::SeqCst);
+                    log::warn!("[EMERGENCY] 检测到紧急解锁热键 Control+Option+Shift+R");
                 }
 
                 // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
@@ -1405,6 +1446,9 @@ extern "C" fn promise_write(
                 Box::from_raw(completion_raw as *mut block::RcBlock<(*mut Object,), ()>)
             };
             let result = if is_drag {
+                // 有界等待：对端一直不给数据（卡死/会话丢失）时必须结束等待，
+                // 否则这次拖拽的 completion 永远不回调，系统侧的拖拽会话悬挂。
+                let deadline = Instant::now() + Duration::from_secs(300);
                 let result = loop {
                     if let Some(result) = REMOTE_DRAG_RESULTS
                         .get_or_init(Default::default)
@@ -1413,6 +1457,10 @@ extern "C" fn promise_write(
                         .remove(&id)
                     {
                         break result;
+                    }
+                    if Instant::now() >= deadline {
+                        log::error!("[DRAG] 等待对端拖拽数据超时，结束本次拖拽会话");
+                        break Err("remote drag timed out".to_string());
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 };
@@ -1553,6 +1601,27 @@ unsafe fn general_pasteboard() -> *mut Object {
     msg_send![class!(NSPasteboard), generalPasteboard]
 }
 
+/// 把 AppKit / NSPasteboard 操作放到主线程执行（已在主线程则直接执行）。
+///
+/// NSPasteboard 不是线程安全的：Apple 明确要求 AppKit 只在主线程使用。Ruiss 的
+/// 剪贴板读写由后台线程发起（tokio 网络任务、剪贴板轮询线程），而主线程上的
+/// WebKit 剪贴板监听也在读同一份 NSPasteboard 内部状态——两者并发就是随机
+/// EXC_BAD_ACCESS 崩溃（Tauri 官方 issue #3205 记录的正是这个栈）。
+/// 主线程内再调用不会走 exec_sync，避免自锁死。
+fn run_on_main_thread<T, F>(work: F) -> T
+where
+    F: Send + FnOnce() -> T,
+    T: Send,
+{
+    unsafe {
+        let is_main: bool = msg_send![class!(NSThread), isMainThread];
+        if is_main {
+            return work();
+        }
+    }
+    dispatch::Queue::main().exec_sync(work)
+}
+
 /// 返回进程期常驻的 NSString 类型名。剪贴板监听运行在自建线程，没有 Cocoa
 /// autorelease pool，因此不能每轮创建 autoreleased NSString。
 unsafe fn ns_type(name: &str) -> *mut Object {
@@ -1611,6 +1680,12 @@ unsafe fn string_to_nsstring(s: &str) -> *mut Object {
 
 /// 读当前剪贴板（优先级 files > image > text）。
 pub fn clipboard_read() -> ClipboardContent {
+    // NSPasteboard 读取同样要在主线程（读操作也会改它内部的类型缓存）。
+    // 用闭包包一层而不是直接传函数项：unsafe fn 不能直接当 FnOnce 用。
+    run_on_main_thread(|| unsafe { clipboard_read_on_main() })
+}
+
+unsafe fn clipboard_read_on_main() -> ClipboardContent {
     unsafe {
         let pb = general_pasteboard();
         if pb.is_null() {
@@ -1702,19 +1777,23 @@ unsafe fn read_files(pb: *mut Object) -> Option<Vec<String>> {
 
 /// 写文本到剪贴板。
 pub fn clipboard_write_text(text: &str) {
-    unsafe {
+    // 写操作必须回主线程：后台线程写 NSPasteboard 与主线程 WebKit 的剪贴板
+    // 监听并发访问是 macOS 上随机崩溃的根因（见 run_on_main_thread 注释）。
+    let text = text.to_string();
+    run_on_main_thread(move || unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
-        let nsstr = string_to_nsstring(text);
+        let nsstr = string_to_nsstring(&text);
         let t = ns_type("public.utf8-plain-text");
         let _: () = msg_send![pb, setString: nsstr forType: t];
         remember_local_clipboard_change(pb);
-    }
+    });
 }
 
 /// 写 PNG 图片到剪贴板（同时写 PNG 和 TIFF 类型，兼容性最好）。
 pub fn clipboard_write_image(png_bytes: &[u8]) {
-    unsafe {
+    let png_bytes = png_bytes.to_vec();
+    run_on_main_thread(move || unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
         let data: *mut Object = msg_send![
@@ -1725,7 +1804,7 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
         let t = ns_type("public.png");
         let _: () = msg_send![pb, setData: data forType: t];
         // 同时写 TIFF（部分应用只认 TIFF）
-        if let Some(tiff) = png_to_tiff(png_bytes) {
+        if let Some(tiff) = png_to_tiff(&png_bytes) {
             let t2 = ns_type("public.tiff");
             let tdata: *mut Object = msg_send![
                 class!(NSData),
@@ -1735,18 +1814,18 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             let _: () = msg_send![pb, setData: tdata forType: t2];
         }
         remember_local_clipboard_change(pb);
-    }
+    });
 }
 
 pub fn clipboard_clear() {
-    unsafe {
+    run_on_main_thread(|| unsafe {
         let pb = general_pasteboard();
         if pb.is_null() {
             return;
         }
         let _: () = msg_send![pb, clearContents];
         remember_local_clipboard_change(pb);
-    }
+    });
 }
 
 /// PNG → TIFF（NSBitmapImageRep 中转）。
@@ -1773,13 +1852,14 @@ pub fn clipboard_write_files(paths: &[String]) {
     if paths.is_empty() {
         return;
     }
-    unsafe {
+    let paths = paths.to_vec();
+    run_on_main_thread(move || unsafe {
         let pb = general_pasteboard();
         let _: () = msg_send![pb, clearContents];
         // 构造 NSURL 数组
         let n = paths.len();
         let mut urls: Vec<*mut Object> = Vec::with_capacity(n);
-        for p in paths {
+        for p in &paths {
             let path_ns = string_to_nsstring(p);
             let url: *mut Object = msg_send![
                 class!(NSURL),
@@ -1794,7 +1874,7 @@ pub fn clipboard_write_files(paths: &[String]) {
         ];
         let _: bool = msg_send![pb, writeObjects: arr];
         remember_local_clipboard_change(pb);
-    }
+    });
 }
 
 /// 懒粘贴剪贴板回调：粘贴时 promise_write 用它请求源端传输。
@@ -1805,6 +1885,27 @@ static CLIP_PASTE_CB: OnceLock<Mutex<Option<crate::platform::ClipboardPasteCallb
 static CLIP_PASTE_CACHE: OnceLock<Mutex<HashMap<String, Result<Vec<String>, String>>>> =
     OnceLock::new();
 
+/// 强引用当前剪贴板 promise 的 delegate。
+/// NSFilePromiseProvider.delegate 是 weak：delegate 一旦被释放，粘贴时系统就拿不到
+/// 回调（Finder 里表现为"粘贴"变灰/拷不出文件）。这里显式持有，并限制数量避免
+/// 无限增长（被淘汰的都是早已被 clearContents 释放掉的旧 offer，不会再被回调）。
+static CLIP_PROMISE_DELEGATES: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
+const MAX_RETAINED_PROMISE_DELEGATES: usize = 256;
+
+fn retain_promise_delegate(delegate: *mut Object) {
+    let mut slots = CLIP_PROMISE_DELEGATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slots.push(delegate as usize);
+    while slots.len() > MAX_RETAINED_PROMISE_DELEGATES {
+        let old = slots.remove(0);
+        unsafe {
+            let _: () = msg_send![old as *mut Object, release];
+        }
+    }
+}
+
 /// 把对端复制的文件挂成剪贴板虚拟文件（懒传）：剪贴板写入 NSFilePromiseProvider，
 /// 用户粘贴时系统回调 promise_write，届时才回源端请求传输。
 pub fn set_clipboard_file_promise(
@@ -1812,18 +1913,18 @@ pub fn set_clipboard_file_promise(
     names: Vec<String>,
     callback: crate::platform::ClipboardPasteCallback,
 ) {
-    unsafe {
-        log::info!(
-            "[CLIPBOARD-MAC] 挂文件承诺 offer id={id} names={names:?}"
-        );
-        // 新 offer 覆盖旧占位与旧下载缓存。
-        CLIP_PASTE_CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        let cb_slot = CLIP_PASTE_CB.get_or_init(Default::default);
-        *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    log::info!("[CLIPBOARD-MAC] 挂文件承诺 offer id={id} names={names:?}");
+    // 新 offer 覆盖旧占位与旧下载缓存。
+    CLIP_PASTE_CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    let cb_slot = CLIP_PASTE_CB.get_or_init(Default::default);
+    *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    // 写剪贴板必须回主线程：NSFilePromiseProvider 的兑现依赖主线程 runloop，
+    // 而且后台线程写 NSPasteboard 会与主线程 WebKit 的剪贴板监听并发（随机崩溃）。
+    run_on_main_thread(move || unsafe {
         let pb = general_pasteboard();
         if pb.is_null() {
             log::error!("[CLIPBOARD-MAC] generalPasteboard 返回 null，无法挂文件承诺");
@@ -1837,6 +1938,7 @@ pub fn set_clipboard_file_promise(
             let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
             (*delegate).set_ivar("dragId", id_ns);
             (*delegate).set_ivar("fileName", name_ns);
+            retain_promise_delegate(delegate);
             let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
             let provider: *mut Object = msg_send![
                 provider,
@@ -1855,7 +1957,7 @@ pub fn set_clipboard_file_promise(
             "[CLIPBOARD-MAC] writeObjects 结果: {wrote}（false=写剪贴板失败，Finder 将没有粘贴选项）"
         );
         remember_local_clipboard_change(pb);
-    }
+    });
 }
 
 /// 懒粘贴：取（或请求）offer 对应的本地文件，把本 promise 对应的那一个
@@ -2091,17 +2193,26 @@ pub fn start_remote_file_drag(
         .insert(id.clone(), callback);
     unsafe {
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        let window: *mut Object = msg_send![app, keyWindow];
-        let window = if window.is_null() {
-            let windows: *mut Object = msg_send![app, orderedWindows];
-            if windows.is_null() {
-                std::ptr::null_mut()
-            } else {
-                msg_send![windows, firstObject]
+        // 合成拖拽必须有源视图。Ruiss 是菜单栏应用，设置窗口平时是隐藏的
+        // （tauri.conf.json 里 visible:false），keyWindow / orderedWindows 经常拿不到，
+        // 拿不到窗口时"Mac 作为拖拽目标"整条能力直接失效（回 DragCancel）。
+        // 因此逐级回退，最后连隐藏窗口也用上。
+        let mut window: *mut Object = msg_send![app, keyWindow];
+        if window.is_null() {
+            window = msg_send![app, mainWindow];
+        }
+        if window.is_null() {
+            let ordered: *mut Object = msg_send![app, orderedWindows];
+            if !ordered.is_null() {
+                window = msg_send![ordered, firstObject];
             }
-        } else {
-            window
-        };
+        }
+        if window.is_null() {
+            let all: *mut Object = msg_send![app, windows];
+            if !all.is_null() {
+                window = msg_send![all, firstObject];
+            }
+        }
         if window.is_null() {
             return Err(anyhow!("no AppKit window for remote drag"));
         }

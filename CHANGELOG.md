@@ -1,5 +1,60 @@
 # CHANGELOG
 
+## 2026-08-19 — 修复「Mac 崩溃后 Win 光标消失」等三类问题（光标/输入自救 + 文件剪贴板 + 跨屏拖拽）
+
+### 1. 光标消失 / 本机输入被吞后再也回不来（新增多层自救）
+- 根因：Win 端只在"自己是 Source"时用 `SetSystemCursor` 把系统光标替换成透明图标
+  （系统级修改，进程死亡也不还原）；恢复只能靠本进程调 `show_cursor()`。而跨屏握手
+  一旦完成（`tx_pointer_ready=true`）就**没有任何存活看门狗**，只剩 TCP 读超时兜底；
+  藏光标期间本机点击/键盘又被钩子吞掉、托盘也点不到 → 只能重启。
+- 修复：
+  - `lib.rs` tick 循环任务体加 `catch_unwind`：这条任务同时承担看门狗/断线复位/紧急
+    解锁，任何 panic 都不能把它杀掉；panic 后立即 `force_release()` 恢复本机。
+  - 抽出 `force_local_reset` / `force_release` / `clear_pointer_sessions`，断线、看门狗、
+    紧急热键、tick panic 四条路径统一收敛（原来各写一遍，容易漏）。
+  - 输入消费线程处理单个事件也包 `catch_unwind`（panic 不再让整条输入链路死掉）。
+  - panic hook 补防重入，并额外解除本机输入屏蔽（原来只恢复光标）。
+  - **新增紧急解锁热键**：Windows `Ctrl+Alt+Shift+R` / macOS `Control+Option+Shift+R`。
+    由低层键盘钩子（Win）/事件 tap（Mac）在"吞事件之前"识别，是光标隐藏且键盘被吞时
+    唯一不依赖鼠标的自救入口。
+- 验证：`cargo check` 通过；新增单测 `clipboard_notification_ignores_only_local_writes`、
+  `emergency_hotkey_requires_all_modifiers_and_keydown`（本机测试二进制因 DLL 入口点
+  不匹配无法启动，未执行，见「未验证」）。
+
+### 2. 跨屏复制文件/压缩包粘贴无效
+- Win 侧（懒传 offer 生命周期）：
+  - `render_clipboard_hdrop` 原来**先取走 offer 再校验格式**，任何一次非 CF_HDROP 的
+    延迟渲染请求都会把 offer 吃掉且不挂回 → 改为先校验格式再取。
+  - 渲染失败/超时原来直接 return，剪贴板里那条延迟 `CF_HDROP` 仍在 → 之后每次 Ctrl+V
+    都触发渲染又拿不到数据（"粘贴没反应"且永不自愈）。现在主动清掉失效占位
+    （`drop_stale_lazy_clipboard`，带剪贴板所有者校验，不误清别人的内容）。
+  - `read_inner` 在"本机自己挂着懒传占位"时不再读 `CF_HDROP`：读它会触发
+    WM_RENDERFORMAT 提前消费 offer，并让调用线程阻塞最长 180s（`lib.rs` 跨屏携带
+    剪贴板那条路径正是从输入消费线程调它）。
+  - 本机所有剪贴板写入统一清掉陈旧占位（`clear_pending_lazy_offer`）。
+  - `WM_CLIPBOARDUPDATE` 去重从"有没有懒传占位"的近似判断改为**按剪贴板序列号精确
+    判定**（`current <= 本机写入序列号` 才算自己的回声），修掉 8-17 修复带来的副作用：
+    收到 offer 后本机第一次真实复制可能被吞掉。
+  - 粘贴回调**先注册等待者再发 ClipboardFileRequest**（原来顺序反了，对端秒传完成时
+    找不到等待者会退化成写剪贴板，而剪贴板正被请求方占用 → 文件丢失）。
+- Mac 侧（崩溃 + 粘贴）：
+  - **所有 NSPasteboard/AppKit 操作统一切主线程**（新增 `run_on_main_thread`）。原来
+    只有 `start_remote_file_drag` 做了主线程派发，其余读/写都在后台线程（tokio 网络
+    任务、剪贴板轮询线程）——Apple 明确要求 AppKit 只在主线程使用，与主线程 WebKit
+    剪贴板监听并发访问就是随机 `EXC_BAD_ACCESS` 崩溃（Tauri 官方 issue #3205 同栈）。
+  - 剪贴板 promise 的 delegate 显式强引用（`NSFilePromiseProvider.delegate` 是 weak），
+    限量 256 个防无限增长。
+  - Mac 拖拽目标取窗口逐级回退 keyWindow → mainWindow → orderedWindows → windows
+    （设置窗口 `visible:false`，原来经常直接 `no AppKit window for remote drag`）。
+
+### 3. 跨屏拖拽卡死会锁住本机鼠标
+- `RemoteDragDataObject::wait_for_paths`（OLE 模态循环里被调用）原来**无超时死等**，
+  而该线程持有 `SetCapture`：对端不给数据时捕获永不释放，本机所有鼠标点击都送不到
+  任何窗口（"鼠标点不动/找不到"）。现在 300s 有界等待，超时返回错误让 OLE 结束拖拽。
+- 新增 `DragCaptureGuard`（RAII）：`ReleaseCapture` + `DestroyWindow` 无论正常返回、
+  提前失败还是线程 panic 都会执行；拖拽线程整体包 `catch_unwind`。
+- Mac 侧对应等待同样改为 300s 有界。
+
 ## 2026-08-18 — 新增 dev 分支 + GitHub Actions 自动编译（Windows + Mac Intel）
 
 - 背景：开源后每次测试需要 Windows 和 Mac 两边手动打包，代码通过 GitHub 同步但不确定准确性。

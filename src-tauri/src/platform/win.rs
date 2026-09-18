@@ -36,7 +36,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+    GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -119,6 +119,35 @@ static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 /// following synthetic left-up completes Explorer's OLE loop as a successful COPY into
 /// the hand-off target instead of cancelling it with Esc (which flashes a prohibited icon).
 static EDGE_DROP_HANDOFF: AtomicBool = AtomicBool::new(false);
+
+/// 紧急解锁热键是否被按下（Ctrl+Alt+Shift+R）。
+/// 跨屏期间本机点击/键盘都被钩子吞掉、光标又被 SetSystemCursor 换成透明图标，
+/// 用户看不见鼠标也点不动任何窗口（托盘也点不到）。这个热键由低层键盘钩子在
+/// "吞事件之前"识别，是唯一不依赖鼠标的自救入口。lib.rs 的 tick 循环轮询它。
+static FORCE_RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 供上层（lib.rs tick 循环）取用并清除紧急解锁请求。
+pub fn take_force_release_request() -> bool {
+    FORCE_RELEASE_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// 判定这次按键是否是紧急解锁组合（Ctrl+Alt+Shift+R，R=0x52）。
+/// 用 GetAsyncKeyState 直接查物理修饰键状态，不依赖钩子维护的按键表。
+fn is_emergency_release_hotkey(wparam: u32, vk: u32) -> bool {
+    if vk != 0x52 {
+        return false;
+    }
+    if !matches!(wparam, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        return false;
+    }
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12; // Alt
+    const VK_SHIFT: i32 = 0x10;
+    unsafe {
+        let down = |vk: i32| (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
+        down(VK_CONTROL) && down(VK_MENU) && down(VK_SHIFT)
+    }
+}
 
 pub fn set_local_input_blocked(blocked: bool) {
     BLOCK_LOCAL_INPUT.store(blocked, Ordering::Relaxed);
@@ -403,7 +432,13 @@ fn finish_hook_setup_failed(ready: Sender<Result<u32>>, msg: String) {
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
+    // 低层钩子回调是 extern "system"：在里面 panic 会直接 abort 整个进程
+    // （Rust 不允许 unwind 穿过 FFI 边界）。整个判定包进 catch_unwind，
+    // 任何异常只降级成"这一个事件原样放行"，不让一次 panic 打断输入链路。
+    let swallow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if code < 0 {
+            return false;
+        }
         let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         let msg = wparam.0 as u32;
         // 注入事件（含本机回环的回声）一般直接丢弃，防死循环。
@@ -445,7 +480,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     });
                 }
                 if swallow {
-                    return LRESULT(1);
+                    return true;
                 }
                 // 移动补藏：跨屏期间每个真实鼠标移动事件后补一次隐藏
                 // （对抗 tao 等外部 ShowCursor(TRUE) 把计数拉回 0）
@@ -454,13 +489,29 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 }
             }
         }
+        false
+    }))
+    .unwrap_or(false);
+    if swallow {
+        return LRESULT(1);
     }
     CallNextHookEx(None, code, wparam, lparam)
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
+    // 同 mouse_proc：extern "system" 回调里 panic 会 abort 整个进程，
+    // 这里把判定包进 catch_unwind，异常只降级为"放行这一个按键"。
+    let swallow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if code < 0 {
+            return false;
+        }
         let ks = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        // 紧急解锁热键必须在"吞事件"之前识别：跨屏期间本机键盘整体被吞，
+        // 这里漏掉就等于用户没有任何自救入口（光标也是隐藏的，托盘点不到）。
+        if is_emergency_release_hotkey(wparam.0 as u32, ks.vkCode) {
+            FORCE_RELEASE_REQUESTED.store(true, Ordering::SeqCst);
+            log::warn!("[EMERGENCY] 检测到紧急解锁热键 Ctrl+Alt+Shift+R");
+        }
         let injected = ks.flags.0 & LLKHF_INJECTED.0 != 0;
         let blocked = BLOCK_LOCAL_INPUT.load(Ordering::Relaxed);
         let sink = SINK_ACTIVE.load(Ordering::Relaxed);
@@ -494,10 +545,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     }
                 });
                 if swallow {
-                    return LRESULT(1);
+                    return true;
                 }
             }
         }
+        false
+    }))
+    .unwrap_or(false);
+    if swallow {
+        return LRESULT(1);
     }
     CallNextHookEx(None, code, wparam, lparam)
 }
@@ -1181,6 +1237,35 @@ fn remember_local_clipboard_sequence() {
     LOCAL_CLIPBOARD_SEQUENCE.store(sequence, Ordering::Release);
 }
 
+/// 这条 WM_CLIPBOARDUPDATE 是否来自本机自己的写入？
+/// 剪贴板序列号全局单调递增：本机写入产生的通知，其序列号不会超过我们记录下的
+/// 那次写入；外部程序复制必然产生更大的序列号。因此 `current <= local` 既能吞掉
+/// 自己写入的回声（一次写入会产生多条通知），又不会误吞用户真实的复制。
+fn clipboard_notification_is_local(current: u32, local: u32) -> bool {
+    current != 0 && local != 0 && current <= local
+}
+
+/// 结合已记录的本地写入序列号判断，并在确认外部复制发生后让本地标记失效。
+fn should_ignore_clipboard_notification(current: u32) -> bool {
+    let local = LOCAL_CLIPBOARD_SEQUENCE.load(Ordering::Acquire);
+    if clipboard_notification_is_local(current, local) {
+        return true;
+    }
+    if current != 0 && local != 0 {
+        // 外部复制已经发生，本机写入标记不再有效
+        LOCAL_CLIPBOARD_SEQUENCE.store(0, Ordering::Release);
+    }
+    false
+}
+
+/// 本机自己写入剪贴板内容时，之前挂着的懒传占位立刻失效（剪贴板内容已被替换）。
+/// 不清会留下"陈旧 PENDING"，让后面的剪贴板读取误判成"当前是延迟渲染的空壳"。
+fn clear_pending_lazy_offer() {
+    *PENDING_LAZY_HDROP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// 读当前剪贴板内容（优先级 files > image > text）。读不出返回 Empty。
 pub fn clipboard_read() -> ClipboardContent {
     unsafe {
@@ -1194,11 +1279,20 @@ pub fn clipboard_read() -> ClipboardContent {
 }
 
 unsafe fn read_inner() -> ClipboardContent {
+    // 本机自己挂着懒传占位时，剪贴板里的 CF_HDROP 是延迟渲染的空壳：
+    // 读它必然触发 WM_RENDERFORMAT（提前消费 offer，并让调用线程阻塞到传输
+    // 结束）。此时剪贴板里只有这一个占位，按空内容处理即可。
+    let pending_offer = PENDING_LAZY_HDROP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
     // 文件优先
-    if let Ok(h) = GetClipboardData(CF_HDROP.0 as u32) {
-        if let Some(files) = read_hdrop(h.0 as *mut c_void) {
-            if !files.is_empty() {
-                return ClipboardContent::Files(files);
+    if !pending_offer {
+        if let Ok(h) = GetClipboardData(CF_HDROP.0 as u32) {
+            if let Some(files) = read_hdrop(h.0 as *mut c_void) {
+                if !files.is_empty() {
+                    return ClipboardContent::Files(files);
+                }
             }
         }
     }
@@ -1359,6 +1453,7 @@ pub fn clipboard_write_text(text: &str) {
             return;
         }
         let _ = EmptyClipboard();
+        clear_pending_lazy_offer();
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         wide.push(0);
         let bytes = wide.align_to::<u8>().1; // u16 → bytes
@@ -1385,6 +1480,7 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             return;
         }
         let _ = EmptyClipboard();
+        clear_pending_lazy_offer();
         // 解码 PNG → RGBA → CF_DIB
         if let Some(dib) = png_to_dib(png_bytes) {
             if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, dib.len()) {
@@ -1426,6 +1522,7 @@ pub fn clipboard_clear() {
             return;
         }
         let _ = EmptyClipboard();
+        clear_pending_lazy_offer();
         remember_local_clipboard_sequence();
         let _ = CloseClipboard();
     }
@@ -1494,6 +1591,7 @@ pub fn clipboard_write_files(paths: &[String]) {
             return;
         }
         let _ = EmptyClipboard();
+        clear_pending_lazy_offer();
         if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total) {
             let ptr = GlobalLock(hmem);
             if !ptr.is_null() {
@@ -1773,8 +1871,22 @@ impl RemoteDragDataObject {
             state.requested = true;
             (self.callback)(super::RemoteFileDragEvent::DataRequested(self.id.clone()));
         }
+        // 有界等待：这条 GetData 是在 OLE 的 DoDragDrop 模态循环里被调用的，
+        // 而那个线程此时正持有 SetCapture。如果对端一直不给数据（卡死、会话丢失），
+        // 无限等待会让 SetCapture 永远不释放——本机所有鼠标点击都送不到任何窗口，
+        // 表现就是"鼠标点不动/找不到"。超时后返回错误让 OLE 结束这次拖拽，
+        // 把捕获交还系统（大文件传输留足 5 分钟余量）。
+        let deadline = Instant::now() + Duration::from_secs(300);
         while state.result.is_none() {
-            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if now >= deadline {
+                log::error!("[DRAG] 等待对端拖拽数据超时，结束本次合成拖拽以释放鼠标捕获");
+                return Err(WinError::new(E_NOTIMPL, "remote drag timed out"));
+            }
+            let (next, _timeout) = cv
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
         }
         match state.result.clone().unwrap() {
             Ok(paths) if !paths.is_empty() => Ok(paths),
@@ -1997,6 +2109,22 @@ unsafe fn attach_drag_image(data: &IDataObject, first_name: Option<&str>) {
     }
 }
 
+/// 拖拽捕获窗口的 RAII 守卫：无论 DoDragDrop 正常返回、提前失败还是内部 panic，
+/// 都必须把 SetCapture 交还系统并销毁窗口——否则本机鼠标点击会一直被路由到这个
+/// 隐形窗口（用户表现为"鼠标点不动 / 找不到"）。
+struct DragCaptureGuard(Option<HWND>);
+
+impl Drop for DragCaptureGuard {
+    fn drop(&mut self) {
+        if let Some(hwnd) = self.0.take() {
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
 pub fn start_remote_file_drag(
     id: String,
     roots: Vec<crate::core::protocol::TransferRoot>,
@@ -2015,62 +2143,69 @@ pub fn start_remote_file_drag(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), ready.clone());
     std::thread::spawn(move || unsafe {
-        if let Err(error) = OleInitialize(None) {
-            callback(super::RemoteFileDragEvent::Cancelled(format!(
-                "OLE initialization failed: {error}"
-            )));
-            REMOTE_DRAGS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-            return;
-        }
-        // DoDragDrop 的模态循环从"本线程"的消息队列取鼠标事件。SendInput 注入的
-        // 移动/松开默认投递到前台窗口线程，本线程收不到 → 拖拽不跟手、松手不落。
-        // 创建属于本线程的隐形捕获窗口并 SetCapture，把注入事件路由进本线程队列
-        // （等价于真实拖拽时源窗口 capture 鼠标的状态），且合成 LEFT_DOWN 也不会
-        // 误点到光标下的前台应用。
-        let capture_hwnd = create_drag_capture_window();
-        if capture_hwnd.0.is_null() {
-            log::warn!("[DRAG] 无法创建拖拽捕获窗口，合成拖拽可能不跟随注入输入");
-        } else {
-            let _ = SetCapture(capture_hwnd);
-        }
-        let input = [INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dwFlags: MOUSEEVENTF_LEFTDOWN,
-                    ..Default::default()
+        let mut ole_ready = false;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Err(error) = OleInitialize(None) {
+                callback(super::RemoteFileDragEvent::Cancelled(format!(
+                    "OLE initialization failed: {error}"
+                )));
+                return;
+            }
+            ole_ready = true;
+            // DoDragDrop 的模态循环从"本线程"的消息队列取鼠标事件。SendInput 注入的
+            // 移动/松开默认投递到前台窗口线程，本线程收不到 → 拖拽不跟手、松手不落。
+            // 创建属于本线程的隐形捕获窗口并 SetCapture，把注入事件路由进本线程队列
+            // （等价于真实拖拽时源窗口 capture 鼠标的状态），且合成 LEFT_DOWN 也不会
+            // 误点到光标下的前台应用。
+            let capture_hwnd = create_drag_capture_window();
+            // 守卫先建：后面任何一条 return/panic 都会走到 Drop，把捕获还回去。
+            let _capture_guard = DragCaptureGuard(if capture_hwnd.0.is_null() {
+                None
+            } else {
+                Some(capture_hwnd)
+            });
+            if capture_hwnd.0.is_null() {
+                log::warn!("[DRAG] 无法创建拖拽捕获窗口，合成拖拽可能不跟随注入输入");
+            } else {
+                let _ = SetCapture(capture_hwnd);
+            }
+            let input = [INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: MOUSEEVENTF_LEFTDOWN,
+                        ..Default::default()
+                    },
                 },
-            },
-        }];
-        SendInput(&input, size_of::<INPUT>() as i32);
-        let data: IDataObject = RemoteDragDataObject {
-            id: id.clone(),
-            ready,
-            callback: callback.clone(),
-        }
-        .into();
-        // 拖影：按第一个根条目的扩展名取系统类型图标（目标机无实体文件，仅视觉）。
-        attach_drag_image(&data, roots.first().map(|r| r.name.as_str()));
-        let source: IDropSource = RemoteDropSource.into();
-        let mut effect = DROPEFFECT_NONE;
-        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
-        if result != DRAGDROP_S_DROP {
+            }];
+            SendInput(&input, size_of::<INPUT>() as i32);
+            let data: IDataObject = RemoteDragDataObject {
+                id: id.clone(),
+                ready,
+                callback: callback.clone(),
+            }
+            .into();
+            // 拖影：按第一个根条目的扩展名取系统类型图标（目标机无实体文件，仅视觉）。
+            attach_drag_image(&data, roots.first().map(|r| r.name.as_str()));
+            let source: IDropSource = RemoteDropSource.into();
+            let mut effect = DROPEFFECT_NONE;
+            let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+            if result != DRAGDROP_S_DROP {
+                callback(super::RemoteFileDragEvent::Cancelled(id.clone()));
+            }
+        }));
+        if outcome.is_err() {
+            log::error!("[DRAG] 合成拖拽线程 panic，已释放鼠标捕获并结束本次拖拽");
             callback(super::RemoteFileDragEvent::Cancelled(id.clone()));
-        }
-        if !capture_hwnd.0.is_null() {
-            let _ = ReleaseCapture();
-            let _ = DestroyWindow(capture_hwnd);
         }
         REMOTE_DRAGS
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
-        OleUninitialize();
+        if ole_ready {
+            OleUninitialize();
+        }
     });
     Ok(())
 }
@@ -2248,6 +2383,12 @@ pub fn set_clipboard_file_promise(
 /// WM_RENDERFORMAT：真正渲染延迟的 CF_HDROP。
 /// 阻塞等待对端把文件传完（目标应用在此期间等待剪贴板数据）。
 fn render_clipboard_hdrop(format: u32) {
+    // 先校验格式再取 offer：offer 是一次性的，任何一次"非 CF_HDROP"的延迟渲染
+    // 请求都不能把它吃掉——否则用户之后真正粘贴时已经没有 offer 可用。
+    if format != CF_HDROP.0 as u32 {
+        log::debug!("[CLIPBOARD] 忽略非 CF_HDROP 的延迟渲染请求 format={format}");
+        return;
+    }
     let offer = PENDING_LAZY_HDROP
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2255,13 +2396,9 @@ fn render_clipboard_hdrop(format: u32) {
     let Some(offer) = offer else {
         return;
     };
-    // 只渲染我们持有的 CF_HDROP；其他格式请求直接忽略。
-    if format != CF_HDROP.0 as u32 {
-        return;
-    }
     let ready = crate::platform::new_paste_ready();
     (offer.callback)(crate::platform::ClipboardPasteEvent::Requested {
-        id: offer.id,
+        id: offer.id.clone(),
         ready: ready.clone(),
     });
     let paths = match crate::platform::wait_paste_ready(&ready, Duration::from_secs(180)) {
@@ -2272,8 +2409,11 @@ fn render_clipboard_hdrop(format: u32) {
         }
     };
     if paths.is_empty() {
-        // 传输失败/超时：不写入空文件列表，避免粘贴出空结果。
-        log::error!("[CLIPBOARD] 懒粘贴渲染跳过：无可用路径");
+        // 传输失败/超时：必须把剪贴板里那条延迟渲染的 CF_HDROP 一起撤掉。
+        // 否则每次 Ctrl+V 都会重新触发渲染、又拿不到数据，表现为"粘贴没反应"
+        // 且永不自愈（只能靠用户复制别的内容打断）。
+        log::error!("[CLIPBOARD] 懒粘贴渲染失败：清空失效的剪贴板占位");
+        drop_stale_lazy_clipboard();
         return;
     }
     unsafe {
@@ -2281,9 +2421,35 @@ fn render_clipboard_hdrop(format: u32) {
         // SetClipboardData 即可；再调 OpenClipboard 必然失败（err=5，
         // 剪贴板已被系统/请求方打开），导致数据永远写不进去、粘贴拿 NULL。
         // （2026-08-14 实测确认：删除 OpenClipboard 后渲染成功、粘贴可拿到数据）
-        if let Ok(hmem) = RemoteDragDataObject::hdrop(&paths) {
-            let _ = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0));
+        match RemoteDragDataObject::hdrop(&paths) {
+            Ok(hmem) => {
+                if let Err(error) = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0)) {
+                    log::error!("[CLIPBOARD] 渲染 CF_HDROP 失败: {error}");
+                }
+            }
+            Err(error) => log::error!("[CLIPBOARD] 构造 CF_HDROP 失败: {error}"),
         }
+    }
+}
+
+/// 清掉剪贴板里已经失效的延迟渲染占位（传输失败时调用），让状态收敛：
+/// 粘贴变成"没有内容"而不是"永远卡着拿不到数据"。
+fn drop_stale_lazy_clipboard() {
+    clear_pending_lazy_offer();
+    unsafe {
+        let Some(&raw) = WATCHER_HWND.get() else {
+            return;
+        };
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
+        if OpenClipboard(hwnd).is_err() {
+            return;
+        }
+        // 只有当前所有者还是我们时才有权清空，否则会破坏别的程序刚放进来的内容。
+        if GetClipboardOwner().map(|owner| owner == hwnd).unwrap_or(false) {
+            let _ = EmptyClipboard();
+            remember_local_clipboard_sequence();
+        }
+        let _ = CloseClipboard();
     }
 }
 
@@ -2296,24 +2462,9 @@ unsafe extern "system" fn clip_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
-        let current = GetClipboardSequenceNumber();
-        if current != 0
-            && LOCAL_CLIPBOARD_SEQUENCE
-                .compare_exchange(current, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return LRESULT(0);
-        }
-        // set_clipboard_file_promise 里 EmptyClipboard + 多次 SetClipboardData
-        // 会产生多条 WM_CLIPBOARDUPDATE，CAS 只能吞掉一条。剩余通知若走进
-        // clipboard_read() 会触发 WM_RENDERFORMAT 提前消费懒传 offer，导致
-        // 用户真正粘贴时 offer 已空。此处检测：若有未消费的懒粘贴占位，
-        // 说明通知来自本机写入，跳过。
-        if PENDING_LAZY_HDROP
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+        // 本机自己写入产生的通知（含一次写入触发的多条通知）直接跳过；
+        // 用序列号精确判定，不再用"有没有懒传占位"这种会误吞真实复制的近似判断。
+        if should_ignore_clipboard_notification(GetClipboardSequenceNumber()) {
             return LRESULT(0);
         }
         let content = clipboard_read();
@@ -2351,6 +2502,27 @@ mod tests {
     #[test]
     fn raw_relative_mouse_preserves_signed_delta() {
         assert_eq!(raw_relative_delta(0, 7, -4), Some((7, -4)));
+    }
+
+    #[test]
+    fn clipboard_notification_ignores_only_local_writes() {
+        // 本机写入后的通知（序列号不超过记录的本地写入）→ 跳过
+        assert!(clipboard_notification_is_local(120, 120));
+        assert!(clipboard_notification_is_local(120, 125));
+        // 外部程序复制必然产生更大的序列号 → 必须处理（不能误吞用户真实复制）
+        assert!(!clipboard_notification_is_local(126, 125));
+        // 没有记录过本地写入 → 一律处理
+        assert!(!clipboard_notification_is_local(126, 0));
+        // 序列号读取失败（0）→ 保守处理，不跳过
+        assert!(!clipboard_notification_is_local(0, 125));
+    }
+
+    #[test]
+    fn emergency_hotkey_requires_all_modifiers_and_keydown() {
+        // 只用 Ctrl+Alt+Shift 之外的真实键状态无法在单测里伪造，
+        // 这里验证"非 R 键 / 非按下"一律不触发，避免误触发强制归还。
+        assert!(!is_emergency_release_hotkey(WM_KEYDOWN, 0x41)); // A
+        assert!(!is_emergency_release_hotkey(WM_KEYUP, 0x52)); // R 抬起
     }
 
     #[test]

@@ -32,6 +32,26 @@ pub fn run() {
     // 初始化日志（debug 输出到控制台）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // 全局 panic hook：任何线程 panic 时恢复系统光标。
+    // hide_cursor() 使用 SetSystemCursor 替换系统光标资源为透明图标，
+    // 这是系统级修改，进程退出/crash 不会自动恢复。如果 panic 发生在
+    // hide_cursor 和 show_cursor 之间（例如钩子线程崩溃），光标会永久消失，
+    // 用户看不到鼠标、无法操作，只能硬重启。panic hook 保证光标至少能恢复。
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 幂等 + 防重入：hook 自己绝不能再 panic 递归。
+        // 恢复动作两件：把系统光标从"透明替换"还原（SetSystemCursor 不随进程
+        // 退出还原），以及解除本机输入屏蔽（否则 panic 后键盘点击全部失效）。
+        static HOOK_ACTIVE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !HOOK_ACTIVE.swap(true, Ordering::SeqCst) {
+            platform::show_cursor();
+            platform::set_local_input_blocked(false);
+            HOOK_ACTIVE.store(false, Ordering::SeqCst);
+        }
+        default_hook(info);
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -368,6 +388,9 @@ fn forward_pointer_move(router: &Mutex<RouterState>, move_payload: Payload) {
 fn start_capturer(router: Arc<Mutex<RouterState>>) -> Result<platform::InputCapturer, String> {
     let router_cb = router.clone();
     platform::InputCapturer::start(move |payload| {
+        // 输入消费线程处理单个事件时 panic 不能让整条捕获链路死掉：一旦它退出，
+        // 本机输入既进不了仲裁器、又会继续被钩子吞掉，机器等于失控。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let actions: Vec<Action> = {
             let mut r = match router_cb.lock() {
                 Ok(g) => g,
@@ -400,6 +423,10 @@ fn start_capturer(router: Arc<Mutex<RouterState>>) -> Result<platform::InputCapt
         };
         for action in actions {
             execute_action(&router_cb, action);
+        }
+        }));
+        if outcome.is_err() {
+            log::error!("[INPUT] 输入事件处理 panic，已跳过该事件并继续运行");
         }
     })
     .map_err(|e| e.to_string())
@@ -460,127 +487,166 @@ fn spawn_tick_task(router: Arc<Mutex<RouterState>>) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
-            let actions = {
+            // 这条任务同时承担看门狗、断线复位和紧急解锁，是本机"光标被藏起来 +
+            // 输入被吞掉"时唯一的自救通道：绝不允许任何 panic 把它杀掉。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for action in tick_once(&router) {
+                    execute_action(&router, action);
+                }
+            }));
+            if outcome.is_err() {
+                log::error!("[TICK] 心跳任务内 panic：强制归还本机控制后继续运行");
                 let mut r = match router.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
                 };
-                let mut acts = Vec::new();
-                let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
-                if !connected {
-                    if let Some(id) = r.incoming_drag.take() {
-                        platform::cancel_remote_file_drag(&id);
-                    }
-                    if let Some(id) = r.outgoing_drag.take() {
-                        if let Some(sender) = &r.file_sender {
-                            sender.cancel_drag(&id);
-                        }
-                    }
-                }
-                // ===== 看门狗：跨屏握手超时自动回滚（只在网络正常时检查）=====
-                // 发起 TakeControl 后对端迟迟不确认（ControlReady 未到），说明对端
-                // 没接住（崩溃/卡死/双方抢控）。此时本机光标已隐藏、输入已屏蔽，
-                // 若放任不管会永久卡死（只能重启）。超时后自动恢复本机状态并通知
-                // 对端释放，保证任何情况下都能自己解锁。断线场景走上面的复位逻辑。
-                if connected {
-                    const TAKE_TIMEOUT: Duration = Duration::from_secs(3);
-                    let now = Instant::now();
-                    let watchdog_fired = r.tx_pointer_session != 0
-                        && !r.tx_pointer_ready
-                        && r
-                            .tx_take_at
-                            .is_some_and(|at| now.duration_since(at) >= TAKE_TIMEOUT);
-                    if watchdog_fired {
-                        log::warn!(
-                            "[WATCHDOG] 跨屏握手超时 {:.0}s：对端未确认 TakeControl，自动回滚",
-                            TAKE_TIMEOUT.as_secs_f32()
-                        );
-                        let session = r.tx_pointer_session;
-                        let (name, net) = (r.settings.name.clone(), r.net.clone());
-                        // 恢复本机输入状态（与断线复位一致）
-                        r.injector.reset_keyboard_state();
-                        platform::show_cursor();
-                        platform::set_local_input_blocked(false);
-                        platform::set_sink_active(false);
-                        if let Some(a) = r.arbiter.as_mut() {
-                            a.on_peer_release();
-                        }
-                        r.tx_pointer_session = 0;
-                        r.tx_pointer_ready = false;
-                        r.tx_take_at = None;
-                        r.tx_pointer_seq = 0;
-                        r.pending_pointer_move = None;
-                        r.rx_pointer_session = 0;
-                        r.rx_pointer_seq = 0;
-                        // 清理本机发起的拖拽会话（如有）
-                        if let Some(id) = r.outgoing_drag.take() {
-                            if let Some(sender) = &r.file_sender {
-                                sender.cancel_drag(&id);
-                            }
-                            if let Some(net) = &net {
-                                net.send_ctrl(Message::ctrl(
-                                    &name,
-                                    Payload::DragCancel { id },
-                                ));
-                            }
-                        }
-                        // 通知对端也复位（对端若已进入 Sink，收到后恢复自主）
-                        if let Some(net) = net {
-                            net.send_ctrl(Message::ctrl(
-                                &name,
-                                Payload::ReleaseControl { session },
-                            ));
-                        }
-                        continue; // 本 tick 已回滚，不再产生其他动作
-                    }
-                }
-                if let Some(a) = r.arbiter.as_mut() {
-                    let (w, h) = platform::screen_size();
-                    if !connected {
-                        let was_active = a.linked || a.mode == Mode::Sink;
-                        a.on_peer_release();
-                        acts.clear();
-                        if was_active {
-                            log::warn!("网络断开，复位跨屏状态");
-                            r.injector.reset_keyboard_state();
-                            platform::show_cursor();
-                            platform::set_local_input_blocked(false);
-                            platform::set_sink_active(false);
-                        }
-                        r.tx_pointer_session = 0;
-                        r.tx_pointer_ready = false;
-                        r.tx_take_at = None;
-                        r.tx_pointer_seq = 0;
-                        r.pending_pointer_move = None;
-                        r.rx_pointer_session = 0;
-                        r.rx_pointer_seq = 0;
-                        continue;
-                    }
-                    // 主动补藏：Source 跨屏期间每 25ms 确认一次光标隐藏。
-                    // 对抗 tao ShowCursor(TRUE) / macOS 移动自动重显，
-                    // 停手不动时也持续压制（不依赖移动事件）。
-                    if a.linked {
-                        platform::enforce_cursor_hidden();
-                    }
-                    if a.mode == Mode::Sink {
-                        // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
-                        acts.extend(a.on_sink_tick(
-                            platform::last_injected_pos(),
-                            w,
-                            h,
-                            Instant::now(),
-                        ));
-                    } else {
-                        acts.extend(a.on_tick(Instant::now()));
-                    }
-                }
-                acts
-            };
-            for action in actions {
-                execute_action(&router, action);
+                force_release(&mut r);
             }
         }
     });
+}
+
+/// 清空跨屏轮次状态（不动光标与输入所有权）。
+fn clear_pointer_sessions(r: &mut RouterState) {
+    r.tx_pointer_session = 0;
+    r.tx_pointer_ready = false;
+    r.tx_take_at = None;
+    r.tx_pointer_seq = 0;
+    r.pending_pointer_move = None;
+    r.rx_pointer_session = 0;
+    r.rx_pointer_seq = 0;
+}
+
+/// 强制恢复本机控制状态：还原光标与输入所有权，并清空跨屏轮次。
+/// 断线、看门狗超时、紧急解锁热键、tick 内 panic 全部复用这一条路径，
+/// 保证"本机光标被藏起来 + 本机点击/键盘被吞掉"这个危险组合在任何异常下都收敛。
+fn force_local_reset(r: &mut RouterState) {
+    r.injector.reset_keyboard_state();
+    platform::show_cursor();
+    platform::set_local_input_blocked(false);
+    platform::set_sink_active(false);
+    if let Some(a) = r.arbiter.as_mut() {
+        a.on_peer_release();
+    }
+    clear_pointer_sessions(r);
+}
+
+/// 强制归还控制权：本机恢复自主 + 通知对端释放 + 清理本机发起的拖拽会话。
+fn force_release(r: &mut RouterState) {
+    let session = if r.tx_pointer_session != 0 {
+        r.tx_pointer_session
+    } else {
+        r.rx_pointer_session
+    };
+    let (name, net, drag) = (
+        r.settings.name.clone(),
+        r.net.clone(),
+        r.outgoing_drag.take(),
+    );
+    force_local_reset(r);
+    if let Some(id) = drag {
+        if let Some(sender) = &r.file_sender {
+            sender.cancel_drag(&id);
+        }
+        if let Some(net) = &net {
+            net.send_ctrl(Message::ctrl(&name, Payload::DragCancel { id }));
+        }
+    }
+    if session != 0 {
+        if let Some(net) = net {
+            net.send_ctrl(Message::ctrl(&name, Payload::ReleaseControl { session }));
+        }
+    }
+}
+
+/// 单次 tick 的判定（锁在内部持有，动作由调用方在锁外执行）。
+fn tick_once(router: &Mutex<RouterState>) -> Vec<Action> {
+    let mut r = match router.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let mut acts = Vec::new();
+    let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
+    if !connected {
+        if let Some(id) = r.incoming_drag.take() {
+            platform::cancel_remote_file_drag(&id);
+        }
+        if let Some(id) = r.outgoing_drag.take() {
+            if let Some(sender) = &r.file_sender {
+                sender.cancel_drag(&id);
+            }
+        }
+    }
+    // ===== 紧急解锁热键 =====
+    // 跨屏期间本机点击/键盘被钩子吞掉、光标又被藏起来时，这是用户唯一不依赖
+    // 鼠标的自救入口（Windows: Ctrl+Alt+Shift+R / macOS: Control+Option+Shift+R）。
+    // 物理按键不会被注入过滤掉，所以本机键盘随时能触发。
+    if platform::take_force_release_request() {
+        log::warn!("[EMERGENCY] 紧急解锁热键：强制归还本机控制");
+        force_release(&mut r);
+        return Vec::new();
+    }
+    // ===== 看门狗：跨屏握手超时自动回滚（只在网络正常时检查）=====
+    // 发起 TakeControl 后对端迟迟不确认（ControlReady 未到），说明对端
+    // 没接住（崩溃/卡死/双方抢控）。此时本机光标已隐藏、输入已屏蔽，
+    // 若放任不管会永久卡死（只能重启）。超时后自动恢复本机状态并通知
+    // 对端释放，保证任何情况下都能自己解锁。断线场景走下面的复位逻辑。
+    if connected {
+        const TAKE_TIMEOUT: Duration = Duration::from_secs(3);
+        let now = Instant::now();
+        let watchdog_fired = r.tx_pointer_session != 0
+            && !r.tx_pointer_ready
+            && r
+                .tx_take_at
+                .is_some_and(|at| now.duration_since(at) >= TAKE_TIMEOUT);
+        if watchdog_fired {
+            log::warn!(
+                "[WATCHDOG] 跨屏握手超时 {:.0}s：对端未确认 TakeControl，自动回滚",
+                TAKE_TIMEOUT.as_secs_f32()
+            );
+            force_release(&mut r);
+            return Vec::new(); // 本 tick 已回滚，不再产生其他动作
+        }
+    }
+    let (linked, sink) = r
+        .arbiter
+        .as_ref()
+        .map(|a| (a.linked, a.mode == Mode::Sink))
+        .unwrap_or((false, false));
+    if !connected {
+        acts.clear();
+        if linked || sink {
+            log::warn!("网络断开，复位跨屏状态");
+            force_local_reset(&mut r);
+        } else {
+            if let Some(a) = r.arbiter.as_mut() {
+                a.on_peer_release();
+            }
+            clear_pointer_sessions(&mut r);
+        }
+        return Vec::new();
+    }
+    // 主动补藏：Source 跨屏期间每 25ms 确认一次光标隐藏。
+    // 对抗 tao ShowCursor(TRUE) / macOS 移动自动重显，
+    // 停手不动时也持续压制（不依赖移动事件）。
+    if linked {
+        platform::enforce_cursor_hidden();
+    }
+    if let Some(a) = r.arbiter.as_mut() {
+        let (w, h) = platform::screen_size();
+        if sink {
+            // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
+            acts.extend(a.on_sink_tick(
+                platform::last_injected_pos(),
+                w,
+                h,
+                Instant::now(),
+            ));
+        } else {
+            acts.extend(a.on_tick(Instant::now()));
+        }
+    }
+    acts
 }
 
 /// 执行仲裁器动作：发令牌 / 回绕光标 / 转发事件。
@@ -1018,14 +1084,17 @@ async fn run_incoming_router(
                     let name_cb = name.clone();
                     std::sync::Arc::new(move |event| {
                         let platform::ClipboardPasteEvent::Requested { id, ready } = event;
+                        // 必须先注册等待者再发请求：对端传输有可能比这条请求的
+                        // 返回更快结束，顺序反了会找不到等待者 → 退化成"写剪贴板"，
+                        // 而此时剪贴板正被请求方（资源管理器/Finder）占用 → 文件丢失。
+                        if let Some(receiver) = &receiver_cb {
+                            receiver.attach_clipboard_waiter(&id, ready);
+                        }
                         if let Some(net) = &net_cb {
                             net.send_ctrl(Message::ctrl(
                                 &name_cb,
                                 Payload::ClipboardFileRequest { id: id.clone() },
                             ));
-                        }
-                        if let Some(receiver) = &receiver_cb {
-                            receiver.attach_clipboard_waiter(&id, ready);
                         }
                     })
                 };
