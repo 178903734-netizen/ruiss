@@ -161,3 +161,26 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: #4f8ff7; }
 .transfer-error { margin-top: 5px; color: #c54545; font-size: 10.5px; line-height: 1.4; word-break: break-all; }
 .transfer-actions { justify-content: flex-end; margin-top: 6px; }
 .transfer-action { border: 0; background: transparent; color: #397ad8; font-size: 10.5px; cursor: pointer; }
+
+.debug-input-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid #d8e0ee;
+  border-radius: 7px;
+  background: #fff;
+  font-family: Consolas, "Courier New", monospace;
+}
+.debug-input-item {
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #f4f7fc;
+  color: #3a4256;
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.debug-input-item:first-child { background: #e8f1fe; color: #1f5fbf; }

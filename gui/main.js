@@ -356,6 +356,24 @@
     }
   }
 
+  function listenDebugInput() {
+    const t = tauri();
+    if (t && t.event && typeof t.event.listen === 'function') {
+      t.event.listen('debug-input', (event) => {
+        const p = event.payload || {};
+        const list = $('debugInputList');
+        if (!list || !p.text) return;
+        const now = new Date();
+        const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+        const item = document.createElement('div');
+        item.className = 'debug-input-item';
+        item.textContent = `[${time}] ${p.text}`;
+        list.prepend(item);
+        while (list.children.length > 15) list.lastElementChild.remove();
+      });
+    }
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     $('saveBtn').addEventListener('click', save);
     const pickerMenu = $('pickTransferMenu');
@@ -387,6 +405,7 @@
     });
     window.addEventListener('keydown', captureShortcut, true);
     listenFileReceived();
+    listenDebugInput();
     setInterval(refreshNet, 500);
     load();
   });
