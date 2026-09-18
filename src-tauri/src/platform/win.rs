@@ -2414,6 +2414,7 @@ fn render_clipboard_hdrop(format: u32) {
         id: offer.id.clone(),
         ready: ready.clone(),
     });
+    let started = Instant::now();
     let paths = match crate::platform::wait_paste_ready(&ready, Duration::from_secs(180)) {
         Ok(paths) => paths,
         Err(error) => {
@@ -2421,6 +2422,13 @@ fn render_clipboard_hdrop(format: u32) {
             Vec::new()
         }
     };
+    // 耗时日志：延迟渲染期间资源管理器一直阻塞在 GetClipboardData 上等我们，
+    // 这个毫秒数能直接说明"大文件粘贴为什么慢/为什么会听到系统提示音"。
+    log::info!(
+        "[CLIPBOARD] 懒粘贴取到 {} 个文件，渲染等待 {} ms",
+        paths.len(),
+        started.elapsed().as_millis()
+    );
     if paths.is_empty() {
         // 传输失败/超时：必须把剪贴板里那条延迟渲染的 CF_HDROP 一起撤掉。
         // 否则每次 Ctrl+V 都会重新触发渲染、又拿不到数据，表现为"粘贴没反应"
