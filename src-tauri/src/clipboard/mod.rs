@@ -77,6 +77,21 @@ impl ClipboardSync {
                 }
                 *last = Some((Instant::now(), kind, key));
             }
+            // 分类日志：剪贴板跨屏出问题时，这行是判断"本机这次复制被识别成什么"的唯一线索
+            // （文本/图片原来完全静默；文件在下面的 arm 里有更详细的日志）。
+            // 注意：本文件是两端共用代码，Mac 端同样会打这行。
+            match &content {
+                ClipboardContent::Text(text) => {
+                    log::info!(
+                        "[CLIPBOARD] 本机复制文本 {} 字符 → 发送对端",
+                        text.chars().count()
+                    )
+                }
+                ClipboardContent::Image(png) => {
+                    log::info!("[CLIPBOARD] 本机复制图片 {} 字节 PNG → 发送对端", png.len())
+                }
+                _ => {}
+            }
             // A physical copy on this machine wins over an unfinished incoming copy.
             file_receiver.invalidate_clipboard_revision();
             match content {

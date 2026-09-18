@@ -1919,7 +1919,14 @@ impl RemoteDragDataObject {
                 bytes[header..].as_mut_ptr(),
                 names.len() * 2,
             );
-            GlobalUnlock(memory)?;
+            // 注意：这里不能写 `GlobalUnlock(memory)?`。MSDN 明确：
+            // "If the memory object is unlocked after decrementing the lock count,
+            //  the function returns zero and GetLastError returns NO_ERROR."
+            // 即"锁计数减到 0"这种正常成功恰恰返回 0(FALSE) 且 LastError=0，
+            // windows-rs 会把它转成 Err(0x00000000)（显示为"操作成功完成。"），
+            // 于是每次构造 CF_HDROP 都必然失败——剪贴板文件粘贴和跨屏拖拽一起挂掉。
+            // 本文件其余 12 处 GlobalUnlock 也都是 `let _ =` 忽略返回值。
+            let _ = GlobalUnlock(memory);
             Ok(memory)
         }
     }
@@ -2130,6 +2137,12 @@ pub fn start_remote_file_drag(
     roots: Vec<crate::core::protocol::TransferRoot>,
     callback: Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
 ) -> Result<()> {
+    // 成功路径原来完全没有日志：拖拽不工作时无法判断"对端到底有没有发起拖拽、
+    // 本机有没有开始合成拖拽"。这行是排查跨屏拖拽的第一落点。
+    log::info!(
+        "[DRAG] 收到远端拖拽 id={id} roots={} 项 → 开始合成拖拽",
+        roots.len()
+    );
     let ready = Arc::new((
         Mutex::new(RemoteDragReady {
             requested: false,
