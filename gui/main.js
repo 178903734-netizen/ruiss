@@ -349,7 +349,7 @@
     if (t && t.event && typeof t.event.listen === 'function') {
       t.event.listen('file-received', (event) => {
         const p = event.payload || {};
-        $('fileStatus').textContent = `已收到 ${p.name || '文件'}`;
+        $('fileStatus').textContent = p.clipboardReady ? `已同步 ${p.name || '文件'}，现在可以粘贴` : `已收到 ${p.name || '文件'}`;
         setTimeout(() => ($('fileStatus').textContent = ''), 2500);
       });
       t.event.listen('file-transfer-update', (event) => onTransferUpdate(event.payload || {}));

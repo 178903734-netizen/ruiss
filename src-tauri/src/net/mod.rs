@@ -50,13 +50,22 @@ impl PeerConfig {
     ///   RUISS_PEER_TCP_PORT / RUISS_PEER_UDP_PORT  对端端口（默认=本机端口）
     pub fn new(ip: String) -> Self {
         let env_or = |name: &str, default: u16| {
-            std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
         };
         let tcp_port = env_or("RUISS_TCP_PORT", TCP_PORT);
         let udp_port = env_or("RUISS_UDP_PORT", UDP_PORT);
         let peer_tcp_port = env_or("RUISS_PEER_TCP_PORT", tcp_port);
         let peer_udp_port = env_or("RUISS_PEER_UDP_PORT", udp_port);
-        Self { ip, tcp_port, udp_port, peer_tcp_port, peer_udp_port }
+        Self {
+            ip,
+            tcp_port,
+            udp_port,
+            peer_tcp_port,
+            peer_udp_port,
+        }
     }
 }
 
@@ -213,8 +222,17 @@ impl NetEngine {
             moves: move_tx,
             status: status.clone(),
         };
-        let engine = NetEngine { handle: handle.clone(), shutdown, tasks };
-        Ok(NetStart { engine, handle, incoming, file_incoming })
+        let engine = NetEngine {
+            handle: handle.clone(),
+            shutdown,
+            tasks,
+        };
+        Ok(NetStart {
+            engine,
+            handle,
+            incoming,
+            file_incoming,
+        })
     }
 
     pub fn handle(&self) -> NetHandle {
@@ -312,9 +330,8 @@ impl Connector {
                                 | Payload::FileBatchCancel { .. }
                                 | Payload::FileResult { .. }
                                 | Payload::FileBatchResult { .. }
-                                // 跨屏拖拽会话消息同样由 run_file_router 处理，
-                                // 必须进入文件队列，否则在普通路由中被丢弃。
-                                | Payload::DragStart { .. }
+                                // DragStart stays in the input lane to precede MouseUp.
+                                // Transfer commits/results use the independent file lane.
                                 | Payload::DragCommit { .. }
                                 | Payload::DragCancel { .. }
                         );
@@ -341,10 +358,20 @@ impl Connector {
         });
 
         let mut seq: u64 = 0;
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 _ = &mut dead_rx => break, // 读端断了
+                _ = heartbeat.tick() => {
+                    seq += 1;
+                    let m = Message::ctrl(&self.name, Payload::Heartbeat {
+                        seq,
+                        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    });
+                    if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
+                }
                 msg = self.ctrl_rx.recv() => match msg {
                     Some(m) => {
                         if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
@@ -363,14 +390,7 @@ impl Connector {
                     }
                     None => break,
                 },
-                _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-                    seq += 1;
-                    let m = Message::ctrl(&self.name, Payload::Heartbeat {
-                        seq,
-                        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    });
-                    if tcp::write_frame(&mut wr, &m).await.is_err() { break; }
-                }
+
             }
         }
         reader.abort();
@@ -404,24 +424,42 @@ mod tests {
 
     #[tokio::test]
     async fn two_engines_exchange_messages() {
+        // Do not bind the user's running Ruiss ports during regression tests.
+        let tcp_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (ta, tb) = (
+            tcp_a.local_addr().unwrap().port(),
+            tcp_b.local_addr().unwrap().port(),
+        );
+        let (ua, ub) = (
+            udp_a.local_addr().unwrap().port(),
+            udp_b.local_addr().unwrap().port(),
+        );
         // 同机双引擎：端口错开，对端端口互指（A 地址小 → A 当 Server）
         let cfg_a = PeerConfig {
             ip: "127.0.0.1".into(),
-            tcp_port: 5200,
-            udp_port: 5300,
-            peer_tcp_port: 5201,
-            peer_udp_port: 5301,
+            tcp_port: ta,
+            udp_port: ua,
+            peer_tcp_port: tb,
+            peer_udp_port: ub,
         };
         let cfg_b = PeerConfig {
             ip: "127.0.0.1".into(),
-            tcp_port: 5201,
-            udp_port: 5301,
-            peer_tcp_port: 5200,
-            peer_udp_port: 5300,
+            tcp_port: tb,
+            udp_port: ub,
+            peer_tcp_port: ta,
+            peer_udp_port: ua,
         };
 
-        let sa = NetEngine::start("A".into(), cfg_a).await.expect("A 启动失败");
-        let sb = NetEngine::start("B".into(), cfg_b).await.expect("B 启动失败");
+        drop((tcp_a, tcp_b, udp_a, udp_b));
+        let sa = NetEngine::start("A".into(), cfg_a)
+            .await
+            .expect("A 启动失败");
+        let sb = NetEngine::start("B".into(), cfg_b)
+            .await
+            .expect("B 启动失败");
         let (_engine_a, handle_a, mut in_a) = (sa.engine, sa.handle, sa.incoming);
         let (_engine_b, handle_b, mut in_b) = (sb.engine, sb.handle, sb.incoming);
 
@@ -435,15 +473,38 @@ mod tests {
         // A → B（TCP 事件）
         handle_a.send(Message::event(
             "A",
-            Payload::Key { key: crate::core::keys::Key::A, scan: 0x1E, extended: false, down: true },
+            Payload::Key {
+                key: crate::core::keys::Key::A,
+                scan: 0x1E,
+                extended: false,
+                down: true,
+            },
         ));
         let m = recv_until(&mut in_b, |m| m.from == "A" && m.kind == MsgKind::Event).await;
-        assert!(matches!(m.payload, Payload::Key { key: crate::core::keys::Key::A, .. }));
+        assert!(matches!(
+            m.payload,
+            Payload::Key {
+                key: crate::core::keys::Key::A,
+                ..
+            }
+        ));
 
         // B → A（TCP 事件）
-        handle_b.send(Message::event("B", Payload::MouseButton { button: 0, down: true }));
+        handle_b.send(Message::event(
+            "B",
+            Payload::MouseButton {
+                button: 0,
+                down: true,
+            },
+        ));
         let m = recv_until(&mut in_a, |m| m.from == "B" && m.kind == MsgKind::Event).await;
-        assert!(matches!(m.payload, Payload::MouseButton { button: 0, down: true }));
+        assert!(matches!(
+            m.payload,
+            Payload::MouseButton {
+                button: 0,
+                down: true
+            }
+        ));
 
         // A → B（UDP 移动）
         handle_a.send_pointer(Payload::PointerMove {
@@ -454,15 +515,117 @@ mod tests {
             src_w: 1280,
             src_h: 800,
         });
-        let m = recv_until(&mut in_b, |m| matches!(m.payload, Payload::PointerMove { .. })).await;
-        assert!(matches!(m.payload, Payload::PointerMove { session: 7, seq: 1, x: 10, y: 20, src_w: 1280, src_h: 800 }));
+        let m = recv_until(&mut in_b, |m| {
+            matches!(m.payload, Payload::PointerMove { .. })
+        })
+        .await;
+        assert!(matches!(
+            m.payload,
+            Payload::PointerMove {
+                session: 7,
+                seq: 1,
+                x: 10,
+                y: 20,
+                src_w: 1280,
+                src_h: 800
+            }
+        ));
 
         // 控制消息（Ctrl）
         handle_a.send_ctrl(Message::ctrl(
             "A",
-            Payload::TakeControl { session: 7, x: 0, y: 100, src_w: 1280, src_h: 800 },
+            Payload::TakeControl {
+                session: 7,
+                x: 0,
+                y: 100,
+                src_w: 1280,
+                src_h: 800,
+            },
         ));
-        let m = recv_until(&mut in_b, |m| m.kind == MsgKind::Ctrl).await;
-        assert!(matches!(m.payload, Payload::TakeControl { session: 7, x: 0, y: 100, .. }));
+        let m = recv_until(&mut in_b, |m| {
+            matches!(m.payload, Payload::TakeControl { .. })
+        })
+        .await;
+        assert!(matches!(
+            m.payload,
+            Payload::TakeControl {
+                session: 7,
+                x: 0,
+                y: 100,
+                ..
+            }
+        ));
+
+        // Drag startup must remain ordered with takeover and release, despite a
+        // separate file router. The old routing put DragStart into file_incoming.
+        handle_a.send_ctrl(Message::ctrl(
+            "A",
+            Payload::DragStart {
+                id: "drag".into(),
+                roots: vec![],
+            },
+        ));
+        handle_a.send_ctrl(Message::event(
+            "A",
+            Payload::MouseButton {
+                button: 0,
+                down: false,
+            },
+        ));
+        let next = recv_until(&mut in_b, |m| {
+            !matches!(m.payload, Payload::Heartbeat { .. })
+        })
+        .await;
+        assert!(matches!(next.payload, Payload::DragStart { .. }));
+        let next = recv_until(&mut in_b, |m| {
+            !matches!(m.payload, Payload::Heartbeat { .. })
+        })
+        .await;
+        assert!(matches!(
+            next.payload,
+            Payload::MouseButton { down: false, .. }
+        ));
+
+        // Keep the outgoing queue active longer than the heartbeat read timeout.
+        // Sleeping afresh after every write never sends a heartbeat in this case.
+        let sender = handle_a.clone();
+        let traffic = tokio::spawn(async move {
+            for _ in 0..50 {
+                sender.send_ctrl(Message::clipboard("A", Payload::ClipboardClear));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        let mut heartbeats = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let m = recv_until(&mut in_b, |_| true).await;
+            if matches!(m.payload, Payload::Heartbeat { .. }) {
+                heartbeats += 1;
+            }
+        }
+        traffic.await.unwrap();
+        assert!(heartbeats >= 3, "continuous traffic starved heartbeats");
+        assert!(handle_a.connected() && handle_b.connected());
+
+        // Exercise a >16 MiB image over the actual socket in both directions.
+        for (sender, input, name) in [(&handle_a, &mut in_b, "A"), (&handle_b, &mut in_a, "B")] {
+            let data = vec![217; 20 * 1024 * 1024];
+            crate::clipboard::image::send(sender, name, "image-test".into(), data.clone());
+            let mut image = crate::clipboard::image::ImageReceiver::default();
+            loop {
+                let m = recv_until(input, |m| m.from == name).await;
+                match m.payload {
+                    Payload::ClipboardImageStart { id, size } => image.start(&id, size).unwrap(),
+                    Payload::ClipboardImageChunk { id, seq, data } => {
+                        image.chunk(&id, seq, &data).unwrap()
+                    }
+                    Payload::ClipboardImageEnd { id } => {
+                        assert_eq!(image.finish(&id).unwrap(), data);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }

@@ -23,8 +23,8 @@ use anyhow::{anyhow, Result};
 use windows::core::{implement, w, Error as WinError, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-    DV_E_FORMATETC, E_NOTIMPL, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT,
-    OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK, SIZE, WPARAM,
+    DV_E_FORMATETC, E_NOTIMPL, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED,
+    POINT, POINTL, SIZE, S_OK, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetSysColor, ReleaseDC,
@@ -36,7 +36,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
+    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -61,8 +61,8 @@ use windows::Win32::UI::Input::{
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::Shell::{
-    DragQueryFileW, IDragSourceHelper, SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON,
-    SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, CLSID_DragDropHelper, SHDRAGIMAGE,
+    CLSID_DragDropHelper, DragQueryFileW, IDragSourceHelper, SHGetFileInfoW, SHDRAGIMAGE,
+    SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
@@ -72,10 +72,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DI_NORMAL, HCURSOR, HICON, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
     LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SW_HIDE, SW_SHOWNA,
     SYSTEM_CURSOR_ID, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_SETCURSOR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WM_CLIPBOARDUPDATE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSW, WNDCLASS_STYLES, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP,
 };
@@ -1258,36 +1257,25 @@ fn should_ignore_clipboard_notification(current: u32) -> bool {
     false
 }
 
-/// 本机自己写入剪贴板内容时，之前挂着的懒传占位立刻失效（剪贴板内容已被替换）。
-/// 不清会留下"陈旧 PENDING"，让后面的剪贴板读取误判成"当前是延迟渲染的空壳"。
-fn clear_pending_lazy_offer() {
-    *PENDING_LAZY_HDROP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-}
-
 /// 读当前剪贴板内容（优先级 files > image > text）。读不出返回 Empty。
 pub fn clipboard_read() -> ClipboardContent {
+    try_read_clipboard().unwrap_or(ClipboardContent::Empty)
+}
+
+fn try_read_clipboard() -> Option<ClipboardContent> {
     unsafe {
         if OpenClipboard(None).is_err() {
-            return ClipboardContent::Empty;
+            return None;
         }
         let result = read_inner();
         let _ = CloseClipboard();
-        result
+        Some(result)
     }
 }
 
 unsafe fn read_inner() -> ClipboardContent {
-    // 本机自己挂着懒传占位时，剪贴板里的 CF_HDROP 是延迟渲染的空壳：
-    // 读它必然触发 WM_RENDERFORMAT（提前消费 offer，并让调用线程阻塞到传输
-    // 结束）。此时剪贴板里只有这一个占位，按空内容处理即可。
-    let pending_offer = PENDING_LAZY_HDROP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
     // 文件优先
-    if !pending_offer {
+    {
         if let Ok(h) = GetClipboardData(CF_HDROP.0 as u32) {
             if let Some(files) = read_hdrop(h.0 as *mut c_void) {
                 if !files.is_empty() {
@@ -1446,14 +1434,55 @@ fn dib_bytes_to_png(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 写文本到剪贴板。
+// A real owner is required after EmptyClipboard. OpenClipboard(NULL) leaves
+// ownership NULL, so SetClipboardData may fail. Keep the temporary owner alive
+// through CloseClipboard and retry when another application briefly holds it.
+struct ClipboardWriteGuard(HWND);
+
+impl ClipboardWriteGuard {
+    unsafe fn open() -> Option<Self> {
+        let owner = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            w!("RuissClipboardWriter"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+        for _ in 0..20 {
+            if OpenClipboard(owner).is_ok() {
+                return Some(Self(owner));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log::error!("[CLIPBOARD] clipboard remained locked; unable to publish received content");
+        let _ = DestroyWindow(owner);
+        None
+    }
+}
+
+impl Drop for ClipboardWriteGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
 pub fn clipboard_write_text(text: &str) {
     unsafe {
-        if OpenClipboard(None).is_err() {
+        let Some(_clipboard) = ClipboardWriteGuard::open() else {
             return;
-        }
+        };
         let _ = EmptyClipboard();
-        clear_pending_lazy_offer();
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         wide.push(0);
         let bytes = wide.align_to::<u8>().1; // u16 → bytes
@@ -1469,20 +1498,19 @@ pub fn clipboard_write_text(text: &str) {
             }
         }
         remember_local_clipboard_sequence();
-        let _ = CloseClipboard();
     }
 }
 
 /// 写 PNG 图片到剪贴板（写入 CF_DIB + CF_PNG，兼容性最好）。
 pub fn clipboard_write_image(png_bytes: &[u8]) {
+    let dib = png_to_dib(png_bytes);
     unsafe {
-        if OpenClipboard(None).is_err() {
+        let Some(_clipboard) = ClipboardWriteGuard::open() else {
             return;
-        }
+        };
         let _ = EmptyClipboard();
-        clear_pending_lazy_offer();
         // 解码 PNG → RGBA → CF_DIB
-        if let Some(dib) = png_to_dib(png_bytes) {
+        if let Some(dib) = dib {
             if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, dib.len()) {
                 let ptr = GlobalLock(hmem);
                 if !ptr.is_null() {
@@ -1512,107 +1540,91 @@ pub fn clipboard_write_image(png_bytes: &[u8]) {
             }
         }
         remember_local_clipboard_sequence();
-        let _ = CloseClipboard();
     }
 }
 
 pub fn clipboard_clear() {
     unsafe {
-        if OpenClipboard(None).is_err() {
+        let Some(_clipboard) = ClipboardWriteGuard::open() else {
             return;
-        }
+        };
         let _ = EmptyClipboard();
-        clear_pending_lazy_offer();
         remember_local_clipboard_sequence();
-        let _ = CloseClipboard();
     }
 }
 
 /// PNG → CF_DIB（BITMAPINFOHEADER 32bit BGRA bottom-up + 像素）。
 fn png_to_dib(png_bytes: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Cursor;
-    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_limits(png::Limits {
+        bytes: 256 * 1024 * 1024,
+    });
     let mut reader = decoder.read_info().ok()?;
+    let width = reader.info().width;
+    let height = reader.info().height;
+    let pixel_bytes = width.checked_mul(height)?.checked_mul(4)?;
+    if width > i32::MAX as u32 || height > i32::MAX as u32 || pixel_bytes > 256 * 1024 * 1024 {
+        return None;
+    }
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
-    let width = info.width;
-    let height = info.height;
-
-    let mut dib = Vec::with_capacity(40 + (width * height * 4) as usize);
-    // BITMAPINFOHEADER
-    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
-    dib.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (正=bottom-up)
-    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
-    dib.extend_from_slice(&(width * height * 4).to_le_bytes()); // biSizeImage
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
-    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-                                                // 像素：RGBA → BGRA，bottom-up
-    let row = (width * 4) as usize;
-    for y in (0..height).rev() {
-        for x in 0..width {
-            let s = ((y as usize) * (width as usize) + (x as usize)) * 4;
-            let r = buf[s];
-            let g = buf[s + 1];
-            let b = buf[s + 2];
-            let a = buf[s + 3];
-            dib.push(b);
-            dib.push(g);
-            dib.push(r);
-            dib.push(a);
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let channels = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::Indexed => return None, // EXPAND removes palette indices.
+    };
+    let mut dib = Vec::with_capacity(40 + pixel_bytes as usize);
+    dib.extend_from_slice(&40u32.to_le_bytes());
+    dib.extend_from_slice(&(width as i32).to_le_bytes());
+    dib.extend_from_slice(&(height as i32).to_le_bytes());
+    dib.extend_from_slice(&1u16.to_le_bytes());
+    dib.extend_from_slice(&32u16.to_le_bytes());
+    dib.extend_from_slice(&0u32.to_le_bytes());
+    dib.extend_from_slice(&pixel_bytes.to_le_bytes());
+    dib.extend_from_slice(&[0; 16]);
+    for row in buf[..info.buffer_size()]
+        .chunks_exact(width as usize * channels)
+        .rev()
+    {
+        for pixel in row.chunks_exact(channels) {
+            let rgba = match channels {
+                4 => [pixel[2], pixel[1], pixel[0], pixel[3]],
+                3 => [pixel[2], pixel[1], pixel[0], 255],
+                2 => [pixel[0], pixel[0], pixel[0], pixel[1]],
+                _ => [pixel[0], pixel[0], pixel[0], 255],
+            };
+            dib.extend_from_slice(&rgba);
         }
-        let _ = row; // 抑制未用警告
     }
     Some(dib)
 }
 
 /// 写文件路径列表到剪贴板（CF_HDROP）。
-pub fn clipboard_write_files(paths: &[String]) {
+pub fn clipboard_write_files(paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
-        return;
+        return Err("没有可粘贴的文件".into());
     }
-    // 构造 DROPFILES + UTF-16 路径列表（每条 \0 分隔，末尾 \0\0）
-    let mut payload: Vec<u16> = Vec::new();
-    for p in paths {
-        payload.extend_from_slice(p.encode_utf16().collect::<Vec<u16>>().as_slice());
-        payload.push(0);
-    }
-    payload.push(0); // 双 0 结尾
-
-    let dropfiles_size = 20usize; // sizeof(DROPFILES) = 20
-    let total = dropfiles_size + payload.len() * 2;
-
     unsafe {
-        if OpenClipboard(None).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        clear_pending_lazy_offer();
-        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, total) {
-            let ptr = GlobalLock(hmem);
-            if !ptr.is_null() {
-                let buf = std::slice::from_raw_parts_mut(ptr as *mut u8, total);
-                // DROPFILES: pFiles=20, pt=(0,0), fNC=0, fWide=1
-                buf[0..4].copy_from_slice(&20u32.to_le_bytes());
-                buf[4..8].copy_from_slice(&0i32.to_le_bytes());
-                buf[8..12].copy_from_slice(&0i32.to_le_bytes());
-                buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // fNC=0
-                buf[16..20].copy_from_slice(&1u32.to_le_bytes()); // fWide=1
-                let bytes = payload.align_to::<u8>().1;
-                buf[dropfiles_size..].copy_from_slice(bytes);
-                let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(
-                    CF_HDROP.0 as u32,
-                    windows::Win32::Foundation::HANDLE(hmem.0),
-                );
-            }
+        let _clipboard = ClipboardWriteGuard::open().ok_or("文件已收到，但剪贴板被其他应用占用")?;
+        let hmem = RemoteDragDataObject::hdrop(paths).map_err(|e| e.to_string())?;
+        let result = EmptyClipboard().and_then(|_| {
+            SetClipboardData(
+                CF_HDROP.0 as u32,
+                windows::Win32::Foundation::HANDLE(hmem.0),
+            )
+        });
+        if let Err(error) = result {
+            let _ = windows::Win32::Foundation::GlobalFree(hmem);
+            return Err(format!("文件已收到，但写入剪贴板失败: {error}"));
         }
         remember_local_clipboard_sequence();
-        let _ = CloseClipboard();
+        Ok(())
     }
 }
 
@@ -1991,11 +2003,30 @@ impl IDataObject_Impl for RemoteDragDataObject_Impl {
 }
 
 #[implement(windows::Win32::System::Ole::IDropSource)]
-struct RemoteDropSource;
+struct RemoteDropSource {
+    started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    ready: RemoteReady,
+}
 
 impl IDropSource_Impl for RemoteDropSource_Impl {
     fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
-        if escape.as_bool() {
+        if let Some(started) = self
+            .started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = started.send(());
+        }
+        let cancelled = self
+            .ready
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .result
+            .as_ref()
+            .is_some_and(|r| r.is_err());
+        if escape.as_bool() || cancelled {
             DRAGDROP_S_CANCEL
         } else if (keys & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
             DRAGDROP_S_DROP
@@ -2008,7 +2039,8 @@ impl IDropSource_Impl for RemoteDropSource_Impl {
     }
 }
 
-/// 创建属于当前线程的 1x1 隐形捕获窗口（把注入鼠标事件路由进本线程队列）。
+/// Create a nearly transparent source under the pointer. An invisible background
+/// window cannot capture input outside its bounds (SetCapture's foreground rule).
 /// 窗口类进程级注册，重复注册失败可忽略（类已存在时窗口仍可创建）。
 unsafe fn create_drag_capture_window() -> HWND {
     let class = w!("RuissDragCapture");
@@ -2030,21 +2062,27 @@ unsafe fn create_drag_capture_window() -> HWND {
         ..Default::default()
     };
     let _ = RegisterClassW(&wc);
+    let mut point = POINT::default();
+    let _ = GetCursorPos(&mut point);
     match CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
         class,
         w!("RuissDragCapture"),
         WS_POPUP,
-        0,
-        0,
-        1,
-        1,
+        point.x - 1,
+        point.y - 1,
+        3,
+        3,
         None,
         None,
         hinst,
         None,
     ) {
-        Ok(hwnd) => hwnd,
+        Ok(hwnd) => {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            hwnd
+        }
         Err(error) => {
             log::warn!("[DRAG] 创建拖拽捕获窗口失败: {error}");
             HWND::default()
@@ -2119,13 +2157,29 @@ unsafe fn attach_drag_image(data: &IDataObject, first_name: Option<&str>) {
 /// 拖拽捕获窗口的 RAII 守卫：无论 DoDragDrop 正常返回、提前失败还是内部 panic，
 /// 都必须把 SetCapture 交还系统并销毁窗口——否则本机鼠标点击会一直被路由到这个
 /// 隐形窗口（用户表现为"鼠标点不动 / 找不到"）。
-struct DragCaptureGuard(Option<HWND>);
+struct DragCaptureGuard(Option<HWND>, HWND);
 
 impl Drop for DragCaptureGuard {
     fn drop(&mut self) {
         if let Some(hwnd) = self.0.take() {
             unsafe {
                 let _ = ReleaseCapture();
+                let input = [INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dwFlags: MOUSEEVENTF_LEFTUP,
+                            ..Default::default()
+                        },
+                    },
+                }];
+                SendInput(&input, size_of::<INPUT>() as i32);
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetForegroundWindow, SetForegroundWindow,
+                };
+                if GetForegroundWindow() == hwnd && !self.1 .0.is_null() {
+                    let _ = SetForegroundWindow(self.1);
+                }
                 let _ = DestroyWindow(hwnd);
             }
         }
@@ -2155,6 +2209,8 @@ pub fn start_remote_file_drag(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), ready.clone());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let cancel_id = id.clone();
     std::thread::spawn(move || unsafe {
         let mut ole_ready = false;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2170,17 +2226,21 @@ pub fn start_remote_file_drag(
             // 创建属于本线程的隐形捕获窗口并 SetCapture，把注入事件路由进本线程队列
             // （等价于真实拖拽时源窗口 capture 鼠标的状态），且合成 LEFT_DOWN 也不会
             // 误点到光标下的前台应用。
+            let previous_foreground =
+                windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
             let capture_hwnd = create_drag_capture_window();
             // 守卫先建：后面任何一条 return/panic 都会走到 Drop，把捕获还回去。
-            let _capture_guard = DragCaptureGuard(if capture_hwnd.0.is_null() {
-                None
-            } else {
-                Some(capture_hwnd)
-            });
+            let _capture_guard = DragCaptureGuard(
+                if capture_hwnd.0.is_null() {
+                    None
+                } else {
+                    Some(capture_hwnd)
+                },
+                previous_foreground,
+            );
             if capture_hwnd.0.is_null() {
-                log::warn!("[DRAG] 无法创建拖拽捕获窗口，合成拖拽可能不跟随注入输入");
-            } else {
-                let _ = SetCapture(capture_hwnd);
+                log::error!("[DRAG] 无法创建拖拽捕获窗口");
+                return;
             }
             let input = [INPUT {
                 r#type: INPUT_MOUSE,
@@ -2192,15 +2252,40 @@ pub fn start_remote_file_drag(
                 },
             }];
             SendInput(&input, size_of::<INPUT>() as i32);
+            // Consume the initiating down on this STA. It activates our source and
+            // updates this thread's GetKeyState snapshot before OLE inspects it.
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut down_received = false;
+            while Instant::now() < deadline && !down_received {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    down_received |= msg.message == WM_LBUTTONDOWN;
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if !down_received {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if !down_received {
+                log::error!("[DRAG] native source did not receive initiating mouse down");
+                return;
+            }
+            let _ = SetCapture(capture_hwnd);
             let data: IDataObject = RemoteDragDataObject {
                 id: id.clone(),
-                ready,
+                ready: ready.clone(),
                 callback: callback.clone(),
             }
             .into();
             // 拖影：按第一个根条目的扩展名取系统类型图标（目标机无实体文件，仅视觉）。
             attach_drag_image(&data, roots.first().map(|r| r.name.as_str()));
-            let source: IDropSource = RemoteDropSource.into();
+            let source: IDropSource = RemoteDropSource {
+                started: Mutex::new(Some(started_tx)),
+                ready,
+            }
+            .into();
             let mut effect = DROPEFFECT_NONE;
             let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
             if result != DRAGDROP_S_DROP {
@@ -2220,6 +2305,10 @@ pub fn start_remote_file_drag(
             OleUninitialize();
         }
     });
+    if let Err(error) = started_rx.recv_timeout(Duration::from_secs(2)) {
+        cancel_remote_file_drag(&cancel_id);
+        return Err(anyhow!("native drag did not start: {error}"));
+    }
     Ok(())
 }
 
@@ -2239,6 +2328,14 @@ pub fn complete_remote_file_drag(id: &str, paths: &[String], error: Option<Strin
 }
 
 pub fn cancel_remote_file_drag(id: &str) {
+    if !REMOTE_DRAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(id)
+    {
+        return;
+    }
     complete_remote_file_drag(id, &[], Some("drag cancelled".into()));
     let input = [INPUT {
         r#type: INPUT_MOUSE,
@@ -2256,14 +2353,10 @@ pub fn cancel_remote_file_drag(id: &str) {
 
 /// 启动剪贴板监听：创建隐藏消息窗口 + AddClipboardFormatListener，
 /// 收到 WM_CLIPBOARDUPDATE 时读剪贴板并回调（按精确 sequence 跳过本机写入）。
-/// 该窗口同时是懒粘贴剪贴板的所有者：SetClipboardData(NULL) 延迟渲染后，
-/// 粘贴时系统向它发 WM_RENDERFORMAT。
 pub fn start_clipboard_watcher(
     cb: Box<dyn Fn(ClipboardContent) + Send + 'static>,
 ) -> ClipboardWatcherHandle {
-    use std::sync::OnceLock;
-    static WATCHER_TID: OnceLock<u32> = OnceLock::new();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<u32>();
 
     std::thread::spawn(move || {
         unsafe {
@@ -2283,7 +2376,6 @@ pub fn start_clipboard_watcher(
             };
             let _ = RegisterClassW(&wc);
             // 记录线程 id，stop 时用 PostThreadMessageW 唤醒 GetMessageW
-            let _ = WATCHER_TID.set(GetCurrentThreadId());
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE,
                 class,
@@ -2301,13 +2393,12 @@ pub fn start_clipboard_watcher(
             let hwnd = match hwnd {
                 Ok(h) => h,
                 Err(_) => {
-                    let _ = ready_tx.send(());
+                    let _ = ready_tx.send(0);
                     return;
                 }
             };
-            let _ = WATCHER_HWND.set(hwnd.0 as isize);
             let _ = AddClipboardFormatListener(hwnd);
-            let _ = ready_tx.send(());
+            let _ = ready_tx.send(GetCurrentThreadId());
 
             CLIP_CB.with(|c| *c.borrow_mut() = Some(cb));
 
@@ -2323,10 +2414,10 @@ pub fn start_clipboard_watcher(
         }
     });
 
-    let _ = ready_rx.recv();
+    let tid = ready_rx.recv().unwrap_or(0);
     ClipboardWatcherHandle {
         stop: Some(Box::new(move || {
-            if let Some(&tid) = WATCHER_TID.get() {
+            if tid != 0 {
                 unsafe {
                     let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
                 }
@@ -2339,178 +2430,29 @@ thread_local! {
     static CLIP_CB: RefCell<Option<Box<dyn Fn(ClipboardContent) + Send>>> = const { RefCell::new(None) };
 }
 
-/// 剪贴板监听窗口句柄：懒粘贴占位用它当剪贴板所有者（delay-render）。
-static WATCHER_HWND: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
-
-/// 懒粘贴占位：剪贴板里挂着延迟渲染的 CF_HDROP，粘贴时才真正取文件。
-struct LazyHdrop {
-    id: String,
-    callback: crate::platform::ClipboardPasteCallback,
-}
-
-static PENDING_LAZY_HDROP: Mutex<Option<LazyHdrop>> = Mutex::new(None);
-
-/// 把对端复制的文件挂成剪贴板虚拟文件（懒传）：只写延迟渲染的 CF_HDROP，
-/// 用户粘贴时系统发 WM_RENDERFORMAT，届时才回源端请求传输。
-pub fn set_clipboard_file_promise(
-    id: String,
-    _names: Vec<String>,
-    callback: crate::platform::ClipboardPasteCallback,
-) {
-    *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = Some(LazyHdrop { id, callback });
-    unsafe {
-        let Some(&raw) = WATCHER_HWND.get() else {
-            log::error!("[CLIPBOARD] 剪贴板监听窗口未就绪，无法挂懒粘贴占位");
-            return;
-        };
-        let hwnd = HWND(raw as *mut std::ffi::c_void);
-        if OpenClipboard(hwnd).is_err() {
-            log::error!("[CLIPBOARD] 打开剪贴板失败，无法挂懒粘贴占位");
-            *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            return;
-        }
-        let _ = EmptyClipboard();
-        // CF_HDROP 传 NULL 句柄 → 延迟渲染：粘贴时向 WATCHER_HWND 发 WM_RENDERFORMAT
-        let _ = SetClipboardData(CF_HDROP.0 as u32, HANDLE::default());
-        // Preferred DropEffect = COPY，让资源管理器粘贴时光标显示"复制"
-        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, 4) {
-            let ptr = GlobalLock(hmem);
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(
-                    &1u32.to_le_bytes() as *const u8,
-                    ptr as *mut u8,
-                    4,
-                );
-                let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(
-                    RegisterClipboardFormatW(w!("Preferred DropEffect")) as u32,
-                    HANDLE(hmem.0),
-                );
-            }
-        }
-        remember_local_clipboard_sequence();
-        let _ = CloseClipboard();
-    }
-}
-
-/// WM_RENDERFORMAT：真正渲染延迟的 CF_HDROP。
-/// 阻塞等待对端把文件传完（目标应用在此期间等待剪贴板数据）。
-fn render_clipboard_hdrop(format: u32) {
-    // 先校验格式再取 offer：offer 是一次性的，任何一次"非 CF_HDROP"的延迟渲染
-    // 请求都不能把它吃掉——否则用户之后真正粘贴时已经没有 offer 可用。
-    if format != CF_HDROP.0 as u32 {
-        log::debug!("[CLIPBOARD] 忽略非 CF_HDROP 的延迟渲染请求 format={format}");
-        return;
-    }
-    let offer = PENDING_LAZY_HDROP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    let Some(offer) = offer else {
-        return;
-    };
-    let ready = crate::platform::new_paste_ready();
-    (offer.callback)(crate::platform::ClipboardPasteEvent::Requested {
-        id: offer.id.clone(),
-        ready: ready.clone(),
-    });
-    let started = Instant::now();
-    let paths = match crate::platform::wait_paste_ready(&ready, Duration::from_secs(180)) {
-        Ok(paths) => paths,
-        Err(error) => {
-            log::error!("[CLIPBOARD] 懒粘贴文件传输失败: {error}");
-            Vec::new()
-        }
-    };
-    // 耗时日志：延迟渲染期间资源管理器一直阻塞在 GetClipboardData 上等我们，
-    // 这个毫秒数能直接说明"大文件粘贴为什么慢/为什么会听到系统提示音"。
-    log::info!(
-        "[CLIPBOARD] 懒粘贴取到 {} 个文件，渲染等待 {} ms",
-        paths.len(),
-        started.elapsed().as_millis()
-    );
-    if paths.is_empty() {
-        // 传输失败/超时：必须把剪贴板里那条延迟渲染的 CF_HDROP 一起撤掉。
-        // 否则每次 Ctrl+V 都会重新触发渲染、又拿不到数据，表现为"粘贴没反应"
-        // 且永不自愈（只能靠用户复制别的内容打断）。
-        log::error!("[CLIPBOARD] 懒粘贴渲染失败：清空失效的剪贴板占位");
-        drop_stale_lazy_clipboard();
-        return;
-    }
-    unsafe {
-        // WM_RENDERFORMAT 期间系统已为剪贴板所有者打开剪贴板，直接
-        // SetClipboardData 即可；再调 OpenClipboard 必然失败（err=5，
-        // 剪贴板已被系统/请求方打开），导致数据永远写不进去、粘贴拿 NULL。
-        // （2026-08-14 实测确认：删除 OpenClipboard 后渲染成功、粘贴可拿到数据）
-        match RemoteDragDataObject::hdrop(&paths) {
-            Ok(hmem) => {
-                if let Err(error) = SetClipboardData(CF_HDROP.0 as u32, HANDLE(hmem.0)) {
-                    log::error!("[CLIPBOARD] 渲染 CF_HDROP 失败: {error}");
-                }
-            }
-            Err(error) => log::error!("[CLIPBOARD] 构造 CF_HDROP 失败: {error}"),
-        }
-    }
-}
-
-/// 清掉剪贴板里已经失效的延迟渲染占位（传输失败时调用），让状态收敛：
-/// 粘贴变成"没有内容"而不是"永远卡着拿不到数据"。
-fn drop_stale_lazy_clipboard() {
-    clear_pending_lazy_offer();
-    unsafe {
-        let Some(&raw) = WATCHER_HWND.get() else {
-            return;
-        };
-        let hwnd = HWND(raw as *mut std::ffi::c_void);
-        if OpenClipboard(hwnd).is_err() {
-            return;
-        }
-        // 只有当前所有者还是我们时才有权清空，否则会破坏别的程序刚放进来的内容。
-        if GetClipboardOwner().map(|owner| owner == hwnd).unwrap_or(false) {
-            let _ = EmptyClipboard();
-            remember_local_clipboard_sequence();
-        }
-        let _ = CloseClipboard();
-    }
-}
-
-/// 监听窗口过程：WM_CLIPBOARDUPDATE 触发读剪贴板 + 回调；
-/// WM_RENDERFORMAT/RENDERALLFORMATS 渲染懒粘贴的 CF_HDROP。
+/// Read each physical clipboard change; retry transient locks without losing a copy.
 unsafe extern "system" fn clip_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_CLIPBOARDUPDATE {
-        // 本机自己写入产生的通知（含一次写入触发的多条通知）直接跳过；
-        // 用序列号精确判定，不再用"有没有懒传占位"这种会误吞真实复制的近似判断。
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WM_TIMER};
+    if msg == WM_CLIPBOARDUPDATE || (msg == WM_TIMER && wparam.0 == 1) {
+        let _ = KillTimer(hwnd, 1);
         if should_ignore_clipboard_notification(GetClipboardSequenceNumber()) {
             return LRESULT(0);
         }
-        let content = clipboard_read();
-        if !content.is_empty() {
-            CLIP_CB.with(|c| {
+        match try_read_clipboard() {
+            Some(content) => CLIP_CB.with(|c| {
                 if let Some(cb) = c.borrow().as_ref() {
                     cb(content);
                 }
-            });
+            }),
+            None => {
+                SetTimer(hwnd, 1, 50, None);
+            }
         }
-        return LRESULT(0);
-    }
-    if msg == WM_RENDERFORMAT {
-        // wParam = 请求方要的剪贴板格式（CF_HDROP=15）。
-        render_clipboard_hdrop(wparam.0 as u32);
-        return LRESULT(0);
-    }
-    if msg == WM_RENDERALLFORMATS {
-        // 应用退出/监听窗口销毁：文件懒传无法继续，清占位即可（不渲染）。
-        *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        return LRESULT(0);
-    }
-    if msg == WM_DESTROYCLIPBOARD {
-        // 剪贴板被其他进程抢占，懒占位随之失效。
-        *PENDING_LAZY_HDROP.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -2519,6 +2461,48 @@ unsafe extern "system" fn clip_wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_png_formats_convert_to_bgra_without_panicking() {
+        let cases: &[(png::ColorType, &[u8], &[u8])] = &[
+            (
+                png::ColorType::Rgb,
+                &[10, 20, 30, 40, 50, 60],
+                &[60, 50, 40, 255, 30, 20, 10, 255],
+            ),
+            (
+                png::ColorType::Rgba,
+                &[10, 20, 30, 80, 40, 50, 60, 90],
+                &[60, 50, 40, 90, 30, 20, 10, 80],
+            ),
+            (
+                png::ColorType::Grayscale,
+                &[10, 40],
+                &[40, 40, 40, 255, 10, 10, 10, 255],
+            ),
+            (
+                png::ColorType::GrayscaleAlpha,
+                &[10, 80, 40, 90],
+                &[40, 40, 40, 90, 10, 10, 10, 80],
+            ),
+        ];
+        for (color, pixels, expected) in cases {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 1, 2);
+                encoder.set_color(*color);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(pixels)
+                    .unwrap();
+            }
+            let dib = png_to_dib(&bytes).unwrap();
+            assert_eq!(&dib[40..], *expected, "{color:?}");
+            assert!(png_to_dib(&bytes[..bytes.len() / 2]).is_none());
+        }
+    }
 
     #[test]
     fn raw_relative_mouse_preserves_signed_delta() {
@@ -2603,7 +2587,9 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
         // 值带引号包裹：路径含空格时 Windows 也能正确启动
         let value = format!("\"{exe_str}\"");
         let status = Command::new("reg")
-            .args(["add", run_key, "/v", "Ruiss", "/t", "REG_SZ", "/d", &value, "/f"])
+            .args([
+                "add", run_key, "/v", "Ruiss", "/t", "REG_SZ", "/d", &value, "/f",
+            ])
             .status()
             .map_err(|e| format!("调用 reg.exe 失败: {e}"))?;
         if !status.success() {

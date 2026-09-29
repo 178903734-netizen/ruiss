@@ -19,6 +19,11 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// 写一帧：4 字节大端长度 + JSON。
 pub async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, msg: &Message) -> Result<()> {
     let body = encode_body(msg)?;
+    anyhow::ensure!(
+        body.len() <= MAX_FRAME,
+        "outgoing frame too large: {}",
+        body.len()
+    );
     stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
     stream.write_all(&body).await?;
     Ok(())
@@ -42,16 +47,25 @@ pub async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Message>
 // every control/clipboard message (and therefore keeping diagnostics readable).
 const FRAME_JSON: u8 = 0;
 const FRAME_FILE_CHUNK: u8 = 1;
+const FRAME_IMAGE_CHUNK: u8 = 2;
 
 fn encode_body(msg: &Message) -> Result<Vec<u8>> {
-    if let Payload::FileChunk { id, seq, data } = &msg.payload {
+    if let Payload::FileChunk { id, seq, data } | Payload::ClipboardImageChunk { id, seq, data } =
+        &msg.payload
+    {
         let from = msg.from.as_bytes();
         let id = id.as_bytes();
         if from.len() > u16::MAX as usize || id.len() > u16::MAX as usize {
             return Err(anyhow::anyhow!("file chunk identifier is too long"));
         }
         let mut body = Vec::with_capacity(9 + from.len() + id.len() + data.len());
-        body.push(FRAME_FILE_CHUNK);
+        body.push(
+            if matches!(&msg.payload, Payload::ClipboardImageChunk { .. }) {
+                FRAME_IMAGE_CHUNK
+            } else {
+                FRAME_FILE_CHUNK
+            },
+        );
         body.extend_from_slice(&(from.len() as u16).to_be_bytes());
         body.extend_from_slice(&(id.len() as u16).to_be_bytes());
         body.extend_from_slice(&seq.to_be_bytes());
@@ -74,7 +88,7 @@ fn decode_body(body: &[u8]) -> Result<Message> {
     };
     match tag {
         FRAME_JSON => Ok(serde_json::from_slice(rest)?),
-        FRAME_FILE_CHUNK => {
+        FRAME_FILE_CHUNK | FRAME_IMAGE_CHUNK => {
             if rest.len() < 8 {
                 return Err(anyhow::anyhow!("truncated file chunk header"));
             }
@@ -93,10 +107,18 @@ fn decode_body(body: &[u8]) -> Result<Message> {
             Ok(Message {
                 kind: MsgKind::Clipboard,
                 from,
-                payload: Payload::FileChunk {
-                    id,
-                    seq,
-                    data: rest[names_end..].to_vec(),
+                payload: if tag == FRAME_IMAGE_CHUNK {
+                    Payload::ClipboardImageChunk {
+                        id,
+                        seq,
+                        data: rest[names_end..].to_vec(),
+                    }
+                } else {
+                    Payload::FileChunk {
+                        id,
+                        seq,
+                        data: rest[names_end..].to_vec(),
+                    }
                 },
             })
         }
@@ -185,10 +207,31 @@ mod tests {
 
     #[test]
     fn json_control_frame_round_trip() {
-        let original = Message::ctrl("peer", Payload::DragCancel { id: "drag-1".into() });
+        let original = Message::ctrl(
+            "peer",
+            Payload::DragCancel {
+                id: "drag-1".into(),
+            },
+        );
         let body = encode_body(&original).unwrap();
         assert_eq!(body[0], FRAME_JSON);
         let decoded = decode_body(&body).unwrap();
         assert_eq!(decoded.payload, original.payload);
+    }
+
+    #[test]
+    fn binary_image_chunk_round_trip_without_json_expansion() {
+        let original = Message::clipboard(
+            "peer",
+            Payload::ClipboardImageChunk {
+                id: "image".into(),
+                seq: 6,
+                data: vec![255; 256 * 1024],
+            },
+        );
+        let body = encode_body(&original).unwrap();
+        assert_eq!(body[0], FRAME_IMAGE_CHUNK);
+        assert!(body.len() < 257 * 1024);
+        assert_eq!(decode_body(&body).unwrap().payload, original.payload);
     }
 }

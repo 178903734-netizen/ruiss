@@ -19,22 +19,13 @@ pub enum RemoteFileDragEvent {
     Cancelled(String),
 }
 
-// ===== 懒传剪贴板文件（粘贴时才传输）=====
+// ===== Native file-promise completion shared by all roots in a drag =====
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// 一次懒粘贴请求的共享结果槽。平台层在 WM_RENDERFORMAT / NSFilePromiseProvider
-/// 回调里阻塞等传输完成；网络层（FileReceiver）在文件落地后填入结果并唤醒。
+/// Native drag promise result. Multiple roots share one completed download.
 pub type PasteReady = Arc<(Mutex<Option<Result<Vec<String>, String>>>, Condvar)>;
-
-/// 用户真的粘贴了懒传 offer：平台回调带着 offer id 与结果槽请求上层传输。
-#[derive(Debug, Clone)]
-pub enum ClipboardPasteEvent {
-    Requested { id: String, ready: PasteReady },
-}
-
-pub type ClipboardPasteCallback = Arc<dyn Fn(ClipboardPasteEvent) + Send + Sync>;
 
 pub fn new_paste_ready() -> PasteReady {
     Arc::new((Mutex::new(None), Condvar::new()))
@@ -46,16 +37,51 @@ pub fn wait_paste_ready(ready: &PasteReady, timeout: Duration) -> Result<Vec<Str
     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(result) = state.take() {
-            return result;
+        if let Some(result) = state.as_ref() {
+            // One native drag has a promise per root; all share the same download.
+            return result.clone();
         }
         let (next, _) = cv
-            .wait_timeout(state, Duration::from_millis(500))
+            .wait_timeout(
+                state,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(500)),
+            )
             .unwrap_or_else(|e| e.into_inner());
         state = next;
         if Instant::now() >= deadline {
             return Err("等待对端文件传输超时".to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::*;
+
+    #[test]
+    fn multiple_promises_share_one_completed_transfer() {
+        let ready = new_paste_ready();
+        complete_paste_ready(&ready, Ok(vec!["one.txt".into(), "two.txt".into()]));
+        let first = wait_paste_ready(&ready, Duration::ZERO).unwrap();
+        let second = wait_paste_ready(&ready, Duration::ZERO).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn promise_failure_is_shared_with_all_waiters() {
+        let ready = new_paste_ready();
+        complete_paste_ready(&ready, Err("cancelled".into()));
+        assert_eq!(
+            wait_paste_ready(&ready, Duration::ZERO),
+            Err("cancelled".into())
+        );
+        assert_eq!(
+            wait_paste_ready(&ready, Duration::ZERO),
+            Err("cancelled".into())
+        );
     }
 }
 

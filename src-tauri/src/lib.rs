@@ -68,7 +68,12 @@ pub fn run() {
             app.manage(router.clone());
 
             // 开机自启对齐：设置里开了就确保系统已注册（防升级/移动程序后注册失效）
-            if router.lock().unwrap_or_else(|e| e.into_inner()).settings.autostart {
+            if router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settings
+                .autostart
+            {
                 if let Err(e) = platform::set_autostart(true) {
                     log::error!("开机自启注册失败: {e}");
                 }
@@ -94,7 +99,12 @@ pub fn run() {
             platform::start_drag_path_probe();
 
             // 文件接收器（监听对端 FileStart/Chunk/End，写下载目录 + 写剪贴板 + 通知前端）
-            let receive_dir = router.lock().unwrap_or_else(|e| e.into_inner()).settings.receive_dir.clone();
+            let receive_dir = router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settings
+                .receive_dir
+                .clone();
             let file_receiver = Arc::new(file_transfer::FileReceiver::new(
                 app.handle().clone(),
                 &receive_dir,
@@ -112,7 +122,14 @@ pub fn run() {
             });
 
             // 若已配置对端 IP，启动网络
-            if !router.lock().unwrap_or_else(|e| e.into_inner()).settings.peer_ip.trim().is_empty() {
+            if !router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .settings
+                .peer_ip
+                .trim()
+                .is_empty()
+            {
                 let r = router.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -391,39 +408,39 @@ fn start_capturer(router: Arc<Mutex<RouterState>>) -> Result<platform::InputCapt
         // 输入消费线程处理单个事件时 panic 不能让整条捕获链路死掉：一旦它退出，
         // 本机输入既进不了仲裁器、又会继续被钩子吞掉，机器等于失控。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let actions: Vec<Action> = {
-            let mut r = match router_cb.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
-            if !connected {
-                return;
-            }
-            // Windows mouse bindings are target-native Mac shortcuts. Consume both
-            // button transitions while linked; emit one atomic shortcut on press.
-            if !platform::TARGET_IS_MAC {
-                let linked_source = r
-                    .arbiter
-                    .as_ref()
-                    .map(|a| a.mode == Mode::Source && a.linked)
-                    .unwrap_or(false);
-                if linked_source {
-                    if let Some(actions) = mouse_binding_actions(&r.settings, &payload) {
-                        actions
+            let actions: Vec<Action> = {
+                let mut r = match router_cb.lock() {
+                    Ok(g) => g,
+                    Err(e) => e.into_inner(),
+                };
+                let connected = r.net.as_ref().map(|n| n.connected()).unwrap_or(false);
+                if !connected {
+                    return;
+                }
+                // Windows mouse bindings are target-native Mac shortcuts. Consume both
+                // button transitions while linked; emit one atomic shortcut on press.
+                if !platform::TARGET_IS_MAC {
+                    let linked_source = r
+                        .arbiter
+                        .as_ref()
+                        .map(|a| a.mode == Mode::Source && a.linked)
+                        .unwrap_or(false);
+                    if linked_source {
+                        if let Some(actions) = mouse_binding_actions(&r.settings, &payload) {
+                            actions
+                        } else {
+                            route_captured_payload(&mut r, payload)
+                        }
                     } else {
                         route_captured_payload(&mut r, payload)
                     }
                 } else {
                     route_captured_payload(&mut r, payload)
                 }
-            } else {
-                route_captured_payload(&mut r, payload)
+            };
+            for action in actions {
+                execute_action(&router_cb, action);
             }
-        };
-        for action in actions {
-            execute_action(&router_cb, action);
-        }
         }));
         if outcome.is_err() {
             log::error!("[INPUT] 输入事件处理 panic，已跳过该事件并继续运行");
@@ -596,8 +613,7 @@ fn tick_once(router: &Mutex<RouterState>) -> Vec<Action> {
         let now = Instant::now();
         let watchdog_fired = r.tx_pointer_session != 0
             && !r.tx_pointer_ready
-            && r
-                .tx_take_at
+            && r.tx_take_at
                 .is_some_and(|at| now.duration_since(at) >= TAKE_TIMEOUT);
         if watchdog_fired {
             log::warn!(
@@ -636,12 +652,7 @@ fn tick_once(router: &Mutex<RouterState>) -> Vec<Action> {
         let (w, h) = platform::screen_size();
         if sink {
             // Sink 侧：注入光标停在入口边（=自己的出口边）→ 返回
-            acts.extend(a.on_sink_tick(
-                platform::last_injected_pos(),
-                w,
-                h,
-                Instant::now(),
-            ));
+            acts.extend(a.on_sink_tick(platform::last_injected_pos(), w, h, Instant::now()));
         } else {
             acts.extend(a.on_tick(Instant::now()));
         }
@@ -716,68 +727,16 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                     src_h,
                 },
             ));
-            // 拖拽跨屏：左键按下时把本机剪贴板内容带过去 + 通知对端注入粘贴
-            if left_button_down && drag_paths.is_empty() {
-                let content = platform::clipboard_read();
-                let (has_text, has_image, has_files) = match &content {
-                    platform::ClipboardContent::Text(_) => (true, false, false),
-                    platform::ClipboardContent::Image(_) => (false, true, false),
-                    platform::ClipboardContent::Files(_) => (false, false, true),
-                    platform::ClipboardContent::Empty => (false, false, false),
-                };
-                if has_text || has_image || has_files {
-                    log::info!("拖拽跨屏：携带剪贴板内容 text={has_text} image={has_image} files={has_files}");
-                    net.send_ctrl(Message::ctrl(
-                        &name,
-                        Payload::DragOffer {
-                            drag: true,
-                            has_text,
-                            has_image,
-                            has_files,
-                        },
-                    ));
-                    match content {
-                        platform::ClipboardContent::Text(t) => {
-                            net.send(Message::clipboard(
-                                &name,
-                                Payload::ClipboardText {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    text: t,
-                                },
-                            ));
-                        }
-                        platform::ClipboardContent::Image(png) => {
-                            net.send(Message::clipboard(
-                                &name,
-                                Payload::ClipboardImage {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    png,
-                                },
-                            ));
-                        }
-                        platform::ClipboardContent::Files(_) => {}
-                        platform::ClipboardContent::Empty => {}
-                    }
-                }
-            }
+            // Only native drag data is transferable; the clipboard may contain unrelated content.
             if !drag_paths.is_empty() {
-                let sender = router
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .file_sender
-                    .clone();
-                if let Some(sender) = sender {
+                let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(sender) = r.file_sender.clone() {
                     let paths = drag_paths
                         .into_iter()
                         .map(std::path::PathBuf::from)
                         .collect();
                     match sender.offer_drag_paths(paths) {
-                        Ok(id) => {
-                            router
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .outgoing_drag = Some(id)
-                        }
+                        Ok(id) => r.outgoing_drag = Some(id),
                         Err(error) => log::error!("[DRAG] unable to start file drag: {error}"),
                     }
                 }
@@ -875,12 +834,10 @@ async fn run_incoming_router(
     let mut shift_held = false;
     #[cfg(target_os = "macos")]
     let mut swallow_until_ctrl_up = false;
+    let mut images = clipboard::image::ImageReceiver::default();
     while let Some(msg) = incoming.recv().await {
         match &msg.payload {
-            Payload::Heartbeat {
-                app_version,
-                ..
-            } => {
+            Payload::Heartbeat { app_version, .. } => {
                 let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
                 r.peer_app_version = app_version.clone();
             }
@@ -1077,40 +1034,99 @@ async fn run_incoming_router(
                     log::debug!("丢弃非当前/乱序相对指针帧 session={session} seq={seq}");
                 }
             }
+            Payload::DragStart { id, roots } => {
+                let (net, name) = {
+                    let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(previous) = r.incoming_drag.replace(id.clone()) {
+                        platform::cancel_remote_file_drag(&previous);
+                    }
+                    (r.net.clone(), r.settings.name.clone())
+                };
+                if let Some(net) = net {
+                    let drag_id = id.clone();
+                    let callback_net = net.clone();
+                    let callback_name = name.clone();
+                    let callback =
+                        Arc::new(move |event: platform::RemoteFileDragEvent| match event {
+                            platform::RemoteFileDragEvent::DataRequested(_) => {
+                                callback_net.send_ctrl(Message::ctrl(
+                                    &callback_name,
+                                    Payload::DragCommit {
+                                        id: drag_id.clone(),
+                                    },
+                                ));
+                            }
+                            platform::RemoteFileDragEvent::Cancelled(_) => {
+                                callback_net.send_ctrl(Message::ctrl(
+                                    &callback_name,
+                                    Payload::DragCancel {
+                                        id: drag_id.clone(),
+                                    },
+                                ));
+                            }
+                        });
+                    if let Err(error) =
+                        platform::start_remote_file_drag(id.clone(), roots.clone(), callback)
+                    {
+                        router
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .incoming_drag = None;
+                        log::error!("[DRAG] unable to start target drag {id}: {error}");
+                        net.send_ctrl(Message::ctrl(&name, Payload::DragCancel { id: id.clone() }));
+                    }
+                }
+            }
             Payload::ClipboardText { .. }
             | Payload::ClipboardImage { .. }
             | Payload::ClipboardClear
             | Payload::ClipboardFiles { .. } => {
                 let (receiver, net, name) = {
                     let r = router.lock().unwrap_or_else(|e| e.into_inner());
-                    (r.file_receiver.clone(), r.net.clone(), r.settings.name.clone())
+                    (
+                        r.file_receiver.clone(),
+                        r.net.clone(),
+                        r.settings.name.clone(),
+                    )
                 };
-                // 懒粘贴桥接：平台层（WM_RENDERFORMAT / promise_write）在用户粘贴时
-                // 回调这里 → 回源端发 ClipboardFileRequest 并注册结果等待者。
-                let paste_cb: platform::ClipboardPasteCallback = {
-                    let receiver_cb = receiver.clone();
-                    let net_cb = net.clone();
-                    let name_cb = name.clone();
-                    std::sync::Arc::new(move |event| {
-                        let platform::ClipboardPasteEvent::Requested { id, ready } = event;
-                        // 必须先注册等待者再发请求：对端传输有可能比这条请求的
-                        // 返回更快结束，顺序反了会找不到等待者 → 退化成"写剪贴板"，
-                        // 而此时剪贴板正被请求方（资源管理器/Finder）占用 → 文件丢失。
-                        if let Some(receiver) = &receiver_cb {
-                            receiver.attach_clipboard_waiter(&id, ready);
-                        }
-                        if let Some(net) = &net_cb {
-                            net.send_ctrl(Message::ctrl(
-                                &name_cb,
-                                Payload::ClipboardFileRequest { id: id.clone() },
-                            ));
-                        }
-                    })
-                };
-                if let Some(receiver) = receiver {
-                    clipboard::handle_remote(&msg.payload, &receiver, &paste_cb);
+                images.clear();
+                if let (Some(receiver), Some(net)) = (receiver, net) {
+                    clipboard::handle_remote(&msg.payload, &receiver, &net, &name);
                 }
             }
+            Payload::ClipboardImageStart { id, size } => {
+                let receiver = router
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file_receiver
+                    .clone();
+                if let Some(receiver) = receiver {
+                    if receiver.begin_clipboard_revision(id) {
+                        platform::clipboard_clear();
+                        if let Err(error) = images.start(id, *size) {
+                            log::error!("[CLIPBOARD] {error}");
+                        }
+                    }
+                }
+            }
+            Payload::ClipboardImageChunk { id, seq, data } => {
+                if let Err(error) = images.chunk(id, *seq, data) {
+                    log::error!("[CLIPBOARD] {error}");
+                }
+            }
+            Payload::ClipboardImageEnd { id } => {
+                if let Some(png) = images.finish(id) {
+                    let receiver = router
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .file_receiver
+                        .clone();
+                    if receiver.is_some_and(|r| r.is_current_clipboard_revision(id)) {
+                        platform::clipboard_write_image(&png);
+                    }
+                }
+            }
+
             Payload::ClipboardFileRequest { id } => {
                 // 本机是源端：对端粘贴了 offer，现在开始真正传输。
                 if let Some(sender) = router
@@ -1207,7 +1223,9 @@ fn debug_payload_text(p: &Payload) -> Option<String> {
 /// Key → 可读名（Digit1 → "1"，其余用枚举名）。
 fn key_display(key: Key) -> String {
     let name = format!("{:?}", key);
-    name.strip_prefix("Digit").map(str::to_string).unwrap_or(name)
+    name.strip_prefix("Digit")
+        .map(str::to_string)
+        .unwrap_or(name)
 }
 
 /// NativeShortcut → "Cmd+1" 形式的可读文本。
@@ -1290,9 +1308,21 @@ fn handle_sink_key_conversion(
                     // 滚轮/标签键两个方向 → 切换桌面：
                     // Ctrl+Tab（无 Shift）→ Control+→（下一个桌面）
                     // Ctrl+Shift+Tab → Control+←（上一个桌面）
-                    let arrow = if desktop_switch { Key::ArrowLeft } else { Key::ArrowRight };
-                    let combo = if desktop_switch { "Ctrl+Shift+Tab" } else { "Ctrl+Tab" };
-                    let target = if desktop_switch { "Control+←" } else { "Control+→" };
+                    let arrow = if desktop_switch {
+                        Key::ArrowLeft
+                    } else {
+                        Key::ArrowRight
+                    };
+                    let combo = if desktop_switch {
+                        "Ctrl+Shift+Tab"
+                    } else {
+                        "Ctrl+Tab"
+                    };
+                    let target = if desktop_switch {
+                        "Control+←"
+                    } else {
+                        "Control+→"
+                    };
                     let shortcut = NativeShortcut {
                         key: arrow,
                         modifiers: ModifierState {
@@ -1581,49 +1611,6 @@ async fn run_file_router(
             | Payload::FileBatchResult { .. } => {
                 if let Some(sender) = sender {
                     sender.handle_result(&msg.payload);
-                }
-            }
-            Payload::DragStart { id, roots } => {
-                let (net, name) = {
-                    let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(previous) = r.incoming_drag.replace(id.clone()) {
-                        platform::cancel_remote_file_drag(&previous);
-                    }
-                    (r.net.clone(), r.settings.name.clone())
-                };
-                if let Some(net) = net {
-                    let drag_id = id.clone();
-                    let callback_net = net.clone();
-                    let callback_name = name.clone();
-                    let callback =
-                        Arc::new(move |event: platform::RemoteFileDragEvent| match event {
-                            platform::RemoteFileDragEvent::DataRequested(_) => {
-                                callback_net.send_ctrl(Message::ctrl(
-                                    &callback_name,
-                                    Payload::DragCommit {
-                                        id: drag_id.clone(),
-                                    },
-                                ));
-                            }
-                            platform::RemoteFileDragEvent::Cancelled(_) => {
-                                callback_net.send_ctrl(Message::ctrl(
-                                    &callback_name,
-                                    Payload::DragCancel {
-                                        id: drag_id.clone(),
-                                    },
-                                ));
-                            }
-                        });
-                    if let Err(error) =
-                        platform::start_remote_file_drag(id.clone(), roots.clone(), callback)
-                    {
-                        router
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .incoming_drag = None;
-                        log::error!("[DRAG] unable to start target drag {id}: {error}");
-                        net.send_ctrl(Message::ctrl(&name, Payload::DragCancel { id: id.clone() }));
-                    }
                 }
             }
             Payload::DragCommit { id } => {

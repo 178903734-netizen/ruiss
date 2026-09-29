@@ -688,8 +688,6 @@ struct ReceiverState {
     batches: HashMap<String, ReceiveBatch>,
     clipboard_revision: Option<String>,
     superseded_clipboards: VecDeque<String>,
-    /// 懒粘贴等待者：粘贴请求的传输结果在此交付给平台回调线程。
-    clipboard_waiters: HashMap<String, platform::PasteReady>,
 }
 
 pub struct FileReceiver {
@@ -751,7 +749,7 @@ impl FileReceiver {
         }
     }
 
-    fn is_current_clipboard_revision(&self, id: &str) -> bool {
+    pub fn is_current_clipboard_revision(&self, id: &str) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -764,28 +762,6 @@ impl FileReceiver {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.clipboard_revision.as_deref() == Some(id) {
             state.clipboard_revision = None;
-        }
-    }
-
-    /// 注册懒粘贴等待者：平台层在用户粘贴时调用，然后阻塞等待传输结果。
-    pub fn attach_clipboard_waiter(&self, id: &str, ready: platform::PasteReady) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clipboard_waiters
-            .insert(id.to_string(), ready);
-    }
-
-    /// 交付传输结果给等待中的平台回调线程（无等待者则忽略）。
-    fn complete_clipboard_waiter(&self, id: &str, result: Result<Vec<String>, String>) {
-        let ready = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clipboard_waiters
-            .remove(id);
-        if let Some(ready) = ready {
-            platform::complete_paste_ready(&ready, result);
         }
     }
 
@@ -897,10 +873,6 @@ impl FileReceiver {
     ) -> Result<(), String> {
         if let Some(clipboard_id) = &clipboard_id {
             if !self.begin_clipboard_revision(clipboard_id) {
-                self.complete_clipboard_waiter(
-                    clipboard_id,
-                    Err("剪贴板复制已被更新的内容取代".to_string()),
-                );
                 return Err("clipboard copy was superseded".into());
             }
         }
@@ -998,9 +970,6 @@ impl FileReceiver {
                 .batches
                 .remove(id);
             if let Some(batch) = batch {
-                if let Some(clipboard_id) = &batch.clipboard_id {
-                    self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
-                }
                 cleanup_paths(&batch.root_paths);
                 if let Some(stage) = &batch.drag_stage_dir {
                     let _ = std::fs::remove_dir_all(stage);
@@ -1187,9 +1156,6 @@ impl FileReceiver {
                 Some(error.clone()),
                 None,
             );
-            if let Some(clipboard_id) = &batch.clipboard_id {
-                self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
-            }
             cleanup_paths(&batch.root_paths);
             if let Some(stage) = &batch.drag_stage_dir {
                 let _ = std::fs::remove_dir_all(stage);
@@ -1212,7 +1178,6 @@ impl FileReceiver {
                     Some(error.clone()),
                     None,
                 );
-                self.complete_clipboard_waiter(clipboard_id, Err(error.clone()));
                 cleanup_paths(&batch.root_paths);
                 return (Err(error), drop_at_cursor);
             }
@@ -1224,23 +1189,25 @@ impl FileReceiver {
             .collect::<Vec<_>>();
         if let Some(drag_id) = &batch.drag_id {
             platform::complete_remote_file_drag(drag_id, &paths, None);
-        } else if let Some(clipboard_id) = &batch.clipboard_id {
-            // 懒传：有人粘贴了才传输，文件直接交给等待中的平台回调
-            // （WM_RENDERFORMAT / promise_write），不写剪贴板。
-            let ready = self
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clipboard_waiters
-                .remove(clipboard_id);
-            if let Some(ready) = ready {
-                platform::complete_paste_ready(&ready, Ok(paths.clone()));
-            } else {
-                // 旧版对端 eager 直传（无粘贴等待者）：维持写剪贴板。
-                platform::clipboard_write_files(&paths);
-            }
         } else {
-            platform::clipboard_write_files(&paths);
+            if let Err(error) = platform::clipboard_write_files(&paths) {
+                // The files are complete and usable in the receive directory; preserve
+                // them and report publication failure instead of claiming Paste is ready.
+                emit_update(
+                    &self.app,
+                    id,
+                    "receive",
+                    &batch.title,
+                    "failed",
+                    batch.total_bytes,
+                    batch.total_bytes,
+                    batch.completed_files,
+                    batch.expected_files,
+                    Some(error.clone()),
+                    paths.first().cloned(),
+                );
+                return (Err(error), false);
+            }
         }
         if let Some(clipboard_id) = &batch.clipboard_id {
             self.finish_clipboard_revision(clipboard_id);
@@ -1265,6 +1232,7 @@ impl FileReceiver {
                 "name": batch.title,
                 "path": display_path.unwrap_or_default(),
                 "paths": paths,
+                "clipboardReady": batch.clipboard_id.is_some(),
             }),
         );
         if let Some(stage) = batch.drag_stage_dir {
@@ -1370,13 +1338,6 @@ impl FileReceiver {
                 let _ = std::fs::remove_file(file.temp_path);
             }
         }
-        let waiter = {
-            let clipboard_id = state
-                .batches
-                .get(id)
-                .and_then(|batch| batch.clipboard_id.clone());
-            clipboard_id.and_then(|clipboard_id| state.clipboard_waiters.remove(&clipboard_id))
-        };
         if let Some(batch) = state.batches.remove(id) {
             if let Some(drag_id) = &batch.drag_id {
                 platform::complete_remote_file_drag(drag_id, &[], Some(reason.to_string()));
@@ -1400,9 +1361,6 @@ impl FileReceiver {
             }
         }
         drop(state);
-        if let Some(waiter) = waiter {
-            platform::complete_paste_ready(&waiter, Err(reason.to_string()));
-        }
     }
 
     fn emit_receive_progress(&self, id: &str, force: bool) {

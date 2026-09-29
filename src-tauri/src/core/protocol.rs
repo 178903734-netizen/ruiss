@@ -103,6 +103,19 @@ pub enum Payload {
         id: String,
         png: Vec<u8>,
     },
+    /// Large clipboard images use bounded binary chunks, never a JSON byte array.
+    ClipboardImageStart {
+        id: String,
+        size: u64,
+    },
+    ClipboardImageChunk {
+        id: String,
+        seq: u32,
+        data: Vec<u8>,
+    },
+    ClipboardImageEnd {
+        id: String,
+    },
     /// Source clipboard changed to content that is not yet available lazily on the peer.
     /// Invalidate the previous synchronized value so paste cannot reuse stale content.
     ClipboardClear,

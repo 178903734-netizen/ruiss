@@ -444,7 +444,9 @@ mod tests {
         // 离开入口带后回来 → 返回
         assert!(a.on_sink_tick(Some((300, 200)), W, H, t(500)).is_empty());
         assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(600)).is_empty());
-        let acts = a.on_sink_tick(Some((W - 1, 110)), W, H, t(760));
+        // First stationary tick starts dwell; the arrival tick above is movement.
+        assert!(a.on_sink_tick(Some((W - 1, 110)), W, H, t(700)).is_empty());
+        let acts = a.on_sink_tick(Some((W - 1, 110)), W, H, t(860));
         assert_eq!(acts, vec![Action::ReleaseControl]);
     }
 

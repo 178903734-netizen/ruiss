@@ -60,7 +60,10 @@ extern "C" {
 extern "C" {
     /// 系统窗口列表（跨屏按键转换时判断前台浏览器是否全屏）。
     /// option: kCGWindowListOptionOnScreenOnly = 1；relativeToWindow: kCGNullWindowID = 0。
-    fn CGWindowListCopyWindowInfo(option: u32, relativeToWindow: u32) -> core_foundation::base::CFTypeRef;
+    fn CGWindowListCopyWindowInfo(
+        option: u32,
+        relativeToWindow: u32,
+    ) -> core_foundation::base::CFTypeRef;
 }
 
 // 系统级光标隐藏（CoreGraphics）：与 Windows 的 SetSystemCursor 对称。
@@ -131,6 +134,7 @@ static SESSION_TAP_PORT_PTR: AtomicUsize = AtomicUsize::new(0);
 /// Ruiss 自己注入的 CGEvent 标记。不能只用 source pid 防回环：触控板惯性段由
 /// WindowServer 合成，source pid 语义并不等价于“是不是 Ruiss 注入”。
 const RUISS_EVENT_MARKER: i64 = 0x5255_4953_535F_4556;
+const RUISS_DRAG_CANCEL_MARKER: i64 = 0x5255_4953_535F_4443;
 
 /// Source 跨屏期间是否独占本机输入：点击由 HID tap 提前截获，其余输入由
 /// Session tap 转发后删除，Mac 本机不再接收。
@@ -362,8 +366,13 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 );
                 let blocked = BLOCK_LOCAL_INPUT.load(Ordering::SeqCst);
                 let sink = SINK_ACTIVE.load(Ordering::SeqCst);
-                let marked = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                    == RUISS_EVENT_MARKER;
+                let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+                // The posted Esc can reach the tap after takeover has blocked local input.
+                // It must still end Finder's source-side drag, without being forwarded.
+                if marker == RUISS_DRAG_CANCEL_MARKER {
+                    return CallbackResult::Keep;
+                }
+                let marked = marker == RUISS_EVENT_MARKER;
 
                 if marked {
                     // Sink 必须放行对端注入；Source 只允许入口/返回 warp 的移动通过。
@@ -490,6 +499,9 @@ fn run_hook_loop(tx: Sender<Payload>, ready: Sender<Result<()>>) {
                 // 防回环只认显式 marker，不再猜 source pid。对端输入及本机 warp 都会在
                 // 注入前写入该标记；物理触控板和 WindowServer 惯性事件不会携带它。
                 let marker = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
+                if marker == RUISS_DRAG_CANCEL_MARKER {
+                    return CallbackResult::Keep;
+                }
                 if marker == RUISS_EVENT_MARKER {
                     // Source 不应接收远程按键/滚动；即便合成事件意外继承 marker，也不能
                     // 绕过本机隔离。Sink 上的对端注入则必须放行。
@@ -1510,10 +1522,54 @@ unsafe fn remember_local_clipboard_change(pb: *mut Object) {
 static PENDING_DRAG_PATHS: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
 static DRAG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
 type RemoteDragCallback = std::sync::Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>;
-static REMOTE_DRAG_CALLBACKS: OnceLock<Mutex<HashMap<String, RemoteDragCallback>>> =
-    OnceLock::new();
-static REMOTE_DRAG_RESULTS: OnceLock<Mutex<HashMap<String, Result<Vec<String>, String>>>> =
-    OnceLock::new();
+struct MacDragSession {
+    callback: RemoteDragCallback,
+    ready: super::PasteReady,
+    requested: bool,
+    remaining: usize,
+    ended: bool,
+    delegates: Vec<usize>,
+    window: usize,
+}
+static REMOTE_DRAGS: OnceLock<Mutex<HashMap<String, MacDragSession>>> = OnceLock::new();
+
+fn finish_mac_drag(id: &str, ended: bool, cancelled: bool) {
+    let mut sessions = REMOTE_DRAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(session) = sessions.get_mut(id) else {
+        return;
+    };
+    if ended {
+        session.ended = true;
+    } else {
+        session.remaining = session.remaining.saturating_sub(1);
+    }
+    if cancelled {
+        super::complete_paste_ready(&session.ready, Err("drag cancelled".into()));
+        session.remaining = 0;
+    }
+    if session.ended && session.remaining == 0 {
+        let session = sessions.remove(id).unwrap();
+        drop(sessions);
+        dispatch::Queue::main().exec_async(move || unsafe {
+            if session.window != 0 {
+                let window = session.window as *mut Object;
+                let _: () = msg_send![window, orderOut: std::ptr::null_mut::<Object>()];
+                let _: () = msg_send![window, release];
+            }
+            for delegate in session.delegates {
+                let delegate = delegate as *mut Object;
+                let id_obj = *(*delegate).get_ivar::<*mut Object>("dragId");
+                let name_obj = *(*delegate).get_ivar::<*mut Object>("fileName");
+                let _: () = msg_send![id_obj, release];
+                let _: () = msg_send![name_obj, release];
+                let _: () = msg_send![delegate, release];
+            }
+        });
+    }
+}
 
 fn ns_utf8_string(value: *mut Object) -> Option<String> {
     unsafe {
@@ -1525,18 +1581,6 @@ fn ns_utf8_string(value: *mut Object) -> Option<String> {
             return None;
         }
         Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
-    }
-}
-
-fn remote_drag_callback(id: &str, event: super::RemoteFileDragEvent) {
-    let callback = REMOTE_DRAG_CALLBACKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(id)
-        .cloned();
-    if let Some(callback) = callback {
-        callback(event);
     }
 }
 
@@ -1569,82 +1613,70 @@ extern "C" fn promise_write(
     completion: *mut Object,
 ) {
     unsafe {
-        let id_obj = *this.get_ivar::<*mut Object>("dragId");
-        let Some(id) = ns_utf8_string(id_obj) else {
-            return;
-        };
-        let name_obj = *this.get_ivar::<*mut Object>("fileName");
-        let file_name = ns_utf8_string(name_obj);
+        let id = ns_utf8_string(*this.get_ivar::<*mut Object>("dragId")).unwrap_or_default();
+        let file_name =
+            ns_utf8_string(*this.get_ivar::<*mut Object>("fileName")).unwrap_or_default();
         let destination_path: *mut Object = msg_send![destination, path];
-        let Some(destination_path) = ns_utf8_string(destination_path) else {
-            return;
+        let destination_path = ns_utf8_string(destination_path);
+        let transfer = {
+            let mut sessions = REMOTE_DRAGS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions.get_mut(&id).map(|session| {
+                let request = !session.requested;
+                session.requested = true;
+                (
+                    session.ready.clone(),
+                    request.then(|| session.callback.clone()),
+                )
+            })
         };
-        // 区分来源：跨屏拖拽会话（REMOTE_DRAG_CALLBACKS 里有 id）走既有
-        // DataRequested/结果轮询；懒粘贴剪贴板走 CLIP_PASTE_CB + PasteReady。
-        let is_drag = REMOTE_DRAG_CALLBACKS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&id);
-        if is_drag {
-            remote_drag_callback(&id, super::RemoteFileDragEvent::DataRequested(id.clone()));
-        }
+        // Completion blocks may outlive this AppKit callback.
         let completion = block::RcBlock::<(*mut Object,), ()>::copy(
             completion as *mut block::Block<(*mut Object,), ()>,
         );
-        // RcBlock 内含 Block 裸指针，不是 Send，不能直接移入线程；
-        // 转成 usize 裸地址传入，线程内 Box::from_raw 还原并持有到调用完成。
         let completion_raw = Box::into_raw(Box::new(completion)) as usize;
         std::thread::spawn(move || {
-            let completion = unsafe {
-                Box::from_raw(completion_raw as *mut block::RcBlock<(*mut Object,), ()>)
-            };
-            let result = if is_drag {
-                // 有界等待：对端一直不给数据（卡死/会话丢失）时必须结束等待，
-                // 否则这次拖拽的 completion 永远不回调，系统侧的拖拽会话悬挂。
-                let deadline = Instant::now() + Duration::from_secs(300);
-                let result = loop {
-                    if let Some(result) = REMOTE_DRAG_RESULTS
-                        .get_or_init(Default::default)
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id)
-                    {
-                        break result;
-                    }
-                    if Instant::now() >= deadline {
-                        log::error!("[DRAG] 等待对端拖拽数据超时，结束本次拖拽会话");
-                        break Err("remote drag timed out".to_string());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                };
-                result.and_then(|paths| {
-                    let destination = std::path::PathBuf::from(&destination_path);
-                    let destination_dir = destination
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or(destination);
-                    for source in paths {
-                        let source = std::path::PathBuf::from(source);
-                        let name = source
-                            .file_name()
-                            .ok_or_else(|| "remote drag has an invalid file name".to_string())?;
-                        let target = destination_dir.join(name);
-                        if source.is_dir() {
-                            copy_directory_tree(&source, &target)?;
-                        } else {
-                            std::fs::copy(&source, &target).map_err(|e| e.to_string())?;
-                        }
-                    }
-                    Ok(())
-                })
+            let completion =
+                Box::from_raw(completion_raw as *mut block::RcBlock<(*mut Object,), ()>);
+            let result = (|| -> Result<(), String> {
+                let destination = destination_path.ok_or("invalid file promise destination")?;
+                let (ready, request) = transfer.ok_or("drag session no longer exists")?;
+                if let Some(callback) = request {
+                    callback(super::RemoteFileDragEvent::DataRequested(id.clone()));
+                }
+                let paths = super::wait_paste_ready(&ready, Duration::from_secs(300))?;
+                let source = paths
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .find(|p| {
+                        p.file_name()
+                            .is_some_and(|n| n.to_string_lossy() == file_name)
+                    })
+                    .ok_or("promised file is missing from received batch")?;
+                let target = std::path::PathBuf::from(destination);
+                if source.is_dir() {
+                    copy_directory_tree(&source, &target)?;
+                } else {
+                    std::fs::copy(&source, &target).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })();
+            // Returning nil on failure falsely tells Finder the promised file exists.
+            let pool: *mut Object = msg_send![class!(NSAutoreleasePool), new];
+            let error: *mut Object = if let Err(ref message) = result {
+                log::error!("[DRAG] macOS file promise failed: {message}");
+                let domain = string_to_nsstring("com.ruiss.file-transfer");
+                let error: *mut Object = msg_send![class!(NSError), errorWithDomain: domain code: 1isize userInfo: std::ptr::null_mut::<Object>()];
+                let _: () = msg_send![domain, release];
+                error
             } else {
-                copy_promised_file(&id, file_name, &destination_path)
+                std::ptr::null_mut()
             };
-            unsafe { completion.call((std::ptr::null_mut(),)); }
-            if let Err(error) = result {
-                log::error!("[DRAG] macOS file promise failed: {error}");
-            }
+            completion.call((error,));
+            let _: () = msg_send![pool, drain];
+            finish_mac_drag(&id, false, false);
         });
     }
 }
@@ -1684,14 +1716,18 @@ extern "C" fn promise_drag_ended(
     unsafe {
         let id_obj = *this.get_ivar::<*mut Object>("dragId");
         if let Some(id) = ns_utf8_string(id_obj) {
-            if operation == 0 {
-                remote_drag_callback(&id, super::RemoteFileDragEvent::Cancelled(id.clone()));
-            }
-            REMOTE_DRAG_CALLBACKS
+            let callback = REMOTE_DRAGS
                 .get_or_init(Default::default)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+                .get(&id)
+                .map(|s| s.callback.clone());
+            if operation == 0 {
+                if let Some(callback) = callback {
+                    callback(super::RemoteFileDragEvent::Cancelled(id.clone()));
+                }
+            }
+            finish_mac_drag(&id, true, operation == 0);
         }
     }
 }
@@ -1714,7 +1750,8 @@ fn remote_promise_delegate_class() -> &'static Class {
         );
         decl.add_method(
             sel!(filePromiseProvider:fileNameForType:),
-            promise_file_name_for_type as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
+            promise_file_name_for_type
+                as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> *mut Object,
         );
         decl.add_method(
             sel!(filePromiseProvider:writePromiseToURL:completionHandler:),
@@ -2011,9 +2048,9 @@ fn png_to_tiff(png: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// 写文件路径列表到剪贴板（NSURL 数组 writeObjects）。
-pub fn clipboard_write_files(paths: &[String]) {
+pub fn clipboard_write_files(paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
-        return;
+        return Err("没有可粘贴的文件".into());
     }
     let paths = paths.to_vec();
     run_on_main_thread(move || unsafe {
@@ -2035,160 +2072,14 @@ pub fn clipboard_write_files(paths: &[String]) {
             arrayWithObjects: urls.as_ptr()
             count: n
         ];
-        let _: bool = msg_send![pb, writeObjects: arr];
-        remember_local_clipboard_change(pb);
-    });
-}
-
-/// 懒粘贴剪贴板回调：粘贴时 promise_write 用它请求源端传输。
-static CLIP_PASTE_CB: OnceLock<Mutex<Option<crate::platform::ClipboardPasteCallback>>> =
-    OnceLock::new();
-/// offer id → 已下载的本地路径缓存。同一 offer 的多个文件 promise 或重复粘贴
-/// 只触发一次传输，其余从缓存 copy。
-static CLIP_PASTE_CACHE: OnceLock<Mutex<HashMap<String, Result<Vec<String>, String>>>> =
-    OnceLock::new();
-
-/// 强引用当前剪贴板 promise 的 delegate。
-/// NSFilePromiseProvider.delegate 是 weak：delegate 一旦被释放，粘贴时系统就拿不到
-/// 回调（Finder 里表现为"粘贴"变灰/拷不出文件）。这里显式持有，并限制数量避免
-/// 无限增长（被淘汰的都是早已被 clearContents 释放掉的旧 offer，不会再被回调）。
-static CLIP_PROMISE_DELEGATES: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
-const MAX_RETAINED_PROMISE_DELEGATES: usize = 256;
-
-fn retain_promise_delegate(delegate: *mut Object) {
-    let mut slots = CLIP_PROMISE_DELEGATES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    slots.push(delegate as usize);
-    while slots.len() > MAX_RETAINED_PROMISE_DELEGATES {
-        let old = slots.remove(0);
-        unsafe {
-            let _: () = msg_send![old as *mut Object, release];
-        }
-    }
-}
-
-/// 把对端复制的文件挂成剪贴板虚拟文件（懒传）：剪贴板写入 NSFilePromiseProvider，
-/// 用户粘贴时系统回调 promise_write，届时才回源端请求传输。
-pub fn set_clipboard_file_promise(
-    id: String,
-    names: Vec<String>,
-    callback: crate::platform::ClipboardPasteCallback,
-) {
-    log::info!("[CLIPBOARD-MAC] 挂文件承诺 offer id={id} names={names:?}");
-    // 新 offer 覆盖旧占位与旧下载缓存。
-    CLIP_PASTE_CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    let cb_slot = CLIP_PASTE_CB.get_or_init(Default::default);
-    *cb_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
-    // 写剪贴板必须回主线程：NSFilePromiseProvider 的兑现依赖主线程 runloop，
-    // 而且后台线程写 NSPasteboard 会与主线程 WebKit 的剪贴板监听并发（随机崩溃）。
-    run_on_main_thread(move || unsafe {
-        let pb = general_pasteboard();
-        if pb.is_null() {
-            log::error!("[CLIPBOARD-MAC] generalPasteboard 返回 null，无法挂文件承诺");
-            return;
-        }
-        let _: () = msg_send![pb, clearContents];
-        let mut items: Vec<*mut Object> = Vec::with_capacity(names.len());
-        for name in &names {
-            let id_ns = string_to_nsstring(&id);
-            let name_ns = string_to_nsstring(name);
-            let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
-            (*delegate).set_ivar("dragId", id_ns);
-            (*delegate).set_ivar("fileName", name_ns);
-            retain_promise_delegate(delegate);
-            let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
-            let provider: *mut Object = msg_send![
-                provider,
-                initWithFileType: string_to_nsstring("public.data")
-                delegate: delegate
-            ];
-            items.push(provider);
-        }
-        let arr: *mut Object = msg_send![
-            class!(NSArray),
-            arrayWithObjects: items.as_ptr()
-            count: items.len()
-        ];
         let wrote: bool = msg_send![pb, writeObjects: arr];
-        log::info!(
-            "[CLIPBOARD-MAC] writeObjects 结果: {wrote}（false=写剪贴板失败，Finder 将没有粘贴选项）"
-        );
         remember_local_clipboard_change(pb);
-    });
-}
-
-/// 懒粘贴：取（或请求）offer 对应的本地文件，把本 promise 对应的那一个
-/// copy 进粘贴目标目录。
-fn copy_promised_file(
-    id: &str,
-    file_name: Option<String>,
-    destination_path: &str,
-) -> Result<(), String> {
-    let cache = CLIP_PASTE_CACHE.get_or_init(Default::default);
-    let cached = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(id)
-        .cloned();
-    let paths = match cached {
-        Some(result) => result?,
-        None => {
-            let paste_cb = CLIP_PASTE_CB
-                .get()
-                .and_then(|slot| {
-                    slot.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .ok_or_else(|| "剪贴板懒粘贴 offer 不存在".to_string())?;
-            let ready = crate::platform::new_paste_ready();
-            paste_cb(crate::platform::ClipboardPasteEvent::Requested {
-                id: id.to_string(),
-                ready: ready.clone(),
-            });
-            let result = crate::platform::wait_paste_ready(&ready, Duration::from_secs(180));
-            cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id.to_string(), result.clone());
-            result?
-        }
-    };
-    let destination = std::path::PathBuf::from(destination_path);
-    for source in paths {
-        let source_path = std::path::PathBuf::from(source);
-        let Some(source_name) = source_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        // 多文件 offer 时每个 promise 只 copy 自己对应的那个文件。
-        if let Some(expected) = &file_name {
-            if source_name != *expected {
-                continue;
-            }
-        }
-        // 剪贴板粘贴时系统给的是最终文件 URL，直接写到那里；
-        // 若给的是已存在的目录（个别场景），退回拼接文件名。
-        let target = if destination.is_dir() {
-            destination.join(&source_name)
+        if wrote {
+            Ok(())
         } else {
-            destination.clone()
-        };
-        if source_path.is_dir() {
-            copy_directory_tree(&source_path, &target)?;
-        } else {
-            std::fs::copy(&source_path, &target).map_err(|e| e.to_string())?;
+            Err("文件已收到，但写入 Mac 剪贴板失败".into())
         }
-    }
-    Ok(())
+    })
 }
 
 /// 鼠标左键是否按下（拖拽跨屏检测用）。NSEvent pressedMouseButtons 位掩码 bit0=左键。
@@ -2210,25 +2101,26 @@ pub fn take_drag_paths() -> Vec<String> {
 extern "C" fn drag_probe_entered(_this: &Object, _cmd: Sel, sender: *mut Object) -> usize {
     unsafe {
         let pasteboard: *mut Object = msg_send![sender, draggingPasteboard];
-        if let Some(paths) = read_files(pasteboard) {
-            if !paths.is_empty() {
-                *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((Instant::now(), paths));
-            }
-        }
+        let paths = read_files(pasteboard).unwrap_or_default();
+        let valid = !paths.is_empty();
+        *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) =
+            valid.then(|| (Instant::now(), paths));
+        usize::from(valid) // NSDragOperationCopy while a native file payload is present.
     }
-    0 // NSDragOperationNone：探针只读路径，不在本机执行放置。
 }
 
 extern "C" fn drag_probe_updated(_this: &Object, _cmd: Sel, _sender: *mut Object) -> usize {
-    // 光标停在探针上时持续刷新记录时间戳：用户在边缘犹豫/来回微移时，
-    // 路径不因有效期窗口而过期（跨屏触发那一刻才采样）。
-    if let Ok(mut pending) = PENDING_DRAG_PATHS.lock() {
-        if let Some(entry) = pending.as_mut() {
-            entry.0 = Instant::now();
-        }
+    let mut pending = PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = pending.as_mut() {
+        entry.0 = Instant::now();
+        1
+    } else {
+        0
     }
-    0
+}
+
+extern "C" fn drag_probe_exited(_this: &Object, _cmd: Sel, _sender: *mut Object) {
+    *PENDING_DRAG_PATHS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 extern "C" fn drag_probe_perform(_this: &Object, _cmd: Sel, _sender: *mut Object) -> BOOL {
@@ -2250,6 +2142,10 @@ fn drag_probe_class() -> &'static Class {
         decl.add_method(
             sel!(draggingUpdated:),
             drag_probe_updated as extern "C" fn(&Object, Sel, *mut Object) -> usize,
+        );
+        decl.add_method(
+            sel!(draggingExited:),
+            drag_probe_exited as extern "C" fn(&Object, Sel, *mut Object),
         );
         decl.add_method(
             sel!(performDragOperation:),
@@ -2318,7 +2214,7 @@ pub fn cancel_local_drag() {
             {
                 event.set_integer_value_field(
                     EventField::EVENT_SOURCE_USER_DATA,
-                    RUISS_EVENT_MARKER,
+                    RUISS_DRAG_CANCEL_MARKER,
                 );
                 event.post(CGEventTapLocation::HID);
             }
@@ -2331,114 +2227,127 @@ pub fn cancel_local_drag() {
 pub fn start_remote_file_drag(
     id: String,
     roots: Vec<crate::core::protocol::TransferRoot>,
-    callback: std::sync::Arc<dyn Fn(super::RemoteFileDragEvent) + Send + Sync>,
+    callback: RemoteDragCallback,
 ) -> Result<()> {
-    unsafe {
-        let is_main: bool = msg_send![class!(NSThread), isMainThread];
-        if !is_main {
-            dispatch::Queue::main().exec_async(move || {
-                if let Err(error) = start_remote_file_drag(id.clone(), roots, callback.clone()) {
-                    callback(super::RemoteFileDragEvent::Cancelled(format!(
-                        "AppKit drag startup failed: {error}"
-                    )));
-                }
-            });
-            return Ok(());
+    run_on_main_thread(move || unsafe {
+        if roots.is_empty() {
+            return Err(anyhow!("remote drag has no roots"));
         }
-    }
-    let root = roots
-        .first()
-        .ok_or_else(|| anyhow!("remote drag has no roots"))?;
-    REMOTE_DRAG_CALLBACKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id.clone(), callback);
-    unsafe {
-        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
-        // 合成拖拽必须有源视图。Ruiss 是菜单栏应用，设置窗口平时是隐藏的
-        // （tauri.conf.json 里 visible:false），keyWindow / orderedWindows 经常拿不到，
-        // 拿不到窗口时"Mac 作为拖拽目标"整条能力直接失效（回 DragCancel）。
-        // 因此逐级回退，最后连隐藏窗口也用上。
-        let mut window: *mut Object = msg_send![app, keyWindow];
-        if window.is_null() {
-            window = msg_send![app, mainWindow];
-        }
-        if window.is_null() {
-            let ordered: *mut Object = msg_send![app, orderedWindows];
-            if !ordered.is_null() {
-                window = msg_send![ordered, firstObject];
-            }
-        }
-        if window.is_null() {
-            let all: *mut Object = msg_send![app, windows];
-            if !all.is_null() {
-                window = msg_send![all, firstObject];
-            }
-        }
-        if window.is_null() {
-            return Err(anyhow!("no AppKit window for remote drag"));
-        }
-        let view: *mut Object = msg_send![window, contentView];
-        // The source machine's original left-down happened before takeover and therefore is
-        // not present in this Mac's injector state. Seed it before the native drag session so
-        // subsequent remote movement is posted as LeftMouseDragged instead of MouseMoved.
-        // The real source-side mouse-up is forwarded normally and clears this state.
-        HELD_BUTTON.store(0, Ordering::Relaxed);
-        let id_ns = string_to_nsstring(&id);
-        let name_ns = string_to_nsstring(&root.name);
-        let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
-        (*delegate).set_ivar("dragId", id_ns);
-        (*delegate).set_ivar("fileName", name_ns);
-        let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
-        let provider: *mut Object = msg_send![provider, initWithFileType: string_to_nsstring("public.data") delegate: delegate];
-        let item: *mut Object = msg_send![class!(NSDraggingItem), alloc];
-        let item: *mut Object = msg_send![item, initWithPasteboardWriter: provider];
-        let location: CGPoint = msg_send![window, mouseLocationOutsideOfEventStream];
+        // Use a visible dedicated source, even when Ruiss settings are hidden. Never
+        // choose an arbitrary edge probe or hidden WebView as the drag's source view.
+        let mouse: CGPoint = msg_send![class!(NSEvent), mouseLocation];
         let frame = core_graphics::geometry::CGRect::new(
-            &location,
-            &core_graphics::geometry::CGSize::new(48.0, 48.0),
+            &CGPoint::new(mouse.x - 1.0, mouse.y - 1.0),
+            &core_graphics::geometry::CGSize::new(2.0, 2.0),
         );
+        let window: *mut Object = msg_send![class!(NSWindow), alloc];
+        let window: *mut Object = msg_send![window, initWithContentRect: frame styleMask: 0usize backing: 2usize defer: NO];
+        if window.is_null() {
+            return Err(anyhow!("unable to create native drag source"));
+        }
+        let clear: *mut Object = msg_send![class!(NSColor), clearColor];
+        let _: () = msg_send![window, setOpaque: NO];
+        let _: () = msg_send![window, setBackgroundColor: clear];
+        let _: () = msg_send![window, setHasShadow: NO];
+        let _: () = msg_send![window, setReleasedWhenClosed: NO];
+        let _: () = msg_send![window, setLevel: 25isize];
+        let _: () = msg_send![window, orderFrontRegardless];
+        let view: *mut Object = msg_send![window, contentView];
+        let location = CGPoint::new(1.0, 1.0);
+        let mut delegates = Vec::new();
+        let mut items = Vec::new();
         let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let icon: *mut Object =
-            msg_send![workspace, iconForFileType: string_to_nsstring("public.data")];
-        let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
-        let items: *mut Object = msg_send![class!(NSArray), arrayWithObject: item];
-        // 先单独取 windowNumber 并显式标注类型，msg_send! 嵌套无法自动推断返回类型。
+        for root in &roots {
+            let delegate: *mut Object = msg_send![remote_promise_delegate_class(), new];
+            (*delegate).set_ivar("dragId", string_to_nsstring(&id));
+            (*delegate).set_ivar("fileName", string_to_nsstring(&root.name));
+            delegates.push(delegate as usize);
+            let file_type = string_to_nsstring(if root.is_dir {
+                "public.folder"
+            } else {
+                "public.data"
+            });
+            let provider: *mut Object = msg_send![class!(NSFilePromiseProvider), alloc];
+            let provider: *mut Object =
+                msg_send![provider, initWithFileType: file_type delegate: delegate];
+            let item: *mut Object = msg_send![class!(NSDraggingItem), alloc];
+            let item: *mut Object = msg_send![item, initWithPasteboardWriter: provider];
+            let icon: *mut Object = msg_send![workspace, iconForFileType: file_type];
+            let item_frame = core_graphics::geometry::CGRect::new(
+                &location,
+                &core_graphics::geometry::CGSize::new(48.0, 48.0),
+            );
+            let _: () = msg_send![item, setDraggingFrame: item_frame contents: icon];
+            let _: () = msg_send![provider, release];
+            let _: () = msg_send![file_type, release];
+            items.push(item);
+        }
+        let source = delegates[0] as *mut Object;
+        REMOTE_DRAGS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id.clone(),
+                MacDragSession {
+                    callback,
+                    ready: super::new_paste_ready(),
+                    requested: false,
+                    remaining: roots.len(),
+                    ended: false,
+                    delegates,
+                    window: window as usize,
+                },
+            );
+        HELD_BUTTON.store(0, Ordering::Relaxed);
+        let array: *mut Object =
+            msg_send![class!(NSArray), arrayWithObjects: items.as_ptr() count: items.len()];
         let window_number: isize = msg_send![window, windowNumber];
-        // NSEventTypeLeftMouseDown = 1. beginDraggingSession requires the initiating
-        // mouse-down event; type 6 is LeftMouseDragged and causes a synthetic session to end
-        // on the next run-loop turn (the one-frame drag image seen during crossover).
         let event: *mut Object = msg_send![class!(NSEvent), mouseEventWithType: 1usize location: location modifierFlags: 0usize timestamp: 0.0f64 windowNumber: window_number context: std::ptr::null_mut::<Object>() eventNumber: 0isize clickCount: 1isize pressure: 1.0f64];
         let session: *mut Object =
-            msg_send![view, beginDraggingSessionWithItems: items event: event source: delegate];
+            msg_send![view, beginDraggingSessionWithItems: array event: event source: source];
+        for item in items {
+            let _: () = msg_send![item, release];
+        }
+        let _: () = msg_send![window, setIgnoresMouseEvents: YES];
         if session.is_null() {
             HELD_BUTTON.store(-1, Ordering::Relaxed);
-            REMOTE_DRAG_CALLBACKS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+            finish_mac_drag(&id, true, true);
             return Err(anyhow!("AppKit refused remote drag session"));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn complete_remote_file_drag(id: &str, paths: &[String], error: Option<String>) {
-    REMOTE_DRAG_RESULTS
+    let sessions = REMOTE_DRAGS
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            id.to_string(),
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(session) = sessions.get(id) {
+        super::complete_paste_ready(
+            &session.ready,
             error.map_or_else(|| Ok(paths.to_vec()), Err),
         );
+    }
 }
 
 pub fn cancel_remote_file_drag(id: &str) {
+    let active = REMOTE_DRAGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .map(|session| !session.ended);
+    let Some(active) = active else {
+        return;
+    };
     HELD_BUTTON.store(-1, Ordering::Relaxed);
     complete_remote_file_drag(id, &[], Some("drag cancelled".into()));
+    // Ask AppKit to end its native session as well as completing network waiters.
+    if active {
+        cancel_local_drag();
+    }
 }
 
 /// 启动剪贴板监听：1s 轮询 NSPasteboard changeCount，变化时读 + 回调。
@@ -2450,24 +2359,27 @@ pub fn start_clipboard_watcher(
     use std::sync::Arc;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
-    std::thread::spawn(move || unsafe {
-        let pb = general_pasteboard();
-        let mut last: isize = msg_send![pb, changeCount];
+    std::thread::spawn(move || {
+        let mut last = run_on_main_thread(|| unsafe {
+            let pb = general_pasteboard();
+            msg_send![pb, changeCount]
+        });
         while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let cur: isize = msg_send![pb, changeCount];
-            if cur == last {
-                continue;
-            }
-            last = cur;
-            if LOCAL_CLIPBOARD_CHANGE
-                .compare_exchange(cur, -1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                continue;
-            }
-            let content = clipboard_read();
-            if !content.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let (revision, content) = run_on_main_thread(move || unsafe {
+                let pb = general_pasteboard();
+                let revision: isize = msg_send![pb, changeCount];
+                let content = if revision != last
+                    && revision != LOCAL_CLIPBOARD_CHANGE.load(Ordering::Acquire)
+                {
+                    Some(clipboard_read_on_main())
+                } else {
+                    None
+                };
+                (revision, content)
+            });
+            last = revision;
+            if let Some(content) = content {
                 cb(content);
             }
         }
@@ -2561,7 +2473,8 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
     let plist_path = agents_dir.join("com.ruiss.app.plist");
 
     if enabled {
-        std::fs::create_dir_all(&agents_dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
+        std::fs::create_dir_all(&agents_dir)
+            .map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
         let exe = std::env::current_exe().map_err(|e| format!("获取当前 exe 路径失败: {e}"))?;
         // 打包后 current_exe 指向 Ruiss.app/Contents/MacOS/ruiss，直接作为启动命令即可
         let content = format!(
@@ -2582,7 +2495,8 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 "#,
             exe = xml_escape(&exe.to_string_lossy())
         );
-        std::fs::write(&plist_path, content).map_err(|e| format!("写入 LaunchAgent plist 失败: {e}"))?;
+        std::fs::write(&plist_path, content)
+            .map_err(|e| format!("写入 LaunchAgent plist 失败: {e}"))?;
         launchctl_register(&plist_path)?;
         log::info!("开机自启已启用: {}", exe.to_string_lossy());
     } else {
