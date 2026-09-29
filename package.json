@@ -3,7 +3,11 @@
   "version": "0.2.0",
   "description": "双机键鼠共享：鼠标跨屏、键盘共享、剪贴板同步",
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "dev": "node scripts/run.mjs tauri dev",
+    "build": "node scripts/run.mjs tauri build --no-bundle",
+    "test": "node scripts/run.mjs cargo test --manifest-path src-tauri/Cargo.toml",
+    "package:win": "node scripts/package-win.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

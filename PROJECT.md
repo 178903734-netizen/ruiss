@@ -48,9 +48,12 @@ ruiss/
 │ │   └── IMG_6373.jpeg        # README 交流群二维码
 ├── README.md                # 项目介绍（GitHub 仓库主页）
 ├── LICENSE                  # 开源协议（MIT）
-├── package.json             # 打包工具链（本地 devDep：@tauri-apps/cli，npx tauri build）
+├── package.json             # npm 脚本：dev/build/test/package:win（本地 devDep：@tauri-apps/cli）
+├── minicode.tasks.json      # MiniCode 终端面板按钮（开发预览 / 编译 / 测试 / 打包 Windows 安装包）
 ├── scripts/
-│   └── gen-icon.mjs         # 生成托盘图标 PNG（node 脚本）
+│   ├── gen-icon.mjs         # 生成托盘图标 PNG（node 脚本）
+│   ├── package-win.mjs      # npm run package:win：先编译再打 NSIS 包，产物在 D:/ruiss-target
+│   └── windows-installer-hooks.nsh # 将 WebView2Loader.dll 装到程序旁边，并在卸载时清理
 ├── PROJECT.md               # 本文件：项目地图 + 规划存档
 └── CHANGELOG.md
 ```
@@ -147,9 +150,9 @@ env CARGO_TARGET_DIR=D:/ruiss-target cargo build          # debug → D:/ruiss-t
 
 # 正式打包安装程序（Windows 出 NSIS 安装 exe）
 # 根目录 package.json 已配好 @tauri-apps/cli，直接：
-npx tauri build --bundles nsis   # 产物：src-tauri/target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
-# 注意：tauri.conf.json 已配 bundle.resources 把 target/release/WebView2Loader.dll 打进安装包
-#（GNU 工具链 exe 动态依赖该 DLL，打包器不会自动带，必须显式配置）
+npm run package:win   # 产物：D:/ruiss-target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
+# 脚本先编译，再由 scripts/windows-installer-hooks.nsh 加入 WebView2Loader.dll。
+# GNU 工具链 exe 动态依赖该 DLL；NSIS 钩子同时负责安装和卸载它。
 ```
 
 ## 分支工作流与 CI（2026-08-18 起）

@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "dev",
+      "label": "开发预览",
+      "group": "dev",
+      "command": "npm run dev",
+      "persistent": true,
+      "description": "tauri dev：编译并启动 Ruiss 桌面应用；常驻任务不设超时，改代码后自动重编重启",
+      "windows": {
+        "env": {
+          "CARGO_TARGET_DIR": "D:/ruiss-target"
+        }
+      }
+    },
+    {
+      "id": "build",
+      "label": "编译",
+      "group": "build",
+      "command": "npm run build",
+      "concurrencyKey": "ruiss-target",
+      "timeoutMs": 3600000,
+      "description": "tauri build --no-bundle：编译出 release 版可执行文件（D:/ruiss-target/release/ruiss.exe），不生成安装包",
+      "windows": {
+        "env": {
+          "CARGO_TARGET_DIR": "D:/ruiss-target"
+        }
+      }
+    },
+    {
+      "id": "test",
+      "label": "测试",
+      "group": "test",
+      "command": "npm test",
+      "concurrencyKey": "ruiss-target",
+      "timeoutMs": 1800000,
+      "description": "cargo test：跑 src-tauri 里的 Rust 单元测试",
+      "windows": {
+        "env": {
+          "CARGO_TARGET_DIR": "D:/ruiss-target"
+        }
+      }
+    },
+    {
+      "id": "package-win",
+      "label": "打包 Windows 安装包",
+      "group": "package",
+      "platforms": ["win32"],
+      "command": "npm run package:win",
+      "concurrencyKey": "ruiss-target",
+      "timeoutMs": 3600000,
+      "artifacts": ["D:/ruiss-target/release/bundle/nsis"],
+      "description": "只在本机 Windows 出现：先编译再生成 NSIS 安装包，全部产物保存在 D:/ruiss-target",
+      "windows": {
+        "env": {
+          "CARGO_TARGET_DIR": "D:/ruiss-target"
+        }
+      }
+    }
+  ]
+}

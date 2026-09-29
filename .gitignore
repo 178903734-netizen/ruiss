@@ -10,6 +10,7 @@ gui/node_modules/
 # 构建产物
 dist/
 gui/dist/
+release/
 
 # 日志
 *.log
