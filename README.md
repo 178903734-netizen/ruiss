@@ -36,7 +36,11 @@ cargo run --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 
 # 打包 Windows 安装程序（NSIS exe）
-npx tauri build --bundles nsis
+npm run package:win
+
+# 打包 macOS 应用与 dmg（固定证书签名），再替换安装到 /Applications
+npm run package:mac
+npm run install:mac
 ```
 
 > 详细的平台环境安装、双机联调、自测/双实例测试、常见问题见 **[BUILD.md](BUILD.md)**。

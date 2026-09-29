@@ -57,6 +57,27 @@
           "CARGO_TARGET_DIR": "D:/ruiss-target"
         }
       }
+    },
+    {
+      "id": "package-mac",
+      "label": "打包 macOS 安装包",
+      "group": "package",
+      "platforms": ["darwin"],
+      "command": "npm run package:mac",
+      "concurrencyKey": "ruiss-target",
+      "timeoutMs": 3600000,
+      "artifacts": ["src-tauri/target/release/bundle/dmg"],
+      "description": "只在本机 macOS 出现：编译 + 用固定证书签名 + 生成 dmg；签名固定，替换安装后系统隐私授权不用重设"
+    },
+    {
+      "id": "install-mac",
+      "label": "安装到 应用程序",
+      "group": "package",
+      "platforms": ["darwin"],
+      "command": "npm run install:mac",
+      "concurrencyKey": "ruiss-target",
+      "timeoutMs": 600000,
+      "description": "只在本机 macOS 出现：把刚打好的 Ruiss.app 替换到 /Applications（会先退出正在运行的应用）"
     }
   ]
 }

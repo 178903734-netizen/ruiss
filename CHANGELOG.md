@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 2026-09-29 — macOS 本地打包流程（固定签名，隐私授权不再重设）
+
+- 新增 `npm run package:mac`：编译 + 用固定证书签名 + 打 dmg；`npm run install:mac`
+  退出旧应用后替换 `/Applications/Ruiss.app`，系统隐私授权不用重新设置。
+- 签名身份固定在 `src-tauri/tauri.macos.conf.json`（"MiniCode Local Signing"），
+  bundle id 保持 `com.ruiss.app`。签名后的 designated requirement 绑定证书而不是
+  cdhash，所以重新编译、替换安装后「辅助功能 / 输入监控」授权继续有效；
+  未签名应用按二进制哈希记录授权，编译一次就失效。
+- `scripts/mac-signing.mjs` 统一校验签名（`--verify`、bundle id、requirement 不含
+  cdhash），打包与安装两处共用；签名不合要求时脚本直接失败，不会产出"看着成功
+  实际要重设授权"的包。
+- `scripts/toolchain.mjs` 补 macOS 路径：面板 / 非交互 shell 的 PATH 里没有 cargo
+  和 node，构建前临时补入 `~/.cargo/bin`、`/usr/local/bin`、`/opt/homebrew/bin`。
+- `minicode.tasks.json` 增加 macOS 平台的「打包 macOS 安装包 / 安装到 应用程序」按钮。
+
 ## 2026-09-29 — 跨系统剪贴板及边缘拖拽修复
 
 - 文件清单到达后立即后台下载，校验完成再写入真实 CF_HDROP / NSURL。

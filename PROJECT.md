@@ -48,11 +48,15 @@ ruiss/
 │ │   └── IMG_6373.jpeg        # README 交流群二维码
 ├── README.md                # 项目介绍（GitHub 仓库主页）
 ├── LICENSE                  # 开源协议（MIT）
-├── package.json             # npm 脚本：dev/build/test/package:win（本地 devDep：@tauri-apps/cli）
-├── minicode.tasks.json      # MiniCode 终端面板按钮（开发预览 / 编译 / 测试 / 打包 Windows 安装包）
+├── package.json             # npm 脚本：dev/build/test/package:win/package:mac/install:mac（本地 devDep：@tauri-apps/cli）
+├── minicode.tasks.json      # MiniCode 终端面板按钮（开发预览 / 编译 / 测试 / 打包 Windows 安装包 / 打包 macOS 安装包）
 ├── scripts/
 │   ├── gen-icon.mjs         # 生成托盘图标 PNG（node 脚本）
 │   ├── package-win.mjs      # npm run package:win：先编译再打 NSIS 包，产物在 D:/ruiss-target
+│   ├── package-mac.mjs      # npm run package:mac：编译 + 固定证书签名 + 打 dmg（产物在 src-tauri/target/release/bundle）
+│   ├── install-mac.mjs      # npm run install:mac：把打好的 .app 替换到 /Applications
+│   ├── mac-signing.mjs      # macOS 签名约定与校验：固定证书 + 固定 bundle id，隐私授权才不会丢
+│   ├── toolchain.mjs        # 任务环境：把 cargo / node 补进 PATH（Windows 与 macOS 各一套路径）
 │   └── windows-installer-hooks.nsh # 将 WebView2Loader.dll 装到程序旁边，并在卸载时清理
 ├── PROJECT.md               # 本文件：项目地图 + 规划存档
 └── CHANGELOG.md
@@ -153,6 +157,13 @@ env CARGO_TARGET_DIR=D:/ruiss-target cargo build          # debug → D:/ruiss-t
 npm run package:win   # 产物：D:/ruiss-target/release/bundle/nsis/Ruiss_<ver>_x64-setup.exe
 # 脚本先编译，再由 scripts/windows-installer-hooks.nsh 加入 WebView2Loader.dll。
 # GNU 工具链 exe 动态依赖该 DLL；NSIS 钩子同时负责安装和卸载它。
+
+# macOS 打包（在 Mac 上执行；产物在 src-tauri/target/release/bundle）
+npm run package:mac   # 编译 + 用 "MiniCode Local Signing" 证书签名 + 打 dmg
+npm run install:mac   # 退出旧应用 → 替换 /Applications/Ruiss.app → 启动
+# 签名身份固定在 src-tauri/tauri.macos.conf.json。证书和 bundle id 不变时，
+# 系统的辅助功能 / 输入监控授权对重新构建的版本继续有效，不用每次重设；
+# 未签名的应用按二进制哈希记录授权，编译一次就失效（见 scripts/mac-signing.mjs）。
 ```
 
 ## 分支工作流与 CI（2026-08-18 起）

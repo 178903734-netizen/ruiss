@@ -7,7 +7,9 @@
     "dev": "node scripts/run.mjs tauri dev",
     "build": "node scripts/run.mjs tauri build --no-bundle",
     "test": "node scripts/run.mjs cargo test --manifest-path src-tauri/Cargo.toml",
-    "package:win": "node scripts/package-win.mjs"
+    "package:win": "node scripts/package-win.mjs",
+    "package:mac": "node scripts/package-mac.mjs",
+    "install:mac": "node scripts/install-mac.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
