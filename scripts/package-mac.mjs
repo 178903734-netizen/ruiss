@@ -30,7 +30,9 @@ const cli = path.join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
 const bundleDir = path.join(root, 'src-tauri', 'target', 'release', 'bundle');
 const startedAt = Date.now();
 
-const built = spawnSync(process.execPath, [cli, 'build', '--bundles', 'dmg'], {
+// 必须同时要 app 和 dmg：只指定 dmg 时 Tauri 打完包会清掉临时 .app，
+// 那样既没法校验签名，install:mac 也没有可安装的包。
+const built = spawnSync(process.execPath, [cli, 'build', '--bundles', 'app,dmg'], {
   cwd: root,
   stdio: 'inherit',
   env,
