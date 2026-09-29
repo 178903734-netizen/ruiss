@@ -139,6 +139,31 @@ Mac 端代码（`src/platform/mac.rs`）依赖 core-graphics 0.24 的 API，
 如编译报错（个别 API 名/签名差异），**把完整错误信息发给开发者**，
 修改后重新编译。
 
+### 3.5 打包 dmg 与替换安装
+
+```bash
+cd ruiss
+npm install          # 首次需要（提供 @tauri-apps/cli）
+npm run package:mac  # 编译 + 固定证书签名 + 打 dmg
+npm run install:mac  # 退出旧应用 → 替换 /Applications/Ruiss.app → 启动
+```
+
+产物在 `src-tauri/target/release/bundle/`：`macos/Ruiss.app` 与
+`dmg/Ruiss_<版本>_x64.dmg`（约 30 秒，增量编译时更快）。
+
+> **签名证书必须固定**：设置在 `src-tauri/tauri.macos.conf.json`。
+> 系统对**未签名**应用的隐私授权按二进制指纹记录，重新编译一次就失效、
+> 必须重新勾选；用同一张证书签名后，签名要求变成「bundle id + 证书」，
+> 重新打包、替换安装都不用再设。所以不要换签名证书，也不要改
+> `src-tauri/tauri.conf.json` 里的 `identifier`（改了等于变成另一个应用，
+> 授权要重设）。
+>
+> 从旧的手工包（未签名）换过来的**第一次**，仍需在
+> **系统设置 → 隐私与安全性 → 辅助功能 / 输入监控** 里重新授权一次，
+> 之后不会再丢。
+
+> 打包过程中会临时挂载 dmg 设置窗口外观，Finder 里可能一闪而过，属正常现象。
+
 ---
 
 ## 四、运行与配置
