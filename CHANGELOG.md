@@ -14,6 +14,10 @@
 - `scripts/toolchain.mjs` 补 macOS 路径：面板 / 非交互 shell 的 PATH 里没有 cargo
   和 node，构建前临时补入 `~/.cargo/bin`、`/usr/local/bin`、`/opt/homebrew/bin`。
 - `minicode.tasks.json` 增加 macOS 平台的「打包 macOS 安装包 / 安装到 应用程序」按钮。
+- 面板任务补 macOS PATH：从面板（GUI 启动）跑任务时 PATH 只有
+  `/usr/bin:/bin:/usr/sbin:/sbin`，找不到 `npm`，按钮点了会报 `npm: command not found`；
+  现在各任务在 `macos` 覆盖里追加 `/usr/local/bin`、`/opt/homebrew/bin`，
+  `cargo` 仍由 `scripts/toolchain.mjs` 在子进程里临时补入。
 
 ## 2026-09-29 — 跨系统剪贴板及边缘拖拽修复
 

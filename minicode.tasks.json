@@ -12,6 +12,11 @@
         "env": {
           "CARGO_TARGET_DIR": "D:/ruiss-target"
         }
+      },
+      "macos": {
+        "env": {
+          "PATH": "/usr/local/bin:/opt/homebrew/bin"
+        }
       }
     },
     {
@@ -26,6 +31,11 @@
         "env": {
           "CARGO_TARGET_DIR": "D:/ruiss-target"
         }
+      },
+      "macos": {
+        "env": {
+          "PATH": "/usr/local/bin:/opt/homebrew/bin"
+        }
       }
     },
     {
@@ -39,6 +49,11 @@
       "windows": {
         "env": {
           "CARGO_TARGET_DIR": "D:/ruiss-target"
+        }
+      },
+      "macos": {
+        "env": {
+          "PATH": "/usr/local/bin:/opt/homebrew/bin"
         }
       }
     },
@@ -67,7 +82,12 @@
       "concurrencyKey": "ruiss-target",
       "timeoutMs": 3600000,
       "artifacts": ["src-tauri/target/release/bundle/dmg"],
-      "description": "只在本机 macOS 出现：编译 + 用固定证书签名 + 生成 dmg；签名固定，替换安装后系统隐私授权不用重设"
+      "description": "只在本机 macOS 出现：编译 + 用固定证书签名 + 生成 dmg；签名固定，替换安装后系统隐私授权不用重设",
+      "macos": {
+        "env": {
+          "PATH": "/usr/local/bin:/opt/homebrew/bin"
+        }
+      }
     },
     {
       "id": "install-mac",
@@ -77,7 +97,12 @@
       "command": "npm run install:mac",
       "concurrencyKey": "ruiss-target",
       "timeoutMs": 600000,
-      "description": "只在本机 macOS 出现：把刚打好的 Ruiss.app 替换到 /Applications（会先退出正在运行的应用）"
+      "description": "只在本机 macOS 出现：把刚打好的 Ruiss.app 替换到 /Applications（会先退出正在运行的应用）",
+      "macos": {
+        "env": {
+          "PATH": "/usr/local/bin:/opt/homebrew/bin"
+        }
+      }
     }
   ]
 }
