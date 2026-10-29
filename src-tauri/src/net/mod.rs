@@ -540,6 +540,7 @@ mod tests {
                 y: 100,
                 src_w: 1280,
                 src_h: 800,
+                supports_lease: true,
             },
         ));
         let m = recv_until(&mut in_b, |m| {

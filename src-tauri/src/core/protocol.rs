@@ -148,15 +148,34 @@ pub enum Payload {
         y: i32,
         src_w: u32,
         src_h: u32,
+        /// 本端支持控制租约。旧版会忽略这个未知字段，新版据此决定要不要发
+        /// ControlKeepAlive——不能无条件发：旧版反序列化不认识的新变体会
+        /// 直接断链（见 ControlKeepAlive 注释）。
+        #[serde(default)]
+        supports_lease: bool,
     },
     /// 接收端已经完成本轮接管。Source 收到前只缓存移动，不发 UDP，保证
     /// TakeControl 一定先于本轮所有移动生效。
     ControlReady {
         session: u64,
+        /// 被控端支持控制租约（同上，供 Source 判断能否启用租约）。
+        #[serde(default)]
+        supports_lease: bool,
     },
     /// 释放令牌（本机鼠标回到出口边，对端恢复自主）
     ReleaseControl {
         session: u64,
+    },
+    /// 控制权租约心跳（跨屏期间每秒一次，双向发送）。
+    /// 网络层的 Heartbeat 由独立网络线程发送，只能证明 TCP 还活着；对端应用层
+    /// 卡死或 UDP 指针通道中断时它依然正常，双方会永久停在「本机输入被吞、
+    /// 光标被隐藏」的状态。这条消息由路由线程发出，代表控制链真的在跑。
+    /// `pointer_age_ms` = 被控端距上次收到本轮指针帧的毫秒数（Source 据此判断
+    /// UDP 是否已中断；无控制关系时为 0）。
+    ControlKeepAlive {
+        session: u64,
+        #[serde(default)]
+        pointer_age_ms: u64,
     },
 
     // ===== M3：文件传输（分块流，支持任意大小文件）=====

@@ -224,6 +224,22 @@ struct RouterState {
     /// 本机作为 Sink 时当前接受的跨屏轮次及最后 UDP 序号。
     rx_pointer_session: u64,
     rx_pointer_seq: u64,
+    /// 控制租约：最近一次收到对端控制类消息（TakeControl/ControlReady/
+    /// ControlKeepAlive）的时刻。网络层 Heartbeat 只能证明 TCP 活着，不能证明
+    /// 对端应用层还能处理控制权；租约超时即强制归还本机控制。
+    last_peer_control: Option<Instant>,
+    /// 最近一次发出控制租约心跳的时刻（1s 一次，双向）。
+    last_keepalive_sent: Option<Instant>,
+    /// 本机作为 Source 最近一次真正发出 UDP 指针帧的时刻。
+    tx_last_move_at: Option<Instant>,
+    /// 本机作为 Sink 最近一次接受本轮 UDP 指针帧的时刻。
+    rx_last_pointer_at: Option<Instant>,
+    /// 连续判定"UDP 指针通道已停滞"的次数（防抖动，连续 2 次才释放）。
+    udp_stall_strikes: u8,
+    /// 对端是否支持控制租约（收到过 ControlKeepAlive 即为 true）。
+    /// 兼容旧版本：对端不发租约时绝不能按租约超时释放，否则只升级一台机器
+    /// 会让正常跨屏每 3 秒被弹回一次。连接断开时复位。
+    peer_supports_lease: bool,
     outgoing_drag: Option<String>,
     incoming_drag: Option<String>,
     peer_app_version: Option<String>,
@@ -248,6 +264,12 @@ impl RouterState {
             pending_pointer_move: None,
             rx_pointer_session: 0,
             rx_pointer_seq: 0,
+            last_peer_control: None,
+            last_keepalive_sent: None,
+            tx_last_move_at: None,
+            rx_last_pointer_at: None,
+            udp_stall_strikes: 0,
+            peer_supports_lease: false,
             outgoing_drag: None,
             incoming_drag: None,
             peer_app_version: None,
@@ -388,6 +410,9 @@ fn forward_pointer_move(router: &Mutex<RouterState>, move_payload: Payload) {
             return;
         }
         r.tx_pointer_seq = r.tx_pointer_seq.saturating_add(1);
+        // 记录最近一次真正发出指针帧的时刻：对端报告 UDP 停滞时只在"本机确实
+        // 在发移动"期间才判为通道故障，静止不动不会被误判。
+        r.tx_last_move_at = Some(Instant::now());
         let session = r.tx_pointer_session;
         let seq = r.tx_pointer_seq;
         let net = r.net.clone();
@@ -532,6 +557,11 @@ fn clear_pointer_sessions(r: &mut RouterState) {
     r.pending_pointer_move = None;
     r.rx_pointer_session = 0;
     r.rx_pointer_seq = 0;
+    r.last_peer_control = None;
+    r.last_keepalive_sent = None;
+    r.tx_last_move_at = None;
+    r.rx_last_pointer_at = None;
+    r.udp_stall_strikes = 0;
 }
 
 /// 强制恢复本机控制状态：还原光标与输入所有权，并清空跨屏轮次。
@@ -574,6 +604,27 @@ fn force_release(r: &mut RouterState) {
             net.send_ctrl(Message::ctrl(&name, Payload::ReleaseControl { session }));
         }
     }
+}
+
+/// 控制租约是否超时（纯函数，单测覆盖）。
+/// `last_peer_control` 为 None 表示本轮尚未建立控制链（等 ControlReady，
+/// 由现有握手看门狗负责）；Some 时超过 timeout 即视为对端控制链失效。
+fn lease_expired(last_peer_control: Option<Instant>, now: Instant, timeout: Duration) -> bool {
+    last_peer_control.is_some_and(|at| now.duration_since(at) >= timeout)
+}
+
+/// UDP 指针通道是否已停滞（纯函数，单测覆盖）。
+/// 只有"已握手完成 + 本机确实在持续发移动 + 对端报告超过 2s 没收到指针帧"
+/// 三个条件同时成立才算停滞；用户静止不动时不会误判。
+fn udp_pointer_stalled(
+    tx_pointer_ready: bool,
+    tx_last_move_at: Option<Instant>,
+    now: Instant,
+    pointer_age_ms: u64,
+) -> bool {
+    tx_pointer_ready
+        && tx_last_move_at.is_some_and(|at| now.duration_since(at) <= Duration::from_millis(1500))
+        && pointer_age_ms >= 2000
 }
 
 /// 单次 tick 的判定（锁在内部持有，动作由调用方在锁外执行）。
@@ -624,6 +675,52 @@ fn tick_once(router: &Mutex<RouterState>) -> Vec<Action> {
             return Vec::new(); // 本 tick 已回滚，不再产生其他动作
         }
     }
+    // ===== 控制租约：跨屏期间双向每秒一次心跳 =====
+    // 网络层 Heartbeat 由独立网络线程发送，只能证明 TCP 还活着。对端应用层
+    // 卡死（路由/注入线程不再处理消息）或 UDP 指针通道中断时，connected() 仍为
+    // true，双方会永久停在「本机输入被吞、光标被隐藏」——即用户说的"两边都控制
+    // 不了"。这里的租约由路由线程收发，超时 3s 就强制归还控制，谁都不会卡死。
+    let control_session = if r.tx_pointer_session != 0 {
+        r.tx_pointer_session
+    } else {
+        r.rx_pointer_session
+    };
+    if connected && control_session != 0 {
+        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+        const LEASE_TIMEOUT: Duration = Duration::from_secs(3);
+        let now = Instant::now();
+        // 只有双方都支持租约时才发心跳：旧版对端收到不认识的 ControlKeepAlive
+        // 会在反序列化阶段失败并断开 TCP（serde 没有 other 兜底）。
+        if r.peer_supports_lease
+            && r.last_keepalive_sent
+                .map_or(true, |at| now.duration_since(at) >= KEEPALIVE_INTERVAL)
+        {
+            r.last_keepalive_sent = Some(now);
+            let pointer_age_ms = r
+                .rx_last_pointer_at
+                .map_or(0, |at| now.duration_since(at).as_millis() as u64);
+            let (name, net) = (r.settings.name.clone(), r.net.clone());
+            if let Some(net) = net {
+                net.send_ctrl(Message::ctrl(
+                    &name,
+                    Payload::ControlKeepAlive {
+                        session: control_session,
+                        pointer_age_ms,
+                    },
+                ));
+            }
+        }
+        // 只有确认对端支持租约（收到过 its ControlKeepAlive）才按超时释放，
+        // 兼容未升级的对端。
+        if r.peer_supports_lease && lease_expired(r.last_peer_control, now, LEASE_TIMEOUT) {
+            log::warn!(
+                "[LEASE] 控制租约超时 {:.0}s：对端控制链无响应，强制归还本机控制",
+                LEASE_TIMEOUT.as_secs_f32()
+            );
+            force_release(&mut r);
+            return Vec::new();
+        }
+    }
     let (linked, sink) = r
         .arbiter
         .as_ref()
@@ -640,6 +737,8 @@ fn tick_once(router: &Mutex<RouterState>) -> Vec<Action> {
             }
             clear_pointer_sessions(&mut r);
         }
+        // 断线后对端能力未知（可能换成未升级版本），下次连接重新确认。
+        r.peer_supports_lease = false;
         return Vec::new();
     }
     // 主动补藏：Source 跨屏期间每 25ms 确认一次光标隐藏。
@@ -702,6 +801,13 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 // 从 Sink 反向夺回时，旧接收轮次立即作废。
                 r.rx_pointer_session = 0;
                 r.rx_pointer_seq = 0;
+                // 新一轮的租约从零开始：上一轮的时间戳若留着，本 tick 会立即
+                // 判定租约超时，刚跨过去就被弹回。等 ControlReady 再起算。
+                r.last_peer_control = None;
+                r.last_keepalive_sent = None;
+                r.tx_last_move_at = None;
+                r.rx_last_pointer_at = None;
+                r.udp_stall_strikes = 0;
                 was_sink
             };
             // Normal Source crossover has no local injected keyboard state. Only a
@@ -725,6 +831,8 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                     y,
                     src_w,
                     src_h,
+                    // 本端支持控制租约，由对端在 ControlReady 里回告它的能力。
+                    supports_lease: true,
                 },
             ));
             // Only native drag data is transferable; the clipboard may contain unrelated content.
@@ -754,13 +862,9 @@ fn execute_action(router: &Mutex<RouterState>, action: Action) {
                 } else {
                     r.rx_pointer_session
                 };
-                r.tx_pointer_session = 0;
-                r.tx_pointer_ready = false;
-                r.tx_take_at = None;
-                r.tx_pointer_seq = 0;
-                r.pending_pointer_move = None;
-                r.rx_pointer_session = 0;
-                r.rx_pointer_seq = 0;
+                // 统一走 clear_pointer_sessions：轮次与控制租约时间戳一起清空，
+                // 否则下一轮会拿上一轮的旧时间戳判定超时。
+                clear_pointer_sessions(&mut r);
                 (session, r.outgoing_drag.take())
             };
             if let Some(id) = cancelled_drag {
@@ -841,12 +945,45 @@ async fn run_incoming_router(
                 let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
                 r.peer_app_version = app_version.clone();
             }
+            Payload::ControlKeepAlive {
+                session,
+                pointer_age_ms,
+            } => {
+                let mut r = router.lock().unwrap_or_else(|e| e.into_inner());
+                // 收到租约心跳即证明对端版本支持：此后才启用租约超时。
+                r.peer_supports_lease = true;
+                if r.tx_pointer_session == *session || r.rx_pointer_session == *session {
+                    let now = Instant::now();
+                    r.last_peer_control = Some(now);
+                    // Source 侧：对端报告指针帧已很久没到，而本机确实在发移动 →
+                    // UDP 通道中断（TCP 仍活）。连续两次确认才释放，避免瞬时抖动。
+                    let stalled = udp_pointer_stalled(
+                        r.tx_pointer_ready,
+                        r.tx_last_move_at,
+                        now,
+                        *pointer_age_ms,
+                    );
+                    if stalled {
+                        r.udp_stall_strikes = r.udp_stall_strikes.saturating_add(1);
+                    } else {
+                        r.udp_stall_strikes = 0;
+                    }
+                    if r.udp_stall_strikes >= 2 {
+                        log::warn!(
+                            "[LEASE] UDP 指针通道停滞 {}ms（TCP 仍连接），强制归还本机控制",
+                            pointer_age_ms
+                        );
+                        force_release(&mut r);
+                    }
+                }
+            }
             Payload::TakeControl {
                 session,
                 x,
                 y,
                 src_w,
                 src_h,
+                supports_lease,
             } => {
                 injector.reset_keyboard_state();
                 // 被接管：本机系统光标保持可见——对端注入的事件移动的就是
@@ -868,6 +1005,15 @@ async fn run_incoming_router(
                     r.pending_pointer_move = None;
                     r.rx_pointer_session = *session;
                     r.rx_pointer_seq = 0;
+                    // 对端在 TakeControl 里声明支持租约才启用，否则一律不发心跳，
+                    // 避免旧版对端因未知消息类型断开连接。
+                    r.peer_supports_lease = *supports_lease;
+                    // 被控端从现在起按 1s 发租约；本机没有对端控制消息的历史，
+                    // 从接收时刻起算，避免刚接管就被判超时。
+                    r.last_peer_control = Some(Instant::now());
+                    r.last_keepalive_sent = None;
+                    r.rx_last_pointer_at = None;
+                    r.udp_stall_strikes = 0;
                     let entry = r.arbiter.as_mut().and_then(|a| a.on_peer_take(*x, *y));
                     (entry, r.settings.name.clone(), r.net.clone())
                 };
@@ -887,12 +1033,18 @@ async fn run_incoming_router(
                     if let Some(net) = ack_net {
                         net.send_ctrl(Message::ctrl(
                             &ack_name,
-                            Payload::ControlReady { session: *session },
+                            Payload::ControlReady {
+                                session: *session,
+                                supports_lease: true,
+                            },
                         ));
                     }
                 }
             }
-            Payload::ControlReady { session } => {
+            Payload::ControlReady {
+                session,
+                supports_lease,
+            } => {
                 {
                     let mut r = match router.lock() {
                         Ok(g) => g,
@@ -900,6 +1052,8 @@ async fn run_incoming_router(
                     };
                     if r.tx_pointer_session == *session {
                         log::info!("对端已准备好 session={session}，开始发送 UDP 指针帧");
+                        // 对端在 ControlReady 里声明支持租约才启用租约与心跳。
+                        r.peer_supports_lease = *supports_lease;
                         r.tx_take_at = None;
                         // 必须先把确认前缓存的帧排进 UDP 队列，再开放新帧；否则
                         // 捕获线程可能抢先发送 seq=1，随后旧缓存以 seq=2 覆盖新位置。
@@ -913,6 +1067,10 @@ async fn run_incoming_router(
                             }
                         }
                         r.tx_pointer_ready = true;
+                        // 对端确认接管：控制链接通，租约从此刻起算。
+                        r.last_peer_control = Some(Instant::now());
+                        r.last_keepalive_sent = None;
+                        r.udp_stall_strikes = 0;
                     }
                 }
             }
@@ -925,13 +1083,8 @@ async fn run_incoming_router(
                     let accepted =
                         r.tx_pointer_session == *session || r.rx_pointer_session == *session;
                     if accepted {
-                        r.tx_pointer_session = 0;
-                        r.tx_pointer_ready = false;
-                        r.tx_take_at = None;
-                        r.tx_pointer_seq = 0;
-                        r.pending_pointer_move = None;
-                        r.rx_pointer_session = 0;
-                        r.rx_pointer_seq = 0;
+                        // 控制租约时间戳与轮次一起清空，避免下一轮拿旧时间戳判超时。
+                        clear_pointer_sessions(&mut r);
                     }
                     accepted
                 };
@@ -982,12 +1135,18 @@ async fn run_incoming_router(
                         .map(|a| a.mode == Mode::Sink)
                         .unwrap_or(false);
                     let active_session = r.rx_pointer_session;
-                    sink && accept_pointer_sequence(
-                        active_session,
-                        &mut r.rx_pointer_seq,
-                        *session,
-                        *seq,
-                    )
+                    let accepted = sink
+                        && accept_pointer_sequence(
+                            active_session,
+                            &mut r.rx_pointer_seq,
+                            *session,
+                            *seq,
+                        );
+                    if accepted {
+                        // 供租约心跳上报"距上一帧多久"，Source 据此判断 UDP 断流。
+                        r.rx_last_pointer_at = Some(Instant::now());
+                    }
+                    accepted
                 };
                 if accepted {
                     let (tw, th) = platform::screen_size();
@@ -1021,12 +1180,17 @@ async fn run_incoming_router(
                         .map(|a| a.mode == Mode::Sink)
                         .unwrap_or(false);
                     let active_session = r.rx_pointer_session;
-                    sink && accept_pointer_sequence(
-                        active_session,
-                        &mut r.rx_pointer_seq,
-                        *session,
-                        *seq,
-                    )
+                    let accepted = sink
+                        && accept_pointer_sequence(
+                            active_session,
+                            &mut r.rx_pointer_seq,
+                            *session,
+                            *seq,
+                        );
+                    if accepted {
+                        r.rx_last_pointer_at = Some(Instant::now());
+                    }
+                    accepted
                 };
                 if accepted {
                     injector.inject(Payload::MouseMoveRelative { dx: *dx, dy: *dy });
@@ -2002,5 +2166,54 @@ mod mouse_binding_tests {
             },
         );
         assert_eq!(actions, Some(Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod control_lease_tests {
+    use super::*;
+
+    const TIMEOUT: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn lease_ignores_rounds_without_established_control() {
+        assert!(!lease_expired(None, Instant::now(), TIMEOUT));
+    }
+
+    #[test]
+    fn lease_expires_only_after_timeout() {
+        let now = Instant::now();
+        assert!(!lease_expired(
+            Some(now - Duration::from_secs(1)),
+            now,
+            TIMEOUT
+        ));
+        assert!(lease_expired(
+            Some(now - Duration::from_secs(4)),
+            now,
+            TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn udp_stall_requires_ready_link() {
+        let now = Instant::now();
+        let moving = Some(now - Duration::from_millis(100));
+        assert!(!udp_pointer_stalled(false, moving, now, 5000));
+    }
+
+    #[test]
+    fn udp_stall_ignores_idle_source() {
+        let now = Instant::now();
+        let idle = Some(now - Duration::from_secs(5));
+        assert!(!udp_pointer_stalled(true, idle, now, 5000));
+    }
+
+    #[test]
+    fn udp_stall_detected_while_moving() {
+        let now = Instant::now();
+        let moving = Some(now - Duration::from_millis(100));
+        assert!(udp_pointer_stalled(true, moving, now, 2500));
+        assert!(!udp_pointer_stalled(true, moving, now, 500));
     }
 }
